@@ -154,7 +154,9 @@ RVT配布版は、Gen4が`*_td.h5`、Gen1が`*_td.dat.h5`で、どちらも
 `x/y/p/t`の同長、極性、座標範囲、解像度を検査します。RVT実装のように逆行timestampを
 扱うため、RVT Gen1/Gen4入力に限ってevent順を維持したrunning maximum補正を適用します。
 補正件数と最大逆行量は進捗ログ、出力HDF5属性、manifestへ記録します。DSEC/M3EDなど
-他の入力ではtimestamp逆行を引き続きエラーにします。
+他の入力ではtimestamp逆行を引き続きエラーにします。補正後の最大時刻がsource末尾の
+生timestampを超える場合は、RVT入力だけ実効durationをその差分だけ延長し、
+`timestamp_duration_extension_us`として記録します。
 
 既存Gen4の最初の1 recordingを、出力を書かずに検査・計画表示する例です。
 

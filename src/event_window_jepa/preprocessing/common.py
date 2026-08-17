@@ -307,7 +307,20 @@ def _validate_identity_attributes(
 ) -> None:
     for name, expected in _metadata_identity(metadata, split, config_hash).items():
         actual = handle.attrs.get(name)
-        if isinstance(expected, int):
+        if (
+            name == "duration_us"
+            and metadata.attributes.get("timestamp_repair_policy") == "running_max"
+            and bool(handle.attrs.get("complete", False))
+        ):
+            declared = int(handle.attrs.get("source_declared_duration_us", -1))
+            extension = int(handle.attrs.get("timestamp_duration_extension_us", -1))
+            matches = (
+                actual is not None
+                and declared == expected
+                and extension >= 0
+                and int(actual) == declared + extension
+            )
+        elif isinstance(expected, int):
             matches = actual is not None and int(actual) == expected
         else:
             matches = str(actual) == expected
@@ -440,6 +453,14 @@ def _existing_record(
             "source_timestamp_max_backward_us": int(
                 handle.attrs.get("source_timestamp_max_backward_us", 0)
             ),
+            "source_declared_duration_us": int(
+                handle.attrs.get(
+                    "source_declared_duration_us", handle.attrs["duration_us"]
+                )
+            ),
+            "timestamp_duration_extension_us": int(
+                handle.attrs.get("timestamp_duration_extension_us", 0)
+            ),
             "output_file_size": path.stat().st_size,
             "source_file_size": int(handle.attrs["source_file_size"]),
         }
@@ -544,6 +565,8 @@ def _preprocess_sequence_unlocked(
                         "zstd_level": options.zstd_level,
                         "event_count": 0,
                         "dropped_event_count": 0,
+                        "source_declared_duration_us": duration_us,
+                        "timestamp_duration_extension_us": 0,
                         "polarity_encoding": "0=OFF,1=ON",
                         "source_timestamp_reference": str(
                             metadata.attributes.get("timestamp_reference", "unknown")
@@ -604,6 +627,7 @@ def _preprocess_sequence_unlocked(
                     "seen_polarities": [],
                     "timestamp_repair_count": 0,
                     "timestamp_max_backward_us": 0,
+                    "effective_duration_us": duration_us,
                     "complete": False,
                 }
                 handle.flush()
@@ -631,6 +655,9 @@ def _preprocess_sequence_unlocked(
             timestamp_max_backward_us = int(
                 checkpoint.get("timestamp_max_backward_us", 0)
             )
+            effective_duration_us = int(
+                checkpoint.get("effective_duration_us", duration_us)
+            )
             repair_timestamps = (
                 metadata.attributes.get("timestamp_repair_policy") == "running_max"
             )
@@ -652,6 +679,10 @@ def _preprocess_sequence_unlocked(
             handle.attrs["source_timestamp_repair_count"] = timestamp_repair_count
             handle.attrs["source_timestamp_max_backward_us"] = (
                 timestamp_max_backward_us
+            )
+            handle.attrs["source_declared_duration_us"] = duration_us
+            handle.attrs["timestamp_duration_extension_us"] = max(
+                0, effective_duration_us - duration_us
             )
             for name, value in metadata.attributes.items():
                 handle.attrs[f"source_{name}"] = value
@@ -691,8 +722,16 @@ def _preprocess_sequence_unlocked(
                     arrays["t_us"].astype(np.int64, copy=False)
                     - metadata.first_timestamp_us
                 )
-                if relative_timestamps[0] < 0 or relative_timestamps[-1] > duration_us:
+                if relative_timestamps[0] < 0:
                     raise ValueError("source timestamps exceed declared metadata bounds")
+                if relative_timestamps[-1] > duration_us:
+                    if not repair_timestamps:
+                        raise ValueError(
+                            "source timestamps exceed declared metadata bounds"
+                        )
+                    effective_duration_us = max(
+                        effective_duration_us, int(relative_timestamps[-1])
+                    )
                 x, y, valid = _transform_coordinates(
                     arrays["x"],
                     arrays["y"],
@@ -740,6 +779,7 @@ def _preprocess_sequence_unlocked(
                         "seen_polarities": sorted(seen_polarities),
                         "timestamp_repair_count": timestamp_repair_count,
                         "timestamp_max_backward_us": timestamp_max_backward_us,
+                        "effective_duration_us": effective_duration_us,
                         "complete": False,
                     }
                 )
@@ -750,6 +790,9 @@ def _preprocess_sequence_unlocked(
                 )
                 handle.attrs["source_timestamp_max_backward_us"] = (
                     timestamp_max_backward_us
+                )
+                handle.attrs["timestamp_duration_extension_us"] = max(
+                    0, effective_duration_us - duration_us
                 )
                 before_flush = time.monotonic()
                 is_first_chunk_this_run = (
@@ -778,6 +821,9 @@ def _preprocess_sequence_unlocked(
                                 "timestamp_repair_count": timestamp_repair_count,
                                 "timestamp_max_backward_us": (
                                     timestamp_max_backward_us
+                                ),
+                                "timestamp_duration_extension_us": max(
+                                    0, effective_duration_us - duration_us
                                 ),
                             },
                             sort_keys=True,
@@ -829,6 +875,9 @@ def _preprocess_sequence_unlocked(
                                 "timestamp_max_backward_us": (
                                     timestamp_max_backward_us
                                 ),
+                                "timestamp_duration_extension_us": max(
+                                    0, effective_duration_us - duration_us
+                                ),
                             },
                             sort_keys=True,
                         ),
@@ -845,7 +894,9 @@ def _preprocess_sequence_unlocked(
                 raise ValueError("source file metadata changed while preprocessing")
             if written_events == 0:
                 raise ValueError("all source events were removed during preprocessing")
-            terminal_boundary = (duration_us // options.index_step_us + 1) * options.index_step_us
+            terminal_boundary = (
+                effective_duration_us // options.index_step_us + 1
+            ) * options.index_step_us
             if next_index_boundary_us <= terminal_boundary:
                 remaining = (
                     (terminal_boundary - next_index_boundary_us) // options.index_step_us + 1
@@ -858,6 +909,11 @@ def _preprocess_sequence_unlocked(
             handle.attrs["source_timestamp_repair_count"] = timestamp_repair_count
             handle.attrs["source_timestamp_max_backward_us"] = (
                 timestamp_max_backward_us
+            )
+            handle.attrs["duration_us"] = effective_duration_us
+            handle.attrs["source_declared_duration_us"] = duration_us
+            handle.attrs["timestamp_duration_extension_us"] = max(
+                0, effective_duration_us - duration_us
             )
             handle.attrs["complete"] = True
             handle.flush()
@@ -873,6 +929,7 @@ def _preprocess_sequence_unlocked(
                     "seen_polarities": sorted(seen_polarities),
                     "timestamp_repair_count": timestamp_repair_count,
                     "timestamp_max_backward_us": timestamp_max_backward_us,
+                    "effective_duration_us": effective_duration_us,
                     "complete": True,
                 }
             )

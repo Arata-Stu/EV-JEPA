@@ -584,6 +584,9 @@ def main() -> None:
                     "timestamp_max_backward_us": record.get(
                         "source_timestamp_max_backward_us", 0
                     ),
+                    "timestamp_duration_extension_us": record.get(
+                        "timestamp_duration_extension_us", 0
+                    ),
                 },
                 sort_keys=True,
             ),
