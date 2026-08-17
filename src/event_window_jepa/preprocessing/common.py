@@ -751,6 +751,40 @@ def _preprocess_sequence_unlocked(
                 handle.attrs["source_timestamp_max_backward_us"] = (
                     timestamp_max_backward_us
                 )
+                before_flush = time.monotonic()
+                is_first_chunk_this_run = (
+                    source_events_read
+                    == run_start_event + len(arrays["x"])
+                )
+                if options.progress_interval_seconds > 0 and (
+                    is_first_chunk_this_run
+                    or before_flush - last_progress
+                    >= options.progress_interval_seconds
+                ):
+                    print(
+                        json.dumps(
+                            {
+                                "status": "progress",
+                                "phase": "flushing_checkpoint",
+                                "sequence": metadata.sequence_id,
+                                "events_processed": source_events_read,
+                                "events_total": metadata.event_count,
+                                "percent": round(
+                                    100.0
+                                    * source_events_read
+                                    / metadata.event_count,
+                                    2,
+                                ),
+                                "timestamp_repair_count": timestamp_repair_count,
+                                "timestamp_max_backward_us": (
+                                    timestamp_max_backward_us
+                                ),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    last_progress = before_flush
                 handle.flush()
                 _write_json_atomic(checkpoint_path, checkpoint)
 
