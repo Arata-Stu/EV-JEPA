@@ -39,6 +39,7 @@ Options:
   --split SPLIT               train, val, test, or all (default: all)
   --extract                   Safely extract after download
   --extracted-root DIRECTORY  Validate an existing train/val/test HDF5 tree only
+  --allow-orphan-bboxes       Report but allow bbox files whose corrupt HDF5 was removed
   --help                      Show this help
 
 Downloads are resumable. Publisher CRC32 is checked before a TAR is published.
@@ -49,6 +50,7 @@ ROOT=""
 SPLIT="all"
 EXTRACT=0
 EXTRACTED_ROOT=""
+ALLOW_ORPHAN_BBOXES=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --root)
@@ -70,6 +72,10 @@ while [ "$#" -gt 0 ]; do
       EXTRACTED_ROOT="$2"
       shift 2
       ;;
+    --allow-orphan-bboxes)
+      ALLOW_ORPHAN_BBOXES=1
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -85,6 +91,11 @@ esac
 
 download_require_runtime
 
+VALIDATE_EXTRA_ARGS=()
+if [ "${ALLOW_ORPHAN_BBOXES}" -eq 1 ]; then
+  VALIDATE_EXTRA_ARGS+=(--allow-orphan-bboxes)
+fi
+
 if [ -n "${EXTRACTED_ROOT}" ]; then
   [ -z "${ROOT}" ] || download_die "--root and --extracted-root cannot be combined"
   [ "${EXTRACT}" -eq 0 ] || download_die "--extract is invalid with --extracted-root"
@@ -92,6 +103,8 @@ if [ -n "${EXTRACTED_ROOT}" ]; then
     download_die "extracted root does not exist: ${EXTRACTED_ROOT}"
 else
   [ -n "${ROOT}" ] || download_die "--root is required"
+  [ "${ALLOW_ORPHAN_BBOXES}" -eq 0 ] || \
+    download_die "--allow-orphan-bboxes is only valid with --extracted-root"
   mkdir -p "${ROOT}/archives" "${ROOT}/raw" "${ROOT}/state/extract"
   RAW_ROOT="${ROOT}/raw"
 fi
@@ -105,7 +118,8 @@ fi
 for current_split in "${SPLITS[@]}"; do
   if [ -n "${EXTRACTED_ROOT}" ]; then
     "${DOWNLOAD_PYTHON}" "${DOWNLOAD_ARCHIVE_TOOL}" validate-rvt-genx \
-      --root "${RAW_ROOT}" --dataset "${DATASET}" --split "${current_split}"
+      --root "${RAW_ROOT}" --dataset "${DATASET}" --split "${current_split}" \
+      "${VALIDATE_EXTRA_ARGS[@]}"
     continue
   fi
 
@@ -117,7 +131,8 @@ for current_split in "${SPLITS[@]}"; do
   if [ "${EXTRACT}" -eq 1 ]; then
     download_extract_archive "${archive}" "${RAW_ROOT}" "${ROOT}/state/extract"
     "${DOWNLOAD_PYTHON}" "${DOWNLOAD_ARCHIVE_TOOL}" validate-rvt-genx \
-      --root "${RAW_ROOT}" --dataset "${DATASET}" --split "${current_split}"
+      --root "${RAW_ROOT}" --dataset "${DATASET}" --split "${current_split}" \
+      "${VALIDATE_EXTRA_ARGS[@]}"
   fi
 done
 

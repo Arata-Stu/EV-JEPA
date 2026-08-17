@@ -199,6 +199,16 @@ bash scripts/download/download_gen4.sh \
   --split all
 ```
 
+壊れたevent HDF5を意図的に除外し、対応bboxだけが残っている既存データでは次を使います。
+orphan bboxの件数と全パスは結果へ表示され、eventがないため前処理対象にはなりません。
+
+```bash
+bash scripts/download/download_gen4.sh \
+  --extracted-root /mnt/ssd-4tb/dataset/gen4 \
+  --split all \
+  --allow-orphan-bboxes
+```
+
 この検査は依存なしの入口検査です。`/events`のkey、dtype、全timestamp単調性、座標範囲、
 解像度1280×720（Gen4）/304×240（Gen1）は、canonical前処理で全件検査します。
 

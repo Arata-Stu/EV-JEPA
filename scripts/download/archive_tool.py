@@ -702,7 +702,13 @@ def validate_prophesee(
     )
 
 
-def validate_rvt_genx(root: Path, dataset: str, expected_split: str) -> None:
+def validate_rvt_genx(
+    root: Path,
+    dataset: str,
+    expected_split: str,
+    *,
+    allow_orphan_bboxes: bool = False,
+) -> None:
     """Validate RVT's original-event Gen1/Gen4 HDF5 distribution layout.
 
     This dependency-free check covers split placement, event/label pairing,
@@ -721,6 +727,7 @@ def validate_rvt_genx(root: Path, dataset: str, expected_split: str) -> None:
         raise ValueError(f"no *_bbox.npy files were found below {split_root}")
 
     expected_h5: set[Path] = set()
+    orphan_bboxes: list[Path] = []
     suffix = "_td.dat.h5" if dataset == "gen1" else "_td.h5"
     for bbox_path in bbox_files:
         recording = bbox_path.name.removesuffix("_bbox.npy")
@@ -728,9 +735,21 @@ def validate_rvt_genx(root: Path, dataset: str, expected_split: str) -> None:
             raise ValueError(f"invalid RVT bbox filename: {bbox_path}")
         h5_path = bbox_path.with_name(recording + suffix)
         if not h5_path.is_file():
-            raise ValueError(f"event HDF5 is missing for {bbox_path}: {h5_path.name}")
+            orphan_bboxes.append(bbox_path)
+            continue
         _verify_hdf5(h5_path)
         expected_h5.add(h5_path.resolve())
+
+    if orphan_bboxes and not allow_orphan_bboxes:
+        preview = ", ".join(str(path) for path in orphan_bboxes[:10])
+        suffix_message = "" if len(orphan_bboxes) <= 10 else ", ..."
+        raise ValueError(
+            f"{len(orphan_bboxes)} bbox file(s) have no event HDF5: "
+            f"{preview}{suffix_message}; if these recordings were deliberately "
+            "removed after corruption checks, rerun with --allow-orphan-bboxes"
+        )
+    if not expected_h5:
+        raise ValueError(f"no paired RVT event HDF5 files were found below {split_root}")
 
     observed_h5 = {
         path.resolve()
@@ -751,6 +770,8 @@ def validate_rvt_genx(root: Path, dataset: str, expected_split: str) -> None:
                 "split": expected_split,
                 "bbox_files": len(bbox_files),
                 "event_hdf5_files": len(expected_h5),
+                "orphan_bbox_files": len(orphan_bboxes),
+                "orphan_bbox_paths": [str(path) for path in orphan_bboxes],
                 "filename_suffix": suffix,
                 "root": str(root),
             },
@@ -916,6 +937,7 @@ def _build_parser() -> argparse.ArgumentParser:
     rvt_genx.add_argument(
         "--split", required=True, choices=("train", "val", "test")
     )
+    rvt_genx.add_argument("--allow-orphan-bboxes", action="store_true")
 
     m3ed = subparsers.add_parser("validate-m3ed-plan")
     m3ed.add_argument("--dataset-list", required=True, type=Path)
@@ -969,7 +991,12 @@ def main() -> None:
         validate_prophesee(args.root, args.width, args.height, args.split)
         return
     if args.command == "validate-rvt-genx":
-        validate_rvt_genx(args.root, args.dataset, args.split)
+        validate_rvt_genx(
+            args.root,
+            args.dataset,
+            args.split,
+            allow_orphan_bboxes=args.allow_orphan_bboxes,
+        )
         return
     if args.command == "validate-m3ed-plan":
         validate_m3ed_plan(args.dataset_list, args.sequence_list, args.split)

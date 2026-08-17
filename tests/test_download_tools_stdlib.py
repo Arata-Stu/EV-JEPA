@@ -201,8 +201,16 @@ class DownloadToolTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr)
 
             (root / "gen4" / "train" / "recording_td.h5").unlink()
-            with self.assertRaisesRegex(ValueError, "event HDF5 is missing"):
+            with self.assertRaisesRegex(ValueError, "bbox file.*no event HDF5"):
                 archive_tool.validate_rvt_genx(root / "gen4", "gen4", "train")
+
+            second_bbox = root / "gen4" / "train" / "paired_bbox.npy"
+            second_h5 = root / "gen4" / "train" / "paired_td.h5"
+            second_bbox.write_bytes(b"placeholder")
+            second_h5.write_bytes(archive_tool.HDF5_MAGIC + b"placeholder")
+            archive_tool.validate_rvt_genx(
+                root / "gen4", "gen4", "train", allow_orphan_bboxes=True
+            )
 
     def test_normalized_archive_member_collision_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
