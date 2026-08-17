@@ -1,0 +1,4 @@
+# Phase 1 train: representative car/urban/day recording, official non-test.
+# Official object size observed 2026-08-17: 13,798,490,482 bytes.
+car_urban_day_penno_small_loop
+

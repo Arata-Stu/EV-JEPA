@@ -1,0 +1,7 @@
+# DSEC-Detection official logical validation split (stored below the physical train tree).
+zurich_city_16_a
+zurich_city_17_a
+zurich_city_18_a
+zurich_city_19_a
+zurich_city_20_a
+zurich_city_21_a

@@ -1,0 +1,6 @@
+# Copy this file outside the repository (or to a machine-specific ignored file),
+# then add one selected DAT stem per line. Keep the `_td` suffix and omit `.dat`.
+# Start with a representative 10--20% subset rather than the complete 1Mpx corpus.
+#
+# recording_name_001_td
+# recording_name_014_td

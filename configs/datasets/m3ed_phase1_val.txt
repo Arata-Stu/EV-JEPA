@@ -1,0 +1,5 @@
+# Phase 1 validation: short car/urban/day recording, official non-test.
+# Keep disjoint from m3ed_phase1_train.txt.
+# Official object size observed 2026-08-17: 6,464,100,941 bytes.
+car_urban_day_horse
+

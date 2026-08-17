@@ -1,0 +1,3 @@
+# Official M3ED test recording. Download only after Phase 1 because it is large.
+# Official object size observed 2026-08-17: 137,070,365,939 bytes.
+car_urban_day_ucity_big_loop

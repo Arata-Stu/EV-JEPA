@@ -12,6 +12,10 @@ output/
 outputs/
 dataset/
 datasets/
+# The download helpers depend on these small, versioned split/sequence lists.
+# Keep them even though generic directories named "datasets" are ignored.
+!configs/datasets/
+!configs/datasets/*.txt
 lib/
 /map/*
 !/map/.gitkeep
