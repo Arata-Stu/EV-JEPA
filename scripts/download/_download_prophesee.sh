@@ -14,7 +14,7 @@ FORM_URL="$5"
 shift 5
 
 case "${DATASET_ID}" in
-  gen1) DISPLAY_SCRIPT='download_gen1.sh' ;;
+  gen1) DISPLAY_SCRIPT='download_prophesee_gen1_dat.sh' ;;
   prophesee_1mpx) DISPLAY_SCRIPT='download_prophesee_1mpx.sh' ;;
   *) DISPLAY_SCRIPT='_download_prophesee.sh' ;;
 esac

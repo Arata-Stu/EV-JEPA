@@ -192,6 +192,7 @@ download_verify_file() {
   local kind="$2"
   local expected_sha256="${3:--}"
   local expected_bytes="${4:--}"
+  local expected_crc32="${5:--}"
   local metadata="${path}.verified.json"
   local expected_args
   expected_args=()
@@ -201,6 +202,9 @@ download_verify_file() {
   if [ -n "${expected_bytes}" ] && [ "${expected_bytes}" != "-" ]; then
     expected_args+=(--expected-bytes "${expected_bytes}")
   fi
+  if [ -n "${expected_crc32}" ] && [ "${expected_crc32}" != "-" ]; then
+    expected_args+=(--expected-crc32 "${expected_crc32}")
+  fi
 
   if "${DOWNLOAD_PYTHON}" "${DOWNLOAD_ARCHIVE_TOOL}" check \
       --path "${path}" --kind "${kind}" --metadata "${metadata}" \
@@ -209,7 +213,7 @@ download_verify_file() {
     return 0
   fi
 
-  download_note "verifying size, content, and SHA-256: $(basename "${path}")"
+  download_note "verifying size, content, SHA-256, and requested publisher checksum: $(basename "${path}")"
   "${DOWNLOAD_PYTHON}" "${DOWNLOAD_ARCHIVE_TOOL}" verify \
     --path "${path}" --kind "${kind}" --metadata "${metadata}" \
     "${expected_args[@]}"
@@ -221,6 +225,7 @@ download_url() {
   local kind="$3"
   local expected_sha256="${4:--}"
   local expected_bytes="${5:--}"
+  local expected_crc32="${6:--}"
   local allow_weak_identity=0
   if [ -n "${expected_sha256}" ] && [ "${expected_sha256}" != "-" ]; then
     if [ "${#expected_sha256}" -ne 64 ] || \
@@ -241,7 +246,7 @@ download_url() {
   local final_remote="${output}.remote.json"
 
   if [ -f "${output}" ]; then
-    download_verify_file "${output}" "${kind}" "${expected_sha256}" "${expected_bytes}"
+    download_verify_file "${output}" "${kind}" "${expected_sha256}" "${expected_bytes}" "${expected_crc32}"
     download_note "already complete: $(basename "${output}")"
     _download_release_lock "${lock_dir}"
     return 0
@@ -302,7 +307,7 @@ download_url() {
     fi
     if [ "${partial_bytes}" -eq "${expected_bytes}" ]; then
       download_note "download bytes were already complete; verifying retained .part"
-      download_verify_file "${partial}" "${kind}" "${expected_sha256}" "${expected_bytes}"
+      download_verify_file "${partial}" "${kind}" "${expected_sha256}" "${expected_bytes}" "${expected_crc32}"
       mv "${partial}" "${output}"
       mv "${partial_metadata}" "${final_metadata}"
       if [ -f "${partial_remote}" ]; then
@@ -366,7 +371,7 @@ download_url() {
   rm -f "${final_header_file}" "${final_remote_check}"
 
   if ! download_verify_file \
-      "${partial}" "${kind}" "${expected_sha256}" "${expected_bytes}"; then
+      "${partial}" "${kind}" "${expected_sha256}" "${expected_bytes}" "${expected_crc32}"; then
     download_die "verification failed; retained for inspection: ${partial}"
   fi
   mv "${partial}" "${output}"

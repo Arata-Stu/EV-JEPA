@@ -95,9 +95,17 @@ def test_1mpx_default_downsample_and_bbox_pairing(tmp_path) -> None:
     bbox.write_bytes(b"labels")
 
     assert _resolved_spatial_downsample("prophesee_1mpx", None) == 2
+    assert _resolved_spatial_downsample("gen4", None) == 2
     assert _resolved_spatial_downsample("m3ed", None) == 2
     assert _resolved_spatial_downsample("gen1", None) == 1
     assert _matching_bbox(dat) == bbox
+
+    gen4_h5 = tmp_path / "recording_td.h5"
+    gen1_h5 = tmp_path / "recording_td.dat.h5"
+    gen4_h5.write_bytes(b"hdf5")
+    gen1_h5.write_bytes(b"hdf5")
+    assert _matching_bbox(gen4_h5) == bbox
+    assert _matching_bbox(gen1_h5) == bbox
 
 
 def test_bbox_copy_and_manifest_paths_are_portable(tmp_path) -> None:

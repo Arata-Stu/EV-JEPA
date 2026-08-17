@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 import time
 import zipfile
+import zlib
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Iterator
 
@@ -78,12 +79,14 @@ def _atomic_json_lines(path: Path, rows: list[dict[str, object]]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _sha256(path: Path) -> str:
+def _file_digests(path: Path) -> tuple[str, str]:
     digest = hashlib.sha256()
+    crc32 = 0
     with path.open("rb") as handle:
         while block := handle.read(COPY_BUFFER_BYTES):
             digest.update(block)
-    return digest.hexdigest()
+            crc32 = zlib.crc32(block, crc32)
+    return digest.hexdigest(), f"{crc32 & 0xFFFFFFFF:08x}"
 
 
 def _prefix(path: Path, length: int = 8192) -> bytes:
@@ -174,12 +177,22 @@ def _verify_text(path: Path) -> str:
 
 
 def _validate_expected(
-    *, size: int, digest: str, expected_bytes: int | None, expected_sha256: str | None
+    *,
+    size: int,
+    digest: str,
+    crc32: str,
+    expected_bytes: int | None,
+    expected_sha256: str | None,
+    expected_crc32: str | None,
 ) -> None:
     if expected_bytes is not None and size != expected_bytes:
         raise ValueError(f"size mismatch: expected {expected_bytes}, got {size}")
     if expected_sha256 is not None and digest.lower() != expected_sha256.lower():
         raise ValueError("SHA-256 mismatch")
+    if expected_crc32 is not None and crc32.lower() != expected_crc32.lower():
+        raise ValueError(
+            f"CRC32 mismatch: expected {expected_crc32.lower()}, got {crc32.lower()}"
+        )
 
 
 def verify_file(
@@ -188,6 +201,7 @@ def verify_file(
     metadata_path: Path,
     expected_bytes: int | None,
     expected_sha256: str | None,
+    expected_crc32: str | None = None,
 ) -> dict[str, object]:
     if not path.is_file():
         raise ValueError(f"not a regular file: {path}")
@@ -206,12 +220,14 @@ def verify_file(
     else:
         raise ValueError(f"unsupported verification kind: {kind}")
 
-    digest = _sha256(path)
+    digest, crc32 = _file_digests(path)
     _validate_expected(
         size=stat_result.st_size,
         digest=digest,
+        crc32=crc32,
         expected_bytes=expected_bytes,
         expected_sha256=expected_sha256,
+        expected_crc32=expected_crc32,
     )
     payload: dict[str, object] = {
         "metadata_version": METADATA_VERSION,
@@ -221,6 +237,7 @@ def verify_file(
         "size_bytes": stat_result.st_size,
         "mtime_ns": stat_result.st_mtime_ns,
         "sha256": digest,
+        "crc32": crc32,
         "verified_unix_ns": time.time_ns(),
     }
     _atomic_json(metadata_path, payload)
@@ -233,6 +250,7 @@ def check_metadata(
     metadata_path: Path,
     expected_bytes: int | None,
     expected_sha256: str | None,
+    expected_crc32: str | None = None,
 ) -> dict[str, object]:
     if not path.is_file() or not metadata_path.is_file():
         raise ValueError("file or verification metadata is missing")
@@ -251,11 +269,20 @@ def check_metadata(
     digest = payload.get("sha256")
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ValueError("verification metadata has an invalid SHA-256")
+    crc32 = payload.get("crc32")
+    if not isinstance(crc32, str) or not re.fullmatch(r"[0-9a-f]{8}", crc32):
+        if expected_crc32 is not None:
+            raise ValueError("verification metadata has no valid CRC32")
+        # Markers created before CRC32 support remain valid unless a publisher
+        # CRC32 is explicitly required.
+        crc32 = "00000000"
     _validate_expected(
         size=stat_result.st_size,
         digest=digest,
+        crc32=crc32,
         expected_bytes=expected_bytes,
         expected_sha256=expected_sha256,
+        expected_crc32=expected_crc32,
     )
     return payload
 
@@ -675,6 +702,63 @@ def validate_prophesee(
     )
 
 
+def validate_rvt_genx(root: Path, dataset: str, expected_split: str) -> None:
+    """Validate RVT's original-event Gen1/Gen4 HDF5 distribution layout.
+
+    This dependency-free check covers split placement, event/label pairing,
+    filename conventions, and HDF5 signatures. Dataset keys, dtypes,
+    timestamps, polarity, and coordinates are validated by preprocessing.
+    """
+
+    split_root = root / expected_split
+    if not split_root.is_dir():
+        raise ValueError(f"RVT split directory is missing: {split_root}")
+    if dataset not in {"gen1", "gen4"}:
+        raise ValueError(f"unsupported RVT dataset: {dataset}")
+
+    bbox_files = sorted(split_root.rglob("*_bbox.npy"))
+    if not bbox_files:
+        raise ValueError(f"no *_bbox.npy files were found below {split_root}")
+
+    expected_h5: set[Path] = set()
+    suffix = "_td.dat.h5" if dataset == "gen1" else "_td.h5"
+    for bbox_path in bbox_files:
+        recording = bbox_path.name.removesuffix("_bbox.npy")
+        if not recording:
+            raise ValueError(f"invalid RVT bbox filename: {bbox_path}")
+        h5_path = bbox_path.with_name(recording + suffix)
+        if not h5_path.is_file():
+            raise ValueError(f"event HDF5 is missing for {bbox_path}: {h5_path.name}")
+        _verify_hdf5(h5_path)
+        expected_h5.add(h5_path.resolve())
+
+    observed_h5 = {
+        path.resolve()
+        for path in split_root.rglob("*.h5")
+        if path.name.endswith(suffix)
+    }
+    extras = sorted(str(path) for path in observed_h5 - expected_h5)
+    if extras:
+        raise ValueError(
+            "RVT event HDF5 has no matching bbox annotation: " + ", ".join(extras[:5])
+        )
+
+    print(
+        json.dumps(
+            {
+                "status": "validated",
+                "dataset": dataset,
+                "split": expected_split,
+                "bbox_files": len(bbox_files),
+                "event_hdf5_files": len(expected_h5),
+                "filename_suffix": suffix,
+                "root": str(root),
+            },
+            sort_keys=True,
+        )
+    )
+
+
 def _simple_yaml_value(value: str) -> object:
     value = value.strip()
     if not value:
@@ -786,6 +870,15 @@ def _optional_sha256(value: str | None) -> str | None:
     return lowered
 
 
+def _optional_crc32(value: str | None) -> str | None:
+    if value in {None, "", "-"}:
+        return None
+    lowered = value.lower()
+    if not re.fullmatch(r"[0-9a-f]{8}", lowered):
+        raise argparse.ArgumentTypeError("expected CRC32 must contain 8 hex digits")
+    return lowered
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -796,6 +889,7 @@ def _build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--metadata", required=True, type=Path)
     verify.add_argument("--expected-bytes", type=_optional_positive_int)
     verify.add_argument("--expected-sha256", type=_optional_sha256)
+    verify.add_argument("--expected-crc32", type=_optional_crc32)
 
     check = subparsers.add_parser("check")
     check.add_argument("--path", required=True, type=Path)
@@ -803,6 +897,7 @@ def _build_parser() -> argparse.ArgumentParser:
     check.add_argument("--metadata", required=True, type=Path)
     check.add_argument("--expected-bytes", type=_optional_positive_int)
     check.add_argument("--expected-sha256", type=_optional_sha256)
+    check.add_argument("--expected-crc32", type=_optional_crc32)
 
     extract = subparsers.add_parser("extract")
     extract.add_argument("--archive", required=True, type=Path)
@@ -814,6 +909,13 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--width", required=True, type=int)
     validate.add_argument("--height", required=True, type=int)
     validate.add_argument("--split", required=True, choices=("train", "val", "test"))
+
+    rvt_genx = subparsers.add_parser("validate-rvt-genx")
+    rvt_genx.add_argument("--root", required=True, type=Path)
+    rvt_genx.add_argument("--dataset", required=True, choices=("gen1", "gen4"))
+    rvt_genx.add_argument(
+        "--split", required=True, choices=("train", "val", "test")
+    )
 
     m3ed = subparsers.add_parser("validate-m3ed-plan")
     m3ed.add_argument("--dataset-list", required=True, type=Path)
@@ -845,6 +947,7 @@ def main() -> None:
             args.metadata,
             args.expected_bytes,
             args.expected_sha256,
+            args.expected_crc32,
         )
         print(
             json.dumps(
@@ -853,6 +956,7 @@ def main() -> None:
                     "kind": payload["kind"],
                     "size_bytes": payload["size_bytes"],
                     "sha256": payload["sha256"],
+                    "crc32": payload.get("crc32"),
                 },
                 sort_keys=True,
             )
@@ -863,6 +967,9 @@ def main() -> None:
         return
     if args.command == "validate-prophesee":
         validate_prophesee(args.root, args.width, args.height, args.split)
+        return
+    if args.command == "validate-rvt-genx":
+        validate_rvt_genx(args.root, args.dataset, args.split)
         return
     if args.command == "validate-m3ed-plan":
         validate_m3ed_plan(args.dataset_list, args.sequence_list, args.split)

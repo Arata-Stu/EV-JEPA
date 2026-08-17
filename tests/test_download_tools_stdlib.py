@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+import zlib
 from pathlib import Path
 
 
@@ -35,6 +36,26 @@ class DownloadToolTests(unittest.TestCase):
                 archive_path, "archive", metadata_path, archive_path.stat().st_size, None
             )
             self.assertEqual(verified["sha256"], checked["sha256"])
+
+            expected_crc32 = f"{zlib.crc32(archive_path.read_bytes()):08x}"
+            checked_crc = archive_tool.check_metadata(
+                archive_path,
+                "archive",
+                metadata_path,
+                archive_path.stat().st_size,
+                None,
+                expected_crc32,
+            )
+            self.assertEqual(checked_crc["crc32"], expected_crc32)
+            with self.assertRaisesRegex(ValueError, "CRC32 mismatch"):
+                archive_tool.check_metadata(
+                    archive_path,
+                    "archive",
+                    metadata_path,
+                    archive_path.stat().st_size,
+                    None,
+                    "00000000",
+                )
 
             output = root / "raw"
             state = root / "state"
@@ -133,7 +154,7 @@ class DownloadToolTests(unittest.TestCase):
             )
             (split / "recording_bbox.npy").write_bytes(b"placeholder")
             archive_tool.validate_prophesee(root, 304, 240, "train")
-            script = MODULE_PATH.with_name("download_gen1.sh")
+            script = MODULE_PATH.with_name("download_prophesee_gen1_dat.sh")
             completed = subprocess.run(
                 [
                     str(script),
@@ -150,6 +171,38 @@ class DownloadToolTests(unittest.TestCase):
                 env={"PATH": os.environ["PATH"], "PYTHON_BIN": sys.executable},
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_rvt_genx_hdf5_layouts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            for dataset, suffix in (("gen4", "_td.h5"), ("gen1", "_td.dat.h5")):
+                dataset_root = root / dataset
+                split = dataset_root / "train"
+                split.mkdir(parents=True)
+                (split / "recording_bbox.npy").write_bytes(b"placeholder")
+                (split / f"recording{suffix}").write_bytes(
+                    archive_tool.HDF5_MAGIC + b"placeholder"
+                )
+                archive_tool.validate_rvt_genx(dataset_root, dataset, "train")
+                script = MODULE_PATH.with_name(f"download_{dataset}.sh")
+                completed = subprocess.run(
+                    [
+                        str(script),
+                        "--extracted-root",
+                        str(dataset_root),
+                        "--split",
+                        "train",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env={"PATH": os.environ["PATH"], "PYTHON_BIN": sys.executable},
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            (root / "gen4" / "train" / "recording_td.h5").unlink()
+            with self.assertRaisesRegex(ValueError, "event HDF5 is missing"):
+                archive_tool.validate_rvt_genx(root / "gen4", "gen4", "train")
 
     def test_normalized_archive_member_collision_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

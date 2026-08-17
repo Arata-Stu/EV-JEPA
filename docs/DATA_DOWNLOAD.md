@@ -9,18 +9,18 @@
 | 0 | DSEC 1 sequence | downloader・前処理・時刻窓の確認 | sequence依存 | なし |
 | 1 | M3ED Phase 1 train+val | 異なる解像度を含む事前学習の成立確認 | 20,262,591,423 bytes | なし |
 | 2 | DSEC Detection train+val | driving domainと下流検出 | train全体131.9 GB相当 + extra val 21.9 GB | なし |
-| 3 | Gen1 | 304×240での検出baseline | 200 GB圧縮、750 GB展開 | **公式フォーム・CAPTCHA** |
+| 3 | Gen1（RVT original-event HDF5） | 304×240での検出baseline | 約200 GB圧縮、展開量は要確認 | なし |
 | 4 | M3ED test / DSEC test | 最終評価 | M3ED候補137.1 GB、DSEC約36.0 GB | なし |
-| 5 | Prophesee 1Mpx | 高解像度transferと検出 | 1.6 TB圧縮、3.5 TB展開 | **公式フォーム・メール確認** |
+| 5 | Gen4 / 1Mpx（RVT original-event HDF5） | 高解像度transferと検出 | 大容量。既存データの利用を優先 | なし |
 
 主な事前学習データはM3EDとDSEC、下流の成立確認はDSEC DetectionとGen1、
 1Mpxは最後のscale-upとするのが現実的です。M3EDはcar/spot/falconを一度に
 取得せず、まず同じcar/urban/day条件のtrain/val 1本ずつから始めます。
 
-Gen1は1Mpxより小さいものの、全量では軽量ではありません。公式にはtrain 6、
-val 2、test 2の独立archiveなので、まず1 archiveだけ取得できます。1Mpxは
-archive数・固定ファイル名・publisher checksumが公開されていないため、容量に
-十分な余裕ができるまで保留します。
+Gen1/Gen4はRVTが公開しているtrain/val/test単位のoriginal-event HDF5 tarを標準経路に
+します。RVTの`preprocessed/*.tar`は固定蓄積時間のevent representationなので、任意の
+蓄積時間を学習時に切り出す本projectでは使いません。ここで使うのは
+`datasets/gen1_tar` / `datasets/gen4_tar`です。
 
 ## downloaderの共通仕様
 
@@ -39,6 +39,7 @@ chmod +x scripts/download/*.sh scripts/download/archive_tool.py
 - 保護URLをsidecarやログへ保存せず、`curl`のprocess引数にも直接置かない
 - HTMLのlogin/error pageをデータとして受理しない
 - ZIP/TARのintegrity検査、HDF5 signature、byte数、ローカルSHA-256を記録
+- 配布元が公開している場合はCRC32も照合（RVT Gen1/Gen4は全splitで照合）
 - 検証後だけatomic renameし、完成済みファイルは再取得しない
 - archive展開は各memberを一時ファイルから置換し、完了記録から再開
 - path traversal、symlink、特殊memberを含むarchiveを拒否
@@ -145,9 +146,69 @@ bash scripts/download/download_m3ed.sh \
   --sequence-list configs/datasets/m3ed_phase2_test.txt
 ```
 
-## Gen1
+## Gen1 / Gen4: RVT original-event HDF5（推奨）
 
-Gen1の初回URL取得はCLIだけでは完結しません。公式ページからZohoフォームを開き、
+RVTのoriginal dataset preprocessing READMEには、Gen1/Gen4ともtrain/val/testの公開tarと
+CRC32が掲載されています。認証、フォーム、GUIは不要です。展開後は次の連続event HDF5を
+使います。
+
+- Gen4: `train|val|test/*_td.h5` と同名prefixの`*_bbox.npy`
+- Gen1: `train|val|test/*_td.dat.h5` と同名prefixの`*_bbox.npy`
+- event HDF5内部: `/events/x`, `/events/y`, `/events/p`, `/events/t`
+
+これは固定voxelではありません。各recordingのevent列が残るため、canonical Zstd HDF5へ
+整形した後も学習時に10 ms、10.5 ms、40 msなど任意の窓を切り出せます。
+
+Gen1をsplit単位で取得・展開する例です。同じcommandを再実行すると`.part`から再開し、
+完成済みtarはCRC32を照合してskipします。
+
+```bash
+cd /home/aten-22/project/research/EV-JEPA
+
+GEN1_ROOT=/mnt/ssd-4tb/dataset/gen1_rvt_h5
+
+bash scripts/download/download_gen1.sh \
+  --root "$GEN1_ROOT" --split train --extract
+bash scripts/download/download_gen1.sh \
+  --root "$GEN1_ROOT" --split val --extract
+bash scripts/download/download_gen1.sh \
+  --root "$GEN1_ROOT" --split test --extract
+```
+
+新たにGen4を取得する場合も同じです。
+
+```bash
+GEN4_DOWNLOAD_ROOT=/mnt/ssd-4tb/dataset/gen4_rvt_h5
+
+bash scripts/download/download_gen4.sh \
+  --root "$GEN4_DOWNLOAD_ROOT" --split train --extract
+bash scripts/download/download_gen4.sh \
+  --root "$GEN4_DOWNLOAD_ROOT" --split val --extract
+bash scripts/download/download_gen4.sh \
+  --root "$GEN4_DOWNLOAD_ROOT" --split test --extract
+```
+
+既に`/mnt/ssd-4tb/dataset/gen4/{train,val,test}`を持っている場合は再ダウンロードせず、
+RVTのファイル名規約、bboxとの1対1対応、HDF5 signatureだけを標準ライブラリで検査できます。
+
+```bash
+cd /home/aten-22/project/research/EV-JEPA
+
+bash scripts/download/download_gen4.sh \
+  --extracted-root /mnt/ssd-4tb/dataset/gen4 \
+  --split all
+```
+
+この検査は依存なしの入口検査です。`/events`のkey、dtype、全timestamp単調性、座標範囲、
+解像度1280×720（Gen4）/304×240（Gen1）は、canonical前処理で全件検査します。
+
+tarと展開後データを同時保持する余裕がなければ、まず`--extract`なしで1 splitを取得し、
+空き容量を確認してください。scriptはtarも展開物も自動削除しません。
+
+## Gen1: Prophesee DAT経路（代替）
+
+元のProphesee DAT配布を直接使う場合だけ、初回URL取得はCLIだけでは完結しません。
+公式ページからZohoフォームを開き、
 氏名・メール・所属等を入力し、利用条件への同意とCAPTCHAを手動で完了してください。
 利用条件は研究者本人が確認する必要があります。
 
@@ -165,7 +226,7 @@ cp configs/download/gen1_urls.example.txt configs/download/gen1_train.private.ur
 chmod 600 configs/download/gen1_train.private.urls
 # configs/download/gen1_train.private.urlsを編集
 
-bash scripts/download/download_gen1.sh \
+bash scripts/download/download_prophesee_gen1_dat.sh \
   --root /datasets/downloads/gen1 \
   --split train \
   --url-file configs/download/gen1_train.private.urls
@@ -175,7 +236,7 @@ bash scripts/download/download_gen1.sh \
 この場合、ブラウザ側downloadの再開機能はブラウザに依存します。
 
 ```bash
-bash scripts/download/download_gen1.sh \
+bash scripts/download/download_prophesee_gen1_dat.sh \
   --root /datasets/downloads/gen1 \
   --split train \
   --inbox /path/to/manual/gen1 \
@@ -191,13 +252,13 @@ canonical HDF5の作業領域も含めて1 TB超を想定します。
 依存なしの検査だけを実行できます。
 
 ```bash
-bash scripts/download/download_gen1.sh \
+bash scripts/download/download_prophesee_gen1_dat.sh \
   --root /datasets/downloads/gen1 \
   --split train \
   --extracted-root /datasets/downloads/gen1/raw/train
 ```
 
-## Prophesee 1Mpx
+## Prophesee 1Mpx DAT経路（代替）
 
 1Mpxも公式フォーム、professional emailの検証、利用条件への同意、CAPTCHAを手動で
 完了する必要があります。download以降の使い方はGen1と同じです。
@@ -217,15 +278,15 @@ bash scripts/download/download_prophesee_1mpx.sh \
   --url-file configs/download/1mpx_train.private.urls
 ```
 
-GUI取得済みなら`--split SPLIT --inbox DIRECTORY`を使い、空き容量を確認後に
+GUI取得済みのDAT版なら`--split SPLIT --inbox DIRECTORY`を使い、空き容量を確認後に
 `--extract`を付けます。全rawを圧縮archiveと同時保持するだけで約5.1 TBになるため、
 canonical HDF5の作業領域まで
-含めて6 TB超を想定してください。RVT等の第三者mirrorは便利でも、公式フォームの
-利用条件と取得経路を迂回するおそれがあるため、この実装では自動利用しません。
+含めて6 TB超を想定してください。RVT HDF5経路を使う場合も、元データに適用される
+利用条件は利用者自身で確認してください。
 
 ## 前処理への接続
 
-DSECとProphesee系は`ROOT/raw`、M3EDは同じく`ROOT/raw`を
+DSEC、RVT Gen1/Gen4、Prophesee DAT系は`ROOT/raw`、M3EDも同じく`ROOT/raw`を
 `window-jepa-preprocess --input`へ渡します。具体的な時刻補正、split、解像度、
 Zstd HDF5変換は[DATA_PREPROCESSING.md](DATA_PREPROCESSING.md)を参照してください。
 
@@ -246,5 +307,7 @@ Zstd HDF5変換は[DATA_PREPROCESSING.md](DATA_PREPROCESSING.md)を参照して�
 - [DSEC-Detection](https://dsec.ifi.uzh.ch/dsec-detection/)
 - [M3ED Download](https://m3ed.io/download/)
 - [M3ED official dataset list（固定commit）](https://github.com/daniilidis-group/m3ed/blob/df739f20fba41ac6da8c22f4260c305875e391ed/dataset_list.yaml)
+- [RVT original Gen1/Gen4 download・CRC32・前処理手順](https://github.com/uzh-rpg/RVT/blob/master/scripts/genx/README.md)
+- [RVT README（固定表現済みtarとの区別）](https://github.com/uzh-rpg/RVT#required-data)
 - [Prophesee dataset formats and sizes](https://docs.prophesee.ai/stable/datasets.html)
 - [Prophesee automotive dataset toolbox](https://github.com/prophesee-ai/prophesee-automotive-dataset-toolbox)

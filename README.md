@@ -36,7 +36,7 @@
 - atomic checkpoint、厳密resume、collapse診断値のJSONL記録
 - higher-is-better / lower-is-better双方に対応したwindow robustness集計
 - fixed-window JEPA、直接feature consistency、Window-JEPAの設定例
-- DSEC・M3ED・Gen1・Prophesee 1MpxからZstd HDF5へのstreaming前処理
+- DSEC・M3ED・RVT Gen1/Gen4・Prophesee DATからZstd HDF5へのstreaming前処理
 
 下流タスク固有のデータ変換・head・公式evaluatorは、このリポジトリへ外部コードを直接コピーせず、`event_window_jepa.downstream.features`の共通feature境界へ接続する設計です。Gen1検出、DSEC segmentation、MVSEC depth/flowの統合は各データセットを用意した段階で追加します。
 

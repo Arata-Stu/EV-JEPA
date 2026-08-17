@@ -260,6 +260,110 @@ class M3EDEventSource:
             self._handle = None
 
 
+class RVTGenXH5EventSource:
+    """Streaming adapter for RVT's original-event Gen1/Gen4 HDF5 files."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        dataset: str,
+        camera: str = "left",
+        sequence_name: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        if dataset not in {"gen1", "gen4"}:
+            raise ValueError("RVT HDF5 dataset must be gen1 or gen4")
+        if camera != "left":
+            raise ValueError("RVT Gen1/Gen4 detection recordings are monocular")
+        if (width is None) != (height is None):
+            raise ValueError("RVT HDF5 width and height overrides must be paired")
+
+        h5py = _require_hdf5()
+        self.path = Path(path).expanduser().resolve()
+        self._handle = h5py.File(self.path, "r")
+        try:
+            self._events = self._handle["events"]
+            event_count = _validate_h5_event_fields(self._events)
+            defaults = (304, 240) if dataset == "gen1" else (1280, 720)
+            has_width = "width" in self._events
+            has_height = "height" in self._events
+            if has_width != has_height:
+                raise ValueError("RVT /events has only one of width and height")
+            if has_width:
+                width_value = np.asarray(self._events["width"][()])
+                height_value = np.asarray(self._events["height"][()])
+                if (
+                    width_value.size != 1
+                    or height_value.size != 1
+                    or not np.issubdtype(width_value.dtype, np.integer)
+                    or not np.issubdtype(height_value.dtype, np.integer)
+                ):
+                    raise TypeError("RVT event width/height must be integer scalars")
+                inferred = (
+                    int(width_value.reshape(-1)[0]),
+                    int(height_value.reshape(-1)[0]),
+                )
+            else:
+                inferred = defaults
+            if inferred != defaults:
+                raise ValueError(
+                    f"RVT {dataset} resolution must be {defaults[0]}x{defaults[1]}, "
+                    f"got {inferred[0]}x{inferred[1]}"
+                )
+            if width is not None and (width, height) != inferred:
+                raise ValueError("resolution override disagrees with RVT HDF5 metadata")
+            width, height = inferred
+            first = int(self._events["t"][0])
+            last = int(self._events["t"][-1])
+        except BaseException:
+            self._handle.close()
+            raise
+
+        if sequence_name is None:
+            filename = self.path.name
+            suffix = "_td.dat.h5" if dataset == "gen1" else "_td.h5"
+            sequence_name = filename.removesuffix(suffix)
+        self.metadata = EventSourceMetadata(
+            sequence_id=sequence_identifier(dataset, sequence_name, camera),
+            dataset=dataset,
+            source_path=self.path,
+            camera=camera,
+            width=width,
+            height=height,
+            event_count=event_count,
+            first_timestamp_us=first,
+            last_timestamp_us=last,
+            coordinate_frame="distorted",
+            attributes={
+                "timestamp_reference": "RVT original-event HDF5 recording clock",
+                "timestamp_synchronized": True,
+                "source_format": "RVT GenX original-event HDF5",
+                "source_events_group": "/events",
+            },
+        )
+
+    def iter_event_chunks(
+        self, chunk_events: int, start_event: int = 0
+    ) -> Iterator[Mapping[str, np.ndarray]]:
+        if not 0 <= start_event <= self.metadata.event_count:
+            raise ValueError("start_event is outside the source event stream")
+        for start in range(start_event, self.metadata.event_count, chunk_events):
+            stop = min(start + chunk_events, self.metadata.event_count)
+            yield {
+                "x": np.asarray(self._events["x"][start:stop]),
+                "y": np.asarray(self._events["y"][start:stop]),
+                "t_us": np.asarray(self._events["t"][start:stop], dtype=np.int64),
+                "polarity": np.asarray(self._events["p"][start:stop]),
+            }
+
+    def close(self) -> None:
+        if self._handle:
+            self._handle.close()
+            self._handle = None
+
+
 def _parse_dat_header(handle: Any) -> tuple[int, int, int, int, int]:
     handle.seek(0, os.SEEK_SET)
     width: int | None = None
@@ -442,10 +546,22 @@ def discover_sequence_paths(dataset: str, input_path: str | Path, camera: str) -
                         paths.append(candidate)
             except OSError:
                 continue
-    elif dataset in {"prophesee_1mpx", "gen1"}:
+    elif dataset == "gen4":
+        paths = sorted(root.glob("**/*_td.h5"))
+    elif dataset == "prophesee_1mpx":
         paths = sorted(root.glob("**/*.dat"))
+    elif dataset == "gen1":
+        paths = sorted(root.glob("**/*.dat"))
+        paths.extend(sorted(root.glob("**/*_td.dat.h5")))
+        paths = sorted(set(paths))
     else:
         raise ValueError(f"unsupported source dataset: {dataset}")
+    if root.is_dir() and dataset in {"gen1", "gen4"}:
+        paths = [
+            path
+            for path in paths
+            if "_excluded_failed_validation" not in path.relative_to(root).parts
+        ]
     if not paths:
         raise ValueError(f"no {dataset} event sequences found below {root}")
     return paths
@@ -458,7 +574,7 @@ def make_event_source(
     camera: str,
     width: int | None = None,
     height: int | None = None,
-) -> DSECEventSource | M3EDEventSource | PropheseeDatEventSource:
+) -> DSECEventSource | M3EDEventSource | RVTGenXH5EventSource | PropheseeDatEventSource:
     if dataset == "dsec":
         if width is not None or height is not None:
             raise ValueError("DSEC resolution is fixed at 640x480")
@@ -466,6 +582,15 @@ def make_event_source(
     if dataset == "m3ed":
         return M3EDEventSource(
             path, camera=camera, width=width, height=height
+        )
+    source_path = Path(path)
+    if dataset == "gen4" or (dataset == "gen1" and source_path.suffix == ".h5"):
+        return RVTGenXH5EventSource(
+            path,
+            dataset=dataset,
+            camera=camera,
+            width=width,
+            height=height,
         )
     if dataset in {"prophesee_1mpx", "gen1"}:
         return PropheseeDatEventSource(

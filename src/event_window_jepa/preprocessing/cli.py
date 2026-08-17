@@ -28,14 +28,14 @@ from event_window_jepa.preprocessing.sources import (
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert raw DSEC, M3ED, Gen1, or 1Mpx event streams into "
+            "Convert raw DSEC, M3ED, Gen1, or Gen4/1Mpx event streams into "
             "arbitrary-window Zstd HDF5 files"
         )
     )
     parser.add_argument(
         "--dataset",
         required=True,
-        choices=("dsec", "m3ed", "prophesee_1mpx", "gen1"),
+        choices=("dsec", "m3ed", "prophesee_1mpx", "gen1", "gen4"),
     )
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
@@ -82,14 +82,14 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Directory for portable copies of matching *_bbox.npy files. "
-            "Defaults to OUTPUT_ROOT/labels for Prophesee DAT inputs."
+            "Defaults to OUTPUT_ROOT/labels for Prophesee DAT or RVT HDF5 inputs."
         ),
     )
     parser.add_argument(
         "--allow-missing-bboxes",
         action="store_true",
         help=(
-            "Allow 1Mpx/Gen1 train or val DAT files without a matching sibling "
+            "Allow Gen1/Gen4/1Mpx train or val event files without a matching sibling "
             "*_bbox.npy (intended only for self-supervised pretraining)"
         ),
     )
@@ -130,13 +130,17 @@ def _source_sequence_name(dataset: str, path: Path) -> str:
         return path.parents[2].name
     if dataset == "m3ed":
         return path.stem.removesuffix("_data")
+    if dataset == "gen4" and path.name.endswith("_td.h5"):
+        return path.name.removesuffix("_td.h5")
+    if dataset == "gen1" and path.name.endswith("_td.dat.h5"):
+        return path.name.removesuffix("_td.dat.h5")
     return path.stem
 
 
 def _resolved_spatial_downsample(dataset: str, requested: int | None) -> int:
     if requested is not None:
         value = requested
-    elif dataset in {"m3ed", "prophesee_1mpx"}:
+    elif dataset in {"m3ed", "prophesee_1mpx", "gen4"}:
         value = 2
     else:
         value = 1
@@ -146,10 +150,16 @@ def _resolved_spatial_downsample(dataset: str, requested: int | None) -> int:
 
 
 def _matching_bbox(path: Path) -> Path | None:
-    if path.suffix.lower() != ".dat":
+    name = path.name
+    if name.endswith("_td.dat.h5"):
+        bbox_stem = name.removesuffix("_td.dat.h5") + "_bbox"
+    elif name.endswith("_td.h5"):
+        bbox_stem = name.removesuffix("_td.h5") + "_bbox"
+    elif path.suffix.lower() == ".dat":
+        stem = path.stem
+        bbox_stem = f"{stem[:-3]}_bbox" if stem.endswith("_td") else f"{stem}_bbox"
+    else:
         return None
-    stem = path.stem
-    bbox_stem = f"{stem[:-3]}_bbox" if stem.endswith("_td") else f"{stem}_bbox"
     candidate = path.with_name(f"{bbox_stem}.npy")
     return candidate if candidate.is_file() else None
 
@@ -292,25 +302,28 @@ def main() -> None:
     if args.bbox_output_root is not None and args.dataset not in {
         "prophesee_1mpx",
         "gen1",
+        "gen4",
     }:
-        raise ValueError("--bbox-output-root is only valid for Prophesee DAT datasets")
+        raise ValueError("--bbox-output-root is only valid for Prophesee/RVT datasets")
     if args.allow_missing_bboxes and args.dataset not in {
         "prophesee_1mpx",
         "gen1",
+        "gen4",
     }:
         raise ValueError(
-            "--allow-missing-bboxes is only valid for Prophesee DAT datasets"
+            "--allow-missing-bboxes is only valid for Prophesee/RVT datasets"
         )
 
     input_path = args.input.expanduser().resolve()
     paths = discover_sequence_paths(args.dataset, input_path, args.camera)
-    if args.dataset in {"prophesee_1mpx", "gen1"}:
+    if args.dataset in {"prophesee_1mpx", "gen1", "gen4"}:
         declared_splits = {path: _dat_path_split(path) for path in paths}
         if input_path.is_dir():
             unassigned = [path for path, split in declared_splits.items() if split is None]
             if unassigned:
                 raise ValueError(
-                    "directory-wide DAT conversion requires train/val/test directories; "
+                    "directory-wide Prophesee/RVT conversion requires train/val/test "
+                    "directories; "
                     f"could not determine the split of {unassigned[:3]}"
                 )
             paths = [
@@ -321,7 +334,7 @@ def main() -> None:
             declared_split = declared_splits[paths[0]]
             if declared_split is not None and declared_split != args.split:
                 raise ValueError(
-                    f"DAT path belongs to {declared_split}, not requested {args.split}"
+                    f"source path belongs to {declared_split}, not requested {args.split}"
                 )
     if args.dataset == "dsec" and input_path.is_dir() and args.sequence_list is None:
         raise ValueError(
@@ -392,28 +405,28 @@ def main() -> None:
         )
     bbox_sources = (
         {path: _matching_bbox(path) for path in paths}
-        if args.dataset in {"prophesee_1mpx", "gen1"}
+        if args.dataset in {"prophesee_1mpx", "gen1", "gen4"}
         else {}
     )
     if (
-        args.dataset in {"prophesee_1mpx", "gen1"}
+        args.dataset in {"prophesee_1mpx", "gen1", "gen4"}
         and args.split in {"train", "val"}
         and not args.allow_missing_bboxes
     ):
         missing_bboxes = [path for path, bbox in bbox_sources.items() if bbox is None]
         if missing_bboxes:
             raise FileNotFoundError(
-                "selected train/val DAT files have no matching sibling *_bbox.npy: "
+                "selected train/val event files have no matching sibling *_bbox.npy: "
                 f"{missing_bboxes[:3]}; use --allow-missing-bboxes only for "
                 "label-free self-supervised data"
             )
     bbox_metadata: dict[Path, dict[str, bool | int | str]] = {}
     if bbox_sources:
         expected_width = args.width or (
-            1280 if args.dataset == "prophesee_1mpx" else 304
+            1280 if args.dataset in {"prophesee_1mpx", "gen4"} else 304
         )
         expected_height = args.height or (
-            720 if args.dataset == "prophesee_1mpx" else 240
+            720 if args.dataset in {"prophesee_1mpx", "gen4"} else 240
         )
         for path, bbox in bbox_sources.items():
             if bbox is not None:

@@ -1,4 +1,4 @@
-# DSEC・M3ED・1Mpxの前処理
+# DSEC・M3ED・Gen1・Gen4/1Mpxの前処理
 
 公式配布元、段階的なデータセット選定、再開可能なdownload script、Gen1/1Mpxで
 必要な手動フォーム操作は[DATA_DOWNLOAD.md](DATA_DOWNLOAD.md)を先に参照してください。
@@ -42,8 +42,8 @@ commandを再実行すれば互換性を確認して`.partial`から再開しま
 | --- | ---: | --- | --- |
 | DSEC | 640×480 | left、倍率1、distortedのまま | 事前学習、Detection |
 | M3ED | 1280×720 | leftから開始、整数2分の1 | 大規模・異種環境事前学習 |
-| Prophesee 1Mpx | 1280×720 | 整数2分の1 | 高解像度Detection |
-| Gen1 | 304×240 | 倍率1 | 小規模な成立確認 |
+| RVT Gen4 / Prophesee 1Mpx | 1280×720 | 整数2分の1 | 高解像度Detection |
+| RVT Gen1 / Prophesee Gen1 | 304×240 | 倍率1 | 小規模な成立確認 |
 
 1280×720を640×480へ非等方変形しません。M3EDと1Mpxは`x//=2, y//=2`で
 640×360にし、DSECは640×480のまま保持します。学習時に全datasetから同じ
@@ -146,9 +146,73 @@ train/val/testの変換後に3 manifestを`window-jepa-merge-manifests`で一度
 同一source recordingが複数splitへ入っていないことも検査できます。統合manifestは
 各行にsplitを保持するため、そのままloaderからsplit別に選択できます。
 
-## Prophesee 1MpxとGen1
+## RVT original-event HDF5（Gen1 / Gen4、推奨）
 
-Event2Dの8-byte DAT recordをchunk読みし、32-bit timestamp wrapを展開します。
+RVT配布版は、Gen4が`*_td.h5`、Gen1が`*_td.dat.h5`で、どちらも
+`/events/{x,y,p,t}`に連続event列を保持しています。RVTの固定representation済みtarは
+使用しません。converterは入力をchunk読みし、timestampの全体非減少、整数dtype、
+`x/y/p/t`の同長、極性、座標範囲、解像度を検査します。RVT実装のように逆行timestampを
+黙って補正せず、破損または想定外の入力として停止します。
+
+既存Gen4の最初の1 recordingを、出力を書かずに検査・計画表示する例です。
+
+```bash
+cd /home/aten-22/project/research/EV-JEPA
+source env/bin/activate
+
+window-jepa-preprocess \
+  --dataset gen4 \
+  --input /mnt/ssd-4tb/dataset/gen4 \
+  --output-root /mnt/ssd-4tb/dataset/evjepa/gen4/events/train \
+  --bbox-output-root /mnt/ssd-4tb/dataset/evjepa/gen4/labels/train \
+  --manifest /mnt/ssd-4tb/dataset/evjepa/gen4/manifests/train.jsonl \
+  --split train \
+  --spatial-downsample 2 \
+  --limit 1 \
+  --plan-only
+```
+
+計画が正しければ`--plan-only`と`--limit 1`を外し、`--skip-existing`と
+`--merge-manifest`を付けて変換します。val/testは出力directory、manifest、`--split`を
+それぞれ変えて実行してください。
+
+```bash
+window-jepa-preprocess \
+  --dataset gen4 \
+  --input /mnt/ssd-4tb/dataset/gen4 \
+  --output-root /mnt/ssd-4tb/dataset/evjepa/gen4/events/train \
+  --bbox-output-root /mnt/ssd-4tb/dataset/evjepa/gen4/labels/train \
+  --manifest /mnt/ssd-4tb/dataset/evjepa/gen4/manifests/train.jsonl \
+  --split train \
+  --spatial-downsample 2 \
+  --skip-existing \
+  --merge-manifest
+```
+
+RVT Gen1はdownload rootの`raw`を入力にし、倍率1にします。
+
+```bash
+window-jepa-preprocess \
+  --dataset gen1 \
+  --input /mnt/ssd-4tb/dataset/gen1_rvt_h5/raw \
+  --output-root /mnt/ssd-4tb/dataset/evjepa/gen1/events/train \
+  --bbox-output-root /mnt/ssd-4tb/dataset/evjepa/gen1/labels/train \
+  --manifest /mnt/ssd-4tb/dataset/evjepa/gen1/manifests/train.jsonl \
+  --split train \
+  --spatial-downsample 1 \
+  --skip-existing \
+  --merge-manifest
+```
+
+HDF5内に`/events/width,height`があれば公式解像度と照合し、無ければGen4は
+1280×720、Gen1は304×240を使います。Gen4は`x//=2,y//=2`で640×360、Gen1は
+304×240のままです。bboxはnative座標のまま別に保存し、manifestへ倍率を記録します。
+既存データroot内の`_excluded_failed_validation`は再帰探索から明示的に除外します。
+
+## Prophesee DAT（代替入力）
+
+元のProphesee配布を使う場合は、Event2Dの8-byte DAT recordをchunk読みし、
+32-bit timestamp wrapを展開します。
 headerに解像度がない場合、1Mpxは1280×720、Gen1は304×240を使います。
 
 1Mpxには誤って1280×720のまま全量変換しないための専用wrapperがあります。出力は
@@ -210,8 +274,10 @@ train/valでは対応するsibling `*_bbox.npy`が1件でもなければ、書�
 factor 2は`x//=2, y//=2`で640×360へ座標を揃える設定で、event行とtimestampは一切
 間引きません。このprojectの標準pipelineはeventをcropしてから224×224表現を作るため、
 nativeとfactor 2でdense tensor/token数は同じです。またfactor 2の224 cropはnative
-座標でより広い面積に相当し、含まれるevent数が増える場合もあります。主目的はFOV、
-検出座標、DSEC/M3EDとの解像度整合であり、H5容量や学習時間の4倍削減ではありません。
+座標でより広い面積に相当し、含まれるevent数が増える場合もあります。主目的は
+M3ED/Gen4間でstored gridを640×360へ揃えることと、同じ224×224 cropでより広い
+native領域を扱うことです。DSECは640×480、Gen1は304×240のままで、角度FOVや
+物体scaleまで同一にはなりません。H5容量や学習時間の4倍削減でもありません。
 factor 4の320×180は標準224 cropより高さが小さいため使用しません。
 
 全量変換の前に、同じ1--3 recordingを別outputへnative（factor 1）とfactor 2で変換し、
@@ -231,12 +297,12 @@ window-jepa-preprocess \
   --skip-existing
 ```
 
-Gen1は`--dataset gen1 --spatial-downsample 1`です。Prophesee bboxはportable bundleへ
+DAT版Gen1も`--dataset gen1 --spatial-downsample 1`です。Prophesee bboxはportable bundleへ
 rawのままcopyされ、converterは下流labelを書き換えません。空間downsampleしたeventと
 labelを組み合わせる場合は、下流adapterでbbox座標へ同じ倍率を適用し、bbox timestamp
 からmanifestの`source_time_origin_us`を引いて内部時計へ揃えます。DSEC labelsと
 calibrationも小さいため別途保持してください。
-1Mpx/Gen1をdataset rootから再帰探索する場合も、各DATの最寄りの
+Gen4/1Mpx/Gen1をdataset rootから再帰探索する場合も、各event fileの最寄りの
 `train`/`val`/`validation`/`test` directoryと`--split`を照合し、別splitのclipを
 混入させません。
 
