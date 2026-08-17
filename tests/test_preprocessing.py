@@ -7,9 +7,11 @@ import pytest
 
 from event_window_jepa.data.types import SequenceInfo
 from event_window_jepa.preprocessing.common import (
+    EventSourceMetadata,
     _exclusive_output_lock,
     _repair_timestamp_regressions,
     _timestamp_numpy_dtype,
+    _validate_identity_attributes,
     _validate_source_chunk,
     coarse_index_entries,
     write_manifest,
@@ -70,6 +72,50 @@ def test_rvt_timestamp_repair_is_running_max_across_chunks() -> None:
     arrays, previous = _validate_source_chunk(repaired, previous)
     assert arrays["t_us"].tolist() == [11, 12]
     assert (count, maximum, previous) == (1, 4, 12)
+
+
+def test_legacy_rvt_output_without_duration_extension_metadata_is_accepted(
+    tmp_path,
+) -> None:
+    source_path = tmp_path / "source.h5"
+    source_path.write_bytes(b"source")
+    metadata = EventSourceMetadata(
+        sequence_id="gen4__recording__left",
+        dataset="gen4",
+        source_path=source_path,
+        camera="left",
+        width=1280,
+        height=720,
+        event_count=3,
+        first_timestamp_us=100,
+        last_timestamp_us=200,
+        attributes={
+            "timestamp_reference": "RVT recording clock",
+            "timestamp_synchronized": True,
+            "timestamp_repair_policy": "running_max",
+        },
+    )
+
+    class LegacyHandle:
+        attrs = {
+            "sequence_id": metadata.sequence_id,
+            "source_recording_id": "gen4__recording",
+            "source_dataset": metadata.dataset,
+            "source_path": str(source_path.resolve()),
+            "source_file_size": source_path.stat().st_size,
+            "source_mtime_ns": source_path.stat().st_mtime_ns,
+            "camera": metadata.camera,
+            "source_width": metadata.width,
+            "source_height": metadata.height,
+            "source_time_origin_us": metadata.first_timestamp_us,
+            "duration_us": 100,
+            "source_event_count": metadata.event_count,
+            "logical_split": "train",
+            "converter_config_sha256": "config",
+            "complete": True,
+        }
+
+    _validate_identity_attributes(LegacyHandle(), metadata, "train", "config")
 
 
 def test_sequence_identifier_is_dataset_and_camera_qualified() -> None:

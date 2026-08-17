@@ -312,14 +312,24 @@ def _validate_identity_attributes(
             and metadata.attributes.get("timestamp_repair_policy") == "running_max"
             and bool(handle.attrs.get("complete", False))
         ):
-            declared = int(handle.attrs.get("source_declared_duration_us", -1))
-            extension = int(handle.attrs.get("timestamp_duration_extension_us", -1))
-            matches = (
-                actual is not None
-                and declared == expected
-                and extension >= 0
-                and int(actual) == declared + extension
+            has_duration_metadata = (
+                "source_declared_duration_us" in handle.attrs
+                and "timestamp_duration_extension_us" in handle.attrs
             )
+            if has_duration_metadata:
+                declared = int(handle.attrs["source_declared_duration_us"])
+                extension = int(handle.attrs["timestamp_duration_extension_us"])
+                matches = (
+                    actual is not None
+                    and declared == expected
+                    and extension >= 0
+                    and int(actual) == declared + extension
+                )
+            else:
+                # Outputs completed before duration-extension metadata was
+                # introduced are valid only if their original duration still
+                # exactly matches the source declaration.
+                matches = actual is not None and int(actual) == expected
         elif isinstance(expected, int):
             matches = actual is not None and int(actual) == expected
         else:
