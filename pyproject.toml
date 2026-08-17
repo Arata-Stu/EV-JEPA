@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "event-window-jepa"
+version = "0.1.0"
+description = "Temporal-accumulation-conditioned JEPA pretraining for event-camera representations"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "numpy>=1.26",
+  "PyYAML>=6.0",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+hdf5 = [
+  "h5py>=3.10",
+  "hdf5plugin>=4.4",
+]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+window-jepa-pretrain = "event_window_jepa.train.pretrain:main"
+window-jepa-preprocess = "event_window_jepa.preprocessing.cli:main"
+window-jepa-merge-manifests = "event_window_jepa.preprocessing.merge_manifests:main"
+window-jepa-summarize = "event_window_jepa.evaluation.window_sweep:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

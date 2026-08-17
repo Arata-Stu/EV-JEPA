@@ -1,0 +1,75 @@
+data:
+  # JSONL schema is documented in README.md. Keep each sequence in one split.
+  manifest: data/manifests/pretrain.jsonl
+  # HDF5 avoids whole-sequence NPZ reloads when sampling many sequences.
+  store: hdf5
+  split: train
+  samples_per_epoch: 100000
+  batch_size: 64
+  workers: 8
+  # First sample a dataset uniformly, then a sequence within that dataset.
+  sequence_sampling: dataset_balanced
+  crop_size: [224, 224]
+  horizontal_flip_probability: 0.5
+
+representation:
+  type: voxel_grid
+  temporal_bins: 5
+  split_polarity: true
+  # Element-wise count compression; never divide by a sample's event count.
+  normalization: log1p
+
+windows:
+  train_ms: [10, 20, 40, 80]
+  eval_ms: [5, 10, 15, 20, 30, 40, 60, 80, 120]
+  unseen_eval_ms: [5, 15, 30, 60, 120]
+  target_ms: [10, 20, 40, 80]
+  canonical_ms: 40
+  minimum_ratio: 1.5
+  direction: any
+  # Equal-window pairs calibrate the predictor's identity transformation.
+  allow_equal: true
+
+model:
+  image_size: [224, 224]
+  patch_size: 16
+  embed_dim: 384
+  encoder_depth: 12
+  encoder_heads: 6
+  predictor_dim: 256
+  predictor_depth: 4
+  predictor_heads: 8
+  scale_dim: 128
+  scale_fourier_bands: 16
+  condition_on_scale: true
+
+mask:
+  # target_area_range applies to the union of the four target blocks.
+  target_blocks: 4
+  target_area_range: [0.15, 0.25]
+  target_aspect_range: [0.5, 2.0]
+  context_keep_ratio: 0.60
+
+optimization:
+  objective: window_jepa
+  epochs: 100
+  learning_rate: 0.0003
+  minimum_learning_rate: 0.000001
+  warmup_epochs: 10
+  weight_decay: 0.05
+  target_ema_start: 0.996
+  target_ema_end: 1.0
+  precision: bf16
+  gradient_clip: 1.0
+  # Keep disabled unless collapse diagnostics justify it.
+  variance_weight: 0.0
+  covariance_weight: 0.0
+  # Same latent objective on full context/full target, matching canonical inference.
+  canonical_query_weight: 0.25
+
+runtime:
+  seed: 0
+  output_dir: outputs/window_jepa_vits
+  log_every_steps: 20
+  checkpoint_every_epochs: 1
+  resume: null

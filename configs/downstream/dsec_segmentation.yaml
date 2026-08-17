@@ -1,0 +1,12 @@
+task: semantic_segmentation
+dataset: dsec
+representation_modes: [encoder_only, canonical]
+canonical_ms: 40
+head_training_windows_ms: [40]
+evaluation_windows_ms: [5, 10, 15, 20, 30, 40, 60, 80, 120]
+unseen_windows_ms: [5, 15, 30, 60, 120]
+metric: mIoU
+higher_is_better: true
+ignore_label: 255
+seeds: [0, 1, 2]
+

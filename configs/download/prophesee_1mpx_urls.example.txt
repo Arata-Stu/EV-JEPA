@@ -1,0 +1,8 @@
+# Private file format: filename URL [sha256|-] [bytes|-]
+#
+# Complete the official 1Mpx form and email verification first. Copy each
+# publisher-provided archive URL below, choose a stable local filename, then
+# rename this file to 1mpx.private.urls and run: chmod 600 1mpx.private.urls
+# Keep only one split in each URL file and pass that split to the script.
+#
+# 1mpx_train_01.zip https://publisher.example/signed-url - -

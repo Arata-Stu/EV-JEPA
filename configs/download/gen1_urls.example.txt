@@ -1,0 +1,8 @@
+# Private file format: filename URL [sha256|-] [bytes|-]
+#
+# Complete the official Gen1 form first. Copy each publisher-provided archive
+# URL below, choose a stable local filename, then rename this file to
+# gen1.private.urls and run: chmod 600 gen1.private.urls
+# Keep only one split in each URL file and pass that split to the script.
+#
+# gen1_train_01.zip https://publisher.example/signed-url - -
