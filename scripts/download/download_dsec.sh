@@ -127,9 +127,32 @@ fi
 mkdir -p "${ARCHIVE_ROOT}/${PROFILE}" "${ROOT}/.download-state"
 
 record_archive() {
+  local archive="$1"
+  local output="${2:-${EXTRACT_TO}}"
   if [ "${EXTRACT}" -eq 1 ]; then
-    download_extract_archive "$1" "${EXTRACT_TO}" "${STATE_ROOT}"
+    download_extract_archive "${archive}" "${output}" "${STATE_ROOT}"
   fi
+}
+
+extract_detection_labels() {
+  local outer_archive="$1"
+  [ "${EXTRACT}" -eq 1 ] || return 0
+
+  # The small all-labels archive is an archive-of-archives.  Expanding it
+  # directly below raw/ leaves train_object_detections.zip and
+  # test_object_detections.zip unopened, so stage those archives beside the
+  # downloaded artifacts and then merge their contents into the DSEC tree.
+  local nested_root="${ARCHIVE_ROOT}/detection-labels"
+  mkdir -p "${nested_root}"
+  download_extract_archive "${outer_archive}" "${nested_root}" "${STATE_ROOT}"
+
+  local split nested_archive
+  for split in train test; do
+    nested_archive="${nested_root}/${split}_object_detections.zip"
+    [ -f "${nested_archive}" ] || \
+      download_die "DSEC label bundle lacks $(basename "${nested_archive}")"
+    download_extract_archive "${nested_archive}" "${EXTRACT_TO}" "${STATE_ROOT}"
+  done
 }
 
 download_sequence() {
@@ -138,13 +161,20 @@ download_sequence() {
   local sequence_base="${DSEC_BASE}/${PHYSICAL_SPLIT}/${sequence}"
   local events_output="${ARCHIVE_ROOT}/${PROFILE}/${events_name}"
   download_url "${events_output}" "${sequence_base}/${events_name}" archive - -
-  record_archive "${events_output}"
+  # Individual DSEC event ZIPs contain bare events.h5/rectify_map.h5 members.
+  # They must be extracted into the sequence/camera directory; extracting all
+  # of them into raw/ would overwrite the preceding sequence.
+  record_archive \
+    "${events_output}" \
+    "${EXTRACT_TO}/${PHYSICAL_SPLIT}/${sequence}/events/left"
   if [ "${INCLUDE_CALIBRATION}" -eq 1 ]; then
     local calibration_name="${sequence}_calibration.zip"
     local calibration_output="${ARCHIVE_ROOT}/${PROFILE}/${calibration_name}"
     download_url \
       "${calibration_output}" "${sequence_base}/${calibration_name}" archive - -
-    record_archive "${calibration_output}"
+    record_archive \
+      "${calibration_output}" \
+      "${EXTRACT_TO}/${PHYSICAL_SPLIT}/${sequence}/calibration"
   fi
 }
 
@@ -194,7 +224,7 @@ fi
 if [ "${INCLUDE_LABELS}" -eq 1 ]; then
   labels_output="${ARCHIVE_ROOT}/dsec-det_left_object_detections.zip"
   download_url "${labels_output}" "${DSEC_LABEL_URL}" archive - "${DSEC_LABEL_BYTES}"
-  record_archive "${labels_output}"
+  extract_detection_labels "${labels_output}"
 fi
 
 if [ "${EXTRACT}" -eq 1 ]; then

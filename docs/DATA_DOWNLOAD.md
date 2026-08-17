@@ -104,6 +104,12 @@ calibrationは不要です。flow・disparity・semanticも扱う段階でだけ
 `--include-calibration`を付けます。valの`zurich_city_16_a`〜`21_a`は物理的には
 `train/`、testの`thun_02_a`だけはextra配布物です。scriptはこの差をprofile内で処理します。
 
+sequence単位のevent ZIPは内部に裸の`events.h5`と`rectify_map.h5`を持つため、
+scriptは`raw/<physical split>/<sequence>/events/left/`へ個別に展開します。全Detection
+labelの小さな配布ZIPは内側にtrain/test別ZIPを持つため、二段階で展開して
+`raw/<physical split>/<sequence>/object_detections/left/tracks.npy`へ配置します。
+複数sequenceのHDF5を`raw/events.h5`へ重ねることはありません。
+
 ## M3ED
 
 M3EDも認証・GUI不要です。公式S3からprocessed `*_data.h5`だけを取得し、動画、
