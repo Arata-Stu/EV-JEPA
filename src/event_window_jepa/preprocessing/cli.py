@@ -67,6 +67,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--read-chunk-events", type=int, default=1_000_000)
     parser.add_argument("--hdf5-chunk-events", type=int, default=262_144)
     parser.add_argument("--zstd-level", type=int, default=5)
+    parser.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=10.0,
+        help="Emit per-sequence JSON progress at this interval; 0 disables it",
+    )
     parser.add_argument("--index-step-us", type=int, default=1_000)
     parser.add_argument(
         "--timestamp-dtype", choices=("auto", "uint32", "uint64"), default="auto"
@@ -457,6 +463,7 @@ def main() -> None:
         overwrite=args.overwrite,
         skip_existing=args.skip_existing,
         resume_partial=not args.no_resume_partial,
+        progress_interval_seconds=args.progress_interval_seconds,
     )
 
     records: list[dict[str, object]] = []
@@ -571,6 +578,12 @@ def main() -> None:
                     "output_bytes": record["output_file_size"],
                     "source_file_bytes": record["source_file_size"],
                     "bbox": record.get("bbox_path"),
+                    "timestamp_repair_count": record.get(
+                        "source_timestamp_repair_count", 0
+                    ),
+                    "timestamp_max_backward_us": record.get(
+                        "source_timestamp_max_backward_us", 0
+                    ),
                 },
                 sort_keys=True,
             ),

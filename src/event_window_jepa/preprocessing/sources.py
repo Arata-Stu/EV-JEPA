@@ -341,6 +341,8 @@ class RVTGenXH5EventSource:
                 "timestamp_synchronized": True,
                 "source_format": "RVT GenX original-event HDF5",
                 "source_events_group": "/events",
+                "timestamp_repair_policy": "running_max",
+                "timestamp_repair_scope": "RVT Gen1/Gen4 source only",
             },
         )
 

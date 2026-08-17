@@ -152,7 +152,9 @@ RVT配布版は、Gen4が`*_td.h5`、Gen1が`*_td.dat.h5`で、どちらも
 `/events/{x,y,p,t}`に連続event列を保持しています。RVTの固定representation済みtarは
 使用しません。converterは入力をchunk読みし、timestampの全体非減少、整数dtype、
 `x/y/p/t`の同長、極性、座標範囲、解像度を検査します。RVT実装のように逆行timestampを
-黙って補正せず、破損または想定外の入力として停止します。
+扱うため、RVT Gen1/Gen4入力に限ってevent順を維持したrunning maximum補正を適用します。
+補正件数と最大逆行量は進捗ログ、出力HDF5属性、manifestへ記録します。DSEC/M3EDなど
+他の入力ではtimestamp逆行を引き続きエラーにします。
 
 既存Gen4の最初の1 recordingを、出力を書かずに検査・計画表示する例です。
 
@@ -174,7 +176,8 @@ window-jepa-preprocess \
 
 計画が正しければ`--plan-only`と`--limit 1`を外し、`--skip-existing`と
 `--merge-manifest`を付けて変換します。val/testは出力directory、manifest、`--split`を
-それぞれ変えて実行してください。
+それぞれ変えて実行してください。変換中は既定10秒間隔で、event進捗率、速度、ETA、
+timestamp補正統計をJSONで表示します。`--progress-interval-seconds`で間隔を変更できます。
 
 ```bash
 window-jepa-preprocess \

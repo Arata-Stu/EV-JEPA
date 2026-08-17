@@ -8,7 +8,9 @@ import pytest
 from event_window_jepa.data.types import SequenceInfo
 from event_window_jepa.preprocessing.common import (
     _exclusive_output_lock,
+    _repair_timestamp_regressions,
     _timestamp_numpy_dtype,
+    _validate_source_chunk,
     coarse_index_entries,
     write_manifest,
 )
@@ -44,6 +46,30 @@ def test_coarse_index_is_first_ge_across_streaming_chunks() -> None:
     )
     assert np.concatenate((first, second)).tolist() == [0, 2, 2, 3, 3, 3, 5, 5]
     assert next_boundary == 8_000
+
+
+def test_rvt_timestamp_repair_is_running_max_across_chunks() -> None:
+    first = {
+        "x": np.arange(4),
+        "y": np.arange(4),
+        "t_us": np.array([10, 9, 8, 11]),
+        "polarity": np.zeros(4, dtype=np.uint8),
+    }
+    repaired, count, maximum = _repair_timestamp_regressions(first, None)
+    arrays, previous = _validate_source_chunk(repaired, None)
+    assert arrays["t_us"].tolist() == [10, 10, 10, 11]
+    assert (count, maximum, previous) == (2, 2, 11)
+
+    second = {
+        "x": np.arange(2),
+        "y": np.arange(2),
+        "t_us": np.array([7, 12]),
+        "polarity": np.ones(2, dtype=np.uint8),
+    }
+    repaired, count, maximum = _repair_timestamp_regressions(second, previous)
+    arrays, previous = _validate_source_chunk(repaired, previous)
+    assert arrays["t_us"].tolist() == [11, 12]
+    assert (count, maximum, previous) == (1, 4, 12)
 
 
 def test_sequence_identifier_is_dataset_and_camera_qualified() -> None:

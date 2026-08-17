@@ -5,6 +5,7 @@ import json
 import math
 import os
 import socket
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -71,6 +72,7 @@ class PreprocessOptions:
     overwrite: bool = False
     skip_existing: bool = False
     resume_partial: bool = True
+    progress_interval_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         if self.spatial_downsample <= 0:
@@ -83,6 +85,8 @@ class PreprocessOptions:
             raise ValueError("index_step_us must be positive")
         if self.timestamp_dtype not in {"auto", "uint32", "uint64"}:
             raise ValueError("timestamp_dtype must be auto, uint32, or uint64")
+        if self.progress_interval_seconds < 0:
+            raise ValueError("progress_interval_seconds cannot be negative")
         if self.overwrite and self.skip_existing:
             raise ValueError("overwrite and skip_existing are mutually exclusive")
 
@@ -165,6 +169,31 @@ def _validate_source_chunk(
             raise ValueError("source timestamps decrease across chunks")
         previous_timestamp_us = int(timestamps[-1])
     return arrays, previous_timestamp_us
+
+
+def _repair_timestamp_regressions(
+    chunk: Mapping[str, np.ndarray], previous_timestamp_us: int | None
+) -> tuple[Mapping[str, np.ndarray], int, int]:
+    """Apply RVT's running-maximum timestamp repair without reordering events."""
+
+    timestamps = np.asarray(chunk.get("t_us"))
+    if timestamps.ndim != 1 or not np.issubdtype(timestamps.dtype, np.integer):
+        return chunk, 0, 0
+    if not timestamps.size:
+        return chunk, 0, 0
+    raw = timestamps.astype(np.int64, copy=False)
+    repaired = raw.copy()
+    if previous_timestamp_us is not None and repaired[0] < previous_timestamp_us:
+        repaired[0] = previous_timestamp_us
+    np.maximum.accumulate(repaired, out=repaired)
+    changed = repaired != raw
+    repair_count = int(np.count_nonzero(changed))
+    if repair_count == 0:
+        return chunk, 0, 0
+    maximum_backward_us = int(np.max(repaired[changed] - raw[changed]))
+    repaired_chunk = dict(chunk)
+    repaired_chunk["t_us"] = repaired
+    return repaired_chunk, repair_count, maximum_backward_us
 
 
 def _transform_coordinates(
@@ -405,6 +434,12 @@ def _existing_record(
                 handle.attrs["source_timestamp_synchronized"]
             ),
             "event_count": int(handle.attrs["event_count"]),
+            "source_timestamp_repair_count": int(
+                handle.attrs.get("source_timestamp_repair_count", 0)
+            ),
+            "source_timestamp_max_backward_us": int(
+                handle.attrs.get("source_timestamp_max_backward_us", 0)
+            ),
             "output_file_size": path.stat().st_size,
             "source_file_size": int(handle.attrs["source_file_size"]),
         }
@@ -567,6 +602,8 @@ def _preprocess_sequence_unlocked(
                     "next_index_boundary_us": 0,
                     "previous_timestamp_us": None,
                     "seen_polarities": [],
+                    "timestamp_repair_count": 0,
+                    "timestamp_max_backward_us": 0,
                     "complete": False,
                 }
                 handle.flush()
@@ -588,6 +625,15 @@ def _preprocess_sequence_unlocked(
             previous_value = checkpoint["previous_timestamp_us"]
             previous_timestamp = None if previous_value is None else int(previous_value)
             seen_polarities = {int(value) for value in checkpoint["seen_polarities"]}
+            timestamp_repair_count = int(
+                checkpoint.get("timestamp_repair_count", 0)
+            )
+            timestamp_max_backward_us = int(
+                checkpoint.get("timestamp_max_backward_us", 0)
+            )
+            repair_timestamps = (
+                metadata.attributes.get("timestamp_repair_policy") == "running_max"
+            )
             minimum_event_length = min(
                 map(len, (x_dataset, y_dataset, t_dataset, p_dataset))
             )
@@ -603,16 +649,36 @@ def _preprocess_sequence_unlocked(
             handle.attrs["complete"] = False
             handle.attrs["event_count"] = written_events
             handle.attrs["dropped_event_count"] = dropped_events
+            handle.attrs["source_timestamp_repair_count"] = timestamp_repair_count
+            handle.attrs["source_timestamp_max_backward_us"] = (
+                timestamp_max_backward_us
+            )
+            for name, value in metadata.attributes.items():
+                handle.attrs[f"source_{name}"] = value
+
+            run_start_event = source_events_read
+            progress_started = time.monotonic()
+            last_progress = progress_started
 
             for chunk in source.iter_event_chunks(
                 options.read_chunk_events, start_event=source_events_read
             ):
+                chunk_repair_count = 0
+                chunk_max_backward_us = 0
+                if repair_timestamps:
+                    chunk, chunk_repair_count, chunk_max_backward_us = (
+                        _repair_timestamp_regressions(chunk, previous_timestamp)
+                    )
                 arrays, previous_timestamp = _validate_source_chunk(
                     chunk, previous_timestamp
                 )
                 if not len(arrays["x"]):
                     continue
                 source_events_read += len(arrays["x"])
+                timestamp_repair_count += chunk_repair_count
+                timestamp_max_backward_us = max(
+                    timestamp_max_backward_us, chunk_max_backward_us
+                )
                 seen_polarities.update(
                     int(value) for value in np.unique(arrays["polarity"]).tolist()
                 )
@@ -672,13 +738,69 @@ def _preprocess_sequence_unlocked(
                         "next_index_boundary_us": next_index_boundary_us,
                         "previous_timestamp_us": previous_timestamp,
                         "seen_polarities": sorted(seen_polarities),
+                        "timestamp_repair_count": timestamp_repair_count,
+                        "timestamp_max_backward_us": timestamp_max_backward_us,
                         "complete": False,
                     }
                 )
                 handle.attrs["event_count"] = written_events
                 handle.attrs["dropped_event_count"] = dropped_events
+                handle.attrs["source_timestamp_repair_count"] = (
+                    timestamp_repair_count
+                )
+                handle.attrs["source_timestamp_max_backward_us"] = (
+                    timestamp_max_backward_us
+                )
                 handle.flush()
                 _write_json_atomic(checkpoint_path, checkpoint)
+
+                now = time.monotonic()
+                if (
+                    options.progress_interval_seconds > 0
+                    and (
+                        now - last_progress >= options.progress_interval_seconds
+                        or source_events_read == metadata.event_count
+                    )
+                ):
+                    elapsed = max(now - progress_started, 1e-9)
+                    run_events = source_events_read - run_start_event
+                    events_per_second = run_events / elapsed
+                    remaining_events = metadata.event_count - source_events_read
+                    eta_seconds = (
+                        remaining_events / events_per_second
+                        if events_per_second > 0
+                        else None
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "status": "progress",
+                                "sequence": metadata.sequence_id,
+                                "events_processed": source_events_read,
+                                "events_total": metadata.event_count,
+                                "percent": round(
+                                    100.0
+                                    * source_events_read
+                                    / metadata.event_count,
+                                    2,
+                                ),
+                                "events_per_second": round(events_per_second, 1),
+                                "elapsed_seconds": round(elapsed, 1),
+                                "eta_seconds": (
+                                    None
+                                    if eta_seconds is None
+                                    else round(eta_seconds, 1)
+                                ),
+                                "timestamp_repair_count": timestamp_repair_count,
+                                "timestamp_max_backward_us": (
+                                    timestamp_max_backward_us
+                                ),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    last_progress = now
 
             if source_events_read != metadata.event_count:
                 raise ValueError(
@@ -699,6 +821,10 @@ def _preprocess_sequence_unlocked(
 
             handle.attrs["event_count"] = written_events
             handle.attrs["dropped_event_count"] = dropped_events
+            handle.attrs["source_timestamp_repair_count"] = timestamp_repair_count
+            handle.attrs["source_timestamp_max_backward_us"] = (
+                timestamp_max_backward_us
+            )
             handle.attrs["complete"] = True
             handle.flush()
             _validate_compressed_structure(handle)
@@ -711,6 +837,8 @@ def _preprocess_sequence_unlocked(
                     "next_index_boundary_us": next_index_boundary_us,
                     "previous_timestamp_us": previous_timestamp,
                     "seen_polarities": sorted(seen_polarities),
+                    "timestamp_repair_count": timestamp_repair_count,
+                    "timestamp_max_backward_us": timestamp_max_backward_us,
                     "complete": True,
                 }
             )
