@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import numpy as np
@@ -14,13 +15,27 @@ from event_window_jepa.data.anchor_sampler import (
     milliseconds_to_microseconds,
 )
 from event_window_jepa.data.event_store import EventStore
-from event_window_jepa.data.spatial_transforms import SharedRandomSpatialTransform
-from event_window_jepa.data.types import EventWindow
-from event_window_jepa.masks.multiblock import MultiBlockMaskGenerator
+from event_window_jepa.data.spatial_transforms import (
+    SharedRandomSpatialTransform,
+    SpatialTransformParameters,
+)
+from event_window_jepa.data.types import EventWindow, SequenceInfo
+from event_window_jepa.masks.multiblock import MaskPair, MultiBlockMaskGenerator
 
 
 class EventRepresentation(Protocol):
     def __call__(self, window: EventWindow) -> np.ndarray: ...
+
+
+@dataclass(frozen=True)
+class PairedWindowDebugSample:
+    """Raw objects used to build one training sample for offline inspection."""
+
+    context: EventWindow
+    target: EventWindow
+    spatial_transform: SpatialTransformParameters
+    masks: MaskPair
+    sequence_info: SequenceInfo
 
 
 class PairedWindowDataset(Dataset[dict[str, Any]]):
@@ -54,7 +69,9 @@ class PairedWindowDataset(Dataset[dict[str, Any]]):
             raise ValueError("epoch cannot be negative")
         self.epoch = epoch
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def _build_sample(
+        self, index: int
+    ) -> tuple[dict[str, Any], PairedWindowDebugSample]:
         anchor = self.anchor_sampler.sample(index, self.epoch)
         rng = random.Random(deterministic_seed(self.seed, self.epoch, index, stream=1))
         pair = self.pair_sampler.sample(rng)
@@ -96,7 +113,7 @@ class PairedWindowDataset(Dataset[dict[str, Any]]):
 
         x_context = np.ascontiguousarray(self.representation(context), dtype=np.float32)
         x_target = np.ascontiguousarray(self.representation(target), dtype=np.float32)
-        return {
+        sample = {
             "x_context": torch.from_numpy(x_context),
             "x_target": torch.from_numpy(x_target),
             "dt_context_ms": torch.tensor(pair.context_ms, dtype=torch.float32),
@@ -107,3 +124,22 @@ class PairedWindowDataset(Dataset[dict[str, Any]]):
             "context_mask": torch.from_numpy(masks.context_keep),
             "target_mask": torch.from_numpy(masks.target),
         }
+        debug = PairedWindowDebugSample(
+            context=context,
+            target=target,
+            spatial_transform=params,
+            masks=masks,
+            sequence_info=info,
+        )
+        return sample, debug
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        sample, _ = self._build_sample(index)
+        return sample
+
+    def sample_with_debug(
+        self, index: int
+    ) -> tuple[dict[str, Any], PairedWindowDebugSample]:
+        """Return the exact training sample plus raw windows and sampled geometry."""
+
+        return self._build_sample(index)

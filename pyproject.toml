@@ -28,6 +28,7 @@ dev = [
 
 [project.scripts]
 window-jepa-pretrain = "event_window_jepa.train.pretrain:main"
+window-jepa-inspect = "event_window_jepa.inspection:main"
 window-jepa-preprocess = "event_window_jepa.preprocessing.cli:main"
 window-jepa-merge-manifests = "event_window_jepa.preprocessing.merge_manifests:main"
 window-jepa-summarize = "event_window_jepa.evaluation.window_sweep:main"

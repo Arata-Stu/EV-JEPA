@@ -107,6 +107,19 @@ NPZは参照のたびにsequence全体を展開する形式なので、少数seq
 window-jepa-pretrain --config configs/pretrain/window_jepa_vits.yaml
 ```
 
+学習前に、同じ設定とサンプリング処理で context/target、時間bin、patch maskを
+目視確認できます。レポートは追加の描画ライブラリを使わない自己完結HTMLです。
+
+```bash
+window-jepa-inspect \
+  --config configs/pretrain/window_jepa_vits.yaml \
+  --expected-dataset gen1 \
+  --samples 8 \
+  --output outputs/gen1-inspection/samples.html
+```
+
+HTMLと同じ場所に、各整合性検査の結果を含む`samples.json`も保存されます。
+
 学習中はrank 0だけにepoch単位の進捗バーを表示し、loss、prediction/target std、
 learning rateだけを簡潔に更新します。JSONLの完全な記録は従来どおり
 `OUTPUT_DIR/train.jsonl`へ保存し、TensorBoardには次の最小6系列だけを書きます。
