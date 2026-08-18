@@ -11,6 +11,7 @@ from event_window_jepa.preprocessing.common import (
     _exclusive_output_lock,
     _repair_timestamp_regressions,
     _timestamp_numpy_dtype,
+    _transform_coordinates,
     _validate_identity_attributes,
     _validate_source_chunk,
     coarse_index_entries,
@@ -72,6 +73,31 @@ def test_rvt_timestamp_repair_is_running_max_across_chunks() -> None:
     arrays, previous = _validate_source_chunk(repaired, previous)
     assert arrays["t_us"].tolist() == [11, 12]
     assert (count, maximum, previous) == (1, 4, 12)
+
+
+def test_rvt_coordinate_repair_drops_out_of_bounds_without_clipping() -> None:
+    x, y, valid = _transform_coordinates(
+        np.array([0, 1279, 1280, 20]),
+        np.array([0, 719, 10, -1]),
+        source_width=1280,
+        source_height=720,
+        downsample=2,
+        drop_out_of_bounds=True,
+    )
+    assert valid.tolist() == [True, True, False, False]
+    assert x[valid].tolist() == [0, 639]
+    assert y[valid].tolist() == [0, 359]
+
+
+def test_coordinate_repair_remains_strict_by_default() -> None:
+    with pytest.raises(ValueError, match="invalid=1/2"):
+        _transform_coordinates(
+            np.array([0, 1280]),
+            np.array([0, 10]),
+            source_width=1280,
+            source_height=720,
+            downsample=1,
+        )
 
 
 def test_legacy_rvt_output_without_duration_extension_metadata_is_accepted(

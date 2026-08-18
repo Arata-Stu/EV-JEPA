@@ -587,6 +587,9 @@ def main() -> None:
                     "timestamp_duration_extension_us": record.get(
                         "timestamp_duration_extension_us", 0
                     ),
+                    "coordinate_out_of_bounds_count": record.get(
+                        "source_coordinate_out_of_bounds_count", 0
+                    ),
                 },
                 sort_keys=True,
             ),

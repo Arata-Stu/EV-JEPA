@@ -158,6 +158,12 @@ RVT配布版は、Gen4が`*_td.h5`、Gen1が`*_td.dat.h5`で、どちらも
 生timestampを超える場合は、RVT入力だけ実効durationをその差分だけ延長し、
 `timestamp_duration_extension_us`として記録します。
 
+RVT Gen1/Gen4入力に含まれるsensor範囲外座標は、画像端へclipすると人工的なevent集中を
+作るため、該当eventだけを除外します。除外件数は`coordinate_out_of_bounds_count`として
+進捗・完了ログへ、`source_coordinate_out_of_bounds_count`としてHDF5属性とmanifestへ
+記録します。DSEC/M3ED入力の範囲外座標は、解像度またはcalibrationの不整合として
+引き続きエラーにします。
+
 既存Gen4の最初の1 recordingを、出力を書かずに検査・計画表示する例です。
 
 ```bash

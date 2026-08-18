@@ -343,6 +343,8 @@ class RVTGenXH5EventSource:
                 "source_events_group": "/events",
                 "timestamp_repair_policy": "running_max",
                 "timestamp_repair_scope": "RVT Gen1/Gen4 source only",
+                "coordinate_repair_policy": "drop_out_of_bounds",
+                "coordinate_repair_scope": "RVT Gen1/Gen4 source only",
             },
         )
 

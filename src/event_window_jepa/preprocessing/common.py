@@ -203,12 +203,20 @@ def _transform_coordinates(
     source_width: int,
     source_height: int,
     downsample: int,
+    drop_out_of_bounds: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     x64 = x.astype(np.int64, copy=False)
     y64 = y.astype(np.int64, copy=False)
     valid = (x64 >= 0) & (x64 < source_width) & (y64 >= 0) & (y64 < source_height)
-    if not bool(valid.all()):
-        raise ValueError("source event coordinates exceed the declared resolution")
+    if not bool(valid.all()) and not drop_out_of_bounds:
+        invalid_count = int(np.count_nonzero(~valid))
+        raise ValueError(
+            "source event coordinates exceed the declared resolution: "
+            f"invalid={invalid_count}/{len(valid)}, "
+            f"x_range=[{int(x64.min())},{int(x64.max())}], "
+            f"y_range=[{int(y64.min())},{int(y64.max())}], "
+            f"declared={source_width}x{source_height}"
+        )
     x64 = x64 // downsample
     y64 = y64 // downsample
     return x64, y64, valid
@@ -457,6 +465,15 @@ def _existing_record(
                 handle.attrs["source_timestamp_synchronized"]
             ),
             "event_count": int(handle.attrs["event_count"]),
+            "dropped_event_count": int(
+                handle.attrs.get("dropped_event_count", 0)
+            ),
+            "source_coordinate_out_of_bounds_count": int(
+                handle.attrs.get(
+                    "source_coordinate_out_of_bounds_count",
+                    handle.attrs.get("dropped_event_count", 0),
+                )
+            ),
             "source_timestamp_repair_count": int(
                 handle.attrs.get("source_timestamp_repair_count", 0)
             ),
@@ -575,6 +592,7 @@ def _preprocess_sequence_unlocked(
                         "zstd_level": options.zstd_level,
                         "event_count": 0,
                         "dropped_event_count": 0,
+                        "source_coordinate_out_of_bounds_count": 0,
                         "source_declared_duration_us": duration_us,
                         "timestamp_duration_extension_us": 0,
                         "polarity_encoding": "0=OFF,1=ON",
@@ -671,6 +689,10 @@ def _preprocess_sequence_unlocked(
             repair_timestamps = (
                 metadata.attributes.get("timestamp_repair_policy") == "running_max"
             )
+            drop_out_of_bounds = (
+                metadata.attributes.get("coordinate_repair_policy")
+                == "drop_out_of_bounds"
+            )
             minimum_event_length = min(
                 map(len, (x_dataset, y_dataset, t_dataset, p_dataset))
             )
@@ -686,6 +708,7 @@ def _preprocess_sequence_unlocked(
             handle.attrs["complete"] = False
             handle.attrs["event_count"] = written_events
             handle.attrs["dropped_event_count"] = dropped_events
+            handle.attrs["source_coordinate_out_of_bounds_count"] = dropped_events
             handle.attrs["source_timestamp_repair_count"] = timestamp_repair_count
             handle.attrs["source_timestamp_max_backward_us"] = (
                 timestamp_max_backward_us
@@ -748,6 +771,7 @@ def _preprocess_sequence_unlocked(
                     source_width=metadata.width,
                     source_height=metadata.height,
                     downsample=options.spatial_downsample,
+                    drop_out_of_bounds=drop_out_of_bounds,
                 )
                 dropped_events += int((~valid).sum())
                 if not bool(valid.any()):
@@ -795,6 +819,9 @@ def _preprocess_sequence_unlocked(
                 )
                 handle.attrs["event_count"] = written_events
                 handle.attrs["dropped_event_count"] = dropped_events
+                handle.attrs["source_coordinate_out_of_bounds_count"] = (
+                    dropped_events
+                )
                 handle.attrs["source_timestamp_repair_count"] = (
                     timestamp_repair_count
                 )
@@ -835,6 +862,7 @@ def _preprocess_sequence_unlocked(
                                 "timestamp_duration_extension_us": max(
                                     0, effective_duration_us - duration_us
                                 ),
+                                "coordinate_out_of_bounds_count": dropped_events,
                             },
                             sort_keys=True,
                         ),
@@ -888,6 +916,7 @@ def _preprocess_sequence_unlocked(
                                 "timestamp_duration_extension_us": max(
                                     0, effective_duration_us - duration_us
                                 ),
+                                "coordinate_out_of_bounds_count": dropped_events,
                             },
                             sort_keys=True,
                         ),
@@ -916,6 +945,7 @@ def _preprocess_sequence_unlocked(
 
             handle.attrs["event_count"] = written_events
             handle.attrs["dropped_event_count"] = dropped_events
+            handle.attrs["source_coordinate_out_of_bounds_count"] = dropped_events
             handle.attrs["source_timestamp_repair_count"] = timestamp_repair_count
             handle.attrs["source_timestamp_max_backward_us"] = (
                 timestamp_max_backward_us
