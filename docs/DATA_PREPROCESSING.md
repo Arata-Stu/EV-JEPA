@@ -41,28 +41,33 @@ commandを再実行すれば互換性を確認して`.partial`から再開しま
 | dataset | native解像度 | 推奨前処理 | 主な用途 |
 | --- | ---: | --- | --- |
 | DSEC | 640×480 | left、倍率1、distortedのまま | 事前学習、Detection |
-| M3ED | 1280×720 | leftから開始、整数2分の1 | 大規模・異種環境事前学習 |
-| RVT Gen4 / Prophesee 1Mpx | 1280×720 | 整数2分の1 | 高解像度Detection |
+| M3ED | 1280×720 | leftから開始、DAGR式2分の1 | 大規模・異種環境事前学習 |
+| RVT Gen4 / Prophesee 1Mpx | 1280×720 | DAGR式2分の1 | 高解像度Detection |
 | RVT Gen1 / Prophesee Gen1 | 304×240 | 倍率1 | 小規模な成立確認 |
 
-1280×720を640×480へ非等方変形しません。M3EDと1Mpxは`x//=2, y//=2`で
-640×360にし、DSECは640×480のまま保持します。学習時に全datasetから同じ
-224×224 cropを取得します。空間downsample後もevent行は間引かず、同じpixelへ
-重なったeventを別eventとして保持します。したがって時間密度と極性統計は残ります。
+1280×720を640×480へ非等方変形しません。M3EDとGen4/1Mpxは640×360にし、DSECは
+640×480のまま保持します。M3EDとGen4/1Mpxのfactor 2では[DAGRのarea accumulation
+方式](https://github.com/uzh-rpg/dagr/blob/main/scripts/downsample_events.py)を既定で使います。
+2×2領域ごとに符号付きcontrastを1/4ずつ蓄積し、絶対値が1へ到達したeventだけを残します。
+同極性なら概ね4 eventから1 eventとなり、逆極性は相殺されます。出力timestampと極性は
+閾値へ到達させたsource eventの値です。
 
-このconverterはdenseな1280×720 frameを生成せず、DATをevent chunk単位で処理します。
-したがってnative解像度そのものよりevent数が前処理時間、I/O、容量を支配します。
-空間downsampleだけではevent件数は減らないため、容量削減の中心は次の3点です。
+このconverterはdenseな1280×720 frameを生成せず、event chunk単位で処理します。
+area accumulationの蓄積状態はchunk間で維持し、二重化したHDF5 checkpointへ保存します。
+中断再開後も最初から連続変換した場合と同じevent列になります。factor 2の出力event数は
+有効入力の最大約1/4で、逆極性相殺が多い場合はさらに少なくなります。実際のH5容量は
+timestampや圧縮率にも依存します。
 
 - M3EDから画像・LiDAR・IMUを複製せず、使用するevent cameraだけを抽出する
-- 1Mpx DATを`uint16/uint32/uint8`中心のSoAへ変換してZstd圧縮する
+- 2×2 area accumulationでevent件数を削減する
+- event列を`uint16/uint32/uint8`中心のSoAへ変換してZstd圧縮する
 - right cameraが不要な段階ではleftだけを変換する
 
-特に1Mpx全量を一度に変換せず、固定したrecording listでまず10--20%だけをportable
-bundleへ変換するのが安全です。factor 2は容量を4分の1にする設定ではありません。
-
-event strideや固定時間binによる間引きは、蓄積時間研究で重要なevent countを変える
-ため実装していません。
+`--spatial-downsample-method coordinate`を明示すると、従来どおり座標だけを整数除算して
+全eventを保持できます。area accumulationはevent密度と極性統計を変えるため、manifestと
+HDF5へ方式、source/output event数、除外件数、保持率を記録します。既存のcoordinate方式
+成果物とは変換config hashが異なり、`--skip-existing`で混同されません。新しいoutput rootへ
+pilotを作るか、確認後に`--overwrite`で再生成してください。
 
 ## 導入
 
@@ -132,7 +137,8 @@ window-jepa-preprocess \
   --camera left \
   --m3ed-dataset-list /path/to/m3ed/dataset_list.yaml \
   --sequence-list /path/to/m3ed_train_sequences.txt \
-  --spatial-downsample 2
+  --spatial-downsample 2 \
+  --spatial-downsample-method area_accumulate
 ```
 
 公式`dataset_list.yaml`の`is_test_file`を必ず照合します。M3EDには公式validation
@@ -178,6 +184,7 @@ window-jepa-preprocess \
   --manifest /mnt/ssd-4tb/dataset/evjepa/gen4/manifests/train.jsonl \
   --split train \
   --spatial-downsample 2 \
+  --spatial-downsample-method area_accumulate \
   --limit 1 \
   --plan-only
 ```
@@ -196,6 +203,7 @@ window-jepa-preprocess \
   --manifest /mnt/ssd-4tb/dataset/evjepa/gen4/manifests/train.jsonl \
   --split train \
   --spatial-downsample 2 \
+  --spatial-downsample-method area_accumulate \
   --skip-existing \
   --merge-manifest
 ```
@@ -216,8 +224,9 @@ window-jepa-preprocess \
 ```
 
 HDF5内に`/events/width,height`があれば公式解像度と照合し、無ければGen4は
-1280×720、Gen1は304×240を使います。Gen4は`x//=2,y//=2`で640×360、Gen1は
-304×240のままです。bboxはnative座標のまま別に保存し、manifestへ倍率を記録します。
+1280×720、Gen1は304×240を使います。Gen4はDAGR式area accumulationで640×360、
+Gen1は304×240のままです。bboxはnative座標のまま別に保存し、manifestへ倍率を
+記録します。
 既存データroot内の`_excluded_failed_validation`は再帰探索から明示的に除外します。
 
 ## Prophesee DAT（代替入力）
@@ -282,18 +291,16 @@ train/valでは対応するsibling `*_bbox.npy`が1件でもなければ、書�
 `--self-supervised`を付けます。testでbboxが配布されていない場合はmanifestの
 `bbox_path`を省略します。
 
-factor 2は`x//=2, y//=2`で640×360へ座標を揃える設定で、event行とtimestampは一切
-間引きません。このprojectの標準pipelineはeventをcropしてから224×224表現を作るため、
-nativeとfactor 2でdense tensor/token数は同じです。またfactor 2の224 cropはnative
-座標でより広い面積に相当し、含まれるevent数が増える場合もあります。主目的は
-M3ED/Gen4間でstored gridを640×360へ揃えることと、同じ224×224 cropでより広い
-native領域を扱うことです。DSECは640×480、Gen1は304×240のままで、角度FOVや
-物体scaleまで同一にはなりません。H5容量や学習時間の4倍削減でもありません。
+factor 2はDAGR式area accumulationで640×360へ揃えます。event行は最大約1/4となり、
+保持されたeventのtimestampは変更しません。このprojectの標準pipelineはeventをcropして
+から224×224表現を作るため、dense tensor/token数自体は変わりませんが、window内event数と
+I/Oは減ります。またfactor 2の224 cropはnative座標でより広い面積に相当します。DSECは
+640×480、Gen1は304×240のままで、角度FOVや物体scaleまで同一にはなりません。
 factor 4の320×180は標準224 cropより高さが小さいため使用しません。
 
-全量変換の前に、同じ1--3 recordingを別outputへnative（factor 1）とfactor 2で変換し、
-完了ログの`output_bytes`、実際のwindow内event数、DataLoader速度を実行環境で比較して
-採用値を確定してください。native pilotは汎用CLIで行えます。
+全量変換の前に、同じ1--3 recordingを別outputへcoordinate方式とarea accumulation方式で
+変換し、完了ログの`output_bytes`、`event_retention_ratio`、実際のwindow内event数、
+DataLoader速度を実行環境で比較してください。従来方式は汎用CLIで明示できます。
 
 ```bash
 window-jepa-preprocess \
@@ -304,7 +311,8 @@ window-jepa-preprocess \
   --manifest /datasets/evjepa/pilot_native/manifests/train.jsonl \
   --split train \
   --sequence-list /datasets/splits/1mpx_pilot.txt \
-  --spatial-downsample 1 \
+  --spatial-downsample 2 \
+  --spatial-downsample-method coordinate \
   --skip-existing
 ```
 

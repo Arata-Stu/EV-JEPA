@@ -20,6 +20,7 @@ dependencies = [
 hdf5 = [
   "h5py>=3.10",
   "hdf5plugin>=4.4",
+  "numba>=0.59",
 ]
 dev = [
   "pytest>=8.0",

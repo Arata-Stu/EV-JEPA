@@ -25,6 +25,7 @@ class SequenceInfo:
     source_width: int | None = None
     source_height: int | None = None
     spatial_downsample: int = 1
+    spatial_downsample_method: str = "coordinate"
     camera: str = "unknown"
     timestamp_reference: str = "unknown"
     timestamp_synchronized: bool = False
@@ -47,6 +48,10 @@ class SequenceInfo:
             raise ValueError("source resolution must be positive")
         if self.spatial_downsample <= 0:
             raise ValueError("spatial_downsample must be positive")
+        if self.spatial_downsample_method not in {"coordinate", "area_accumulate"}:
+            raise ValueError(
+                "spatial_downsample_method must be coordinate or area_accumulate"
+            )
         if not self.camera or not self.timestamp_reference:
             raise ValueError("camera and timestamp_reference cannot be empty")
         if not isinstance(self.timestamp_synchronized, bool):

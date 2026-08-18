@@ -64,8 +64,9 @@ GPU用PyTorchを使う環境では、利用するCUDAに合うPyTorchを先に�
 ```
 
 相対`path`はmanifestのあるディレクトリから解決されます。`t_start_us`は最初のイベント時刻でなく、そのsequenceで利用可能な時間範囲の下端として扱います。
-元時計、camera、歪み座標系、source/stored解像度、整数downsample倍率も各行に保持するため、
-下流ラベルを同じ時計・座標へ明示的に変換できます。
+元時計、camera、歪み座標系、source/stored解像度、整数downsample倍率と方式も各行に
+保持するため、下流ラベルを同じ時計・座標へ明示的に変換できます。M3EDとGen4/1Mpxの
+factor 2は、既定でDAGR式`area_accumulate`を使い、event数と保持率も記録します。
 
 ### HDF5（標準）
 

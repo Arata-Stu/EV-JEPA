@@ -27,8 +27,8 @@ Mode:
   --python-bin PATH      Python from the target venv (default: python)
   -h, --help             Show this help
 
-The spatial factor is intentionally fixed at 2 (1280x720 -> 640x360). Event
-timestamps and event rows are retained; accumulation windows are sampled later.
+The spatial factor is intentionally fixed at 2 (1280x720 -> 640x360), using
+DAGR-style area accumulation. Retained event timestamps are unchanged.
 Rerunning the same command validates completed files and resumes a compatible
 per-recording .partial file.
 EOF
@@ -124,6 +124,7 @@ arguments=(
   --split "$logical_split"
   --camera left
   --spatial-downsample 2
+  --spatial-downsample-method area_accumulate
   --zstd-level 5
   --skip-existing
   --merge-manifest

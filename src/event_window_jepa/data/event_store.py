@@ -176,6 +176,9 @@ class NpzEventStore(EventStore):
                         else int(row["source_height"])
                     ),
                     spatial_downsample=int(row.get("spatial_downsample", 1)),
+                    spatial_downsample_method=str(
+                        row.get("spatial_downsample_method", "coordinate")
+                    ),
                     camera=str(row.get("camera", "unknown")),
                     timestamp_reference=str(
                         row.get("timestamp_reference", "unknown")
@@ -411,6 +414,9 @@ class H5EventStore(EventStore):
                         else int(row["source_height"])
                     ),
                     spatial_downsample=int(row.get("spatial_downsample", 1)),
+                    spatial_downsample_method=str(
+                        row.get("spatial_downsample_method", "coordinate")
+                    ),
                     camera=str(row.get("camera", "unknown")),
                     timestamp_reference=str(
                         row.get("timestamp_reference", "unknown")
@@ -476,6 +482,7 @@ class H5EventStore(EventStore):
             "source_width": info.source_width,
             "source_height": info.source_height,
             "spatial_downsample": info.spatial_downsample,
+            "spatial_downsample_method": info.spatial_downsample_method,
             "camera": info.camera,
             "source_timestamp_reference": info.timestamp_reference,
             "source_timestamp_synchronized": info.timestamp_synchronized,
@@ -486,6 +493,8 @@ class H5EventStore(EventStore):
             if expected is None:
                 continue
             actual = handle.attrs.get(attribute)
+            if attribute == "spatial_downsample_method" and actual is None:
+                actual = "coordinate"
             if isinstance(expected, int):
                 matches = actual is not None and int(actual) == expected
             else:

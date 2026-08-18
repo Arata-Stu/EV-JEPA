@@ -23,6 +23,7 @@ from event_window_jepa.preprocessing.cli import (
     _matching_bbox,
     _m3ed_official_names,
     _resolved_spatial_downsample,
+    _resolved_spatial_downsample_method,
     _validate_bbox,
 )
 from event_window_jepa.preprocessing.merge_manifests import merge_manifests
@@ -196,6 +197,17 @@ def test_1mpx_default_downsample_and_bbox_pairing(tmp_path) -> None:
     assert _resolved_spatial_downsample("gen4", None) == 2
     assert _resolved_spatial_downsample("m3ed", None) == 2
     assert _resolved_spatial_downsample("gen1", None) == 1
+    assert _resolved_spatial_downsample_method("gen4", 2, None) == (
+        "area_accumulate"
+    )
+    assert _resolved_spatial_downsample_method("m3ed", 2, None) == (
+        "area_accumulate"
+    )
+    assert _resolved_spatial_downsample_method("dsec", 1, None) == "coordinate"
+    assert _resolved_spatial_downsample_method("gen1", 1, None) == "coordinate"
+    assert _resolved_spatial_downsample_method("gen4", 2, "coordinate") == (
+        "coordinate"
+    )
     assert _matching_bbox(dat) == bbox
 
     gen4_h5 = tmp_path / "recording_td.h5"

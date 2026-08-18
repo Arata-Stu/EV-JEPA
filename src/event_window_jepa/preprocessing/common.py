@@ -17,6 +17,7 @@ import numpy as np
 
 SCHEMA_NAME = "event-window-jepa-events"
 SCHEMA_VERSION = 1
+SPATIAL_DOWNSAMPLE_METHODS = {"coordinate", "area_accumulate"}
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class EventSource(Protocol):
 @dataclass(frozen=True)
 class PreprocessOptions:
     spatial_downsample: int = 1
+    spatial_downsample_method: str = "coordinate"
     read_chunk_events: int = 1_000_000
     hdf5_chunk_events: int = 262_144
     zstd_level: int = 5
@@ -77,6 +79,15 @@ class PreprocessOptions:
     def __post_init__(self) -> None:
         if self.spatial_downsample <= 0:
             raise ValueError("spatial_downsample must be a positive integer")
+        if self.spatial_downsample_method not in SPATIAL_DOWNSAMPLE_METHODS:
+            raise ValueError(
+                "spatial_downsample_method must be coordinate or area_accumulate"
+            )
+        if (
+            self.spatial_downsample_method == "area_accumulate"
+            and self.spatial_downsample == 1
+        ):
+            raise ValueError("area_accumulate requires spatial_downsample greater than 1")
         if self.read_chunk_events <= 0 or self.hdf5_chunk_events <= 0:
             raise ValueError("event chunk sizes must be positive")
         if not 1 <= self.zstd_level <= 22:
@@ -222,6 +233,89 @@ def _transform_coordinates(
     return x64, y64, valid
 
 
+def _require_numba() -> Any:
+    try:
+        import numba
+    except ImportError as error:
+        raise ImportError(
+            "install event-window-jepa[hdf5] with Numba to use area_accumulate "
+            "spatial downsampling"
+        ) from error
+    return numba
+
+
+def _area_accumulation_filter_impl(
+    x: np.ndarray,
+    y: np.ndarray,
+    polarity: np.ndarray,
+    accumulator: np.ndarray,
+    threshold: int,
+) -> np.ndarray:
+    keep = np.zeros(len(x), dtype=np.bool_)
+    for index in range(len(x)):
+        event_polarity = 1 if polarity[index] > 0 else -1
+        row = y[index]
+        column = x[index]
+        accumulator[row, column] += event_polarity
+        if abs(accumulator[row, column]) >= threshold:
+            keep[index] = True
+            accumulator[row, column] -= event_polarity * threshold
+    return keep
+
+
+def _build_area_accumulation_filter() -> Any:
+    return _require_numba().njit(cache=True)(_area_accumulation_filter_impl)
+
+
+_AREA_ACCUMULATION_FILTER: Any | None = None
+
+
+def area_accumulation_mask(
+    x: np.ndarray,
+    y: np.ndarray,
+    polarity: np.ndarray,
+    accumulator: np.ndarray,
+    *,
+    spatial_downsample: int,
+) -> np.ndarray:
+    """Select events produced by DAGR-style spatial area accumulation.
+
+    Coordinates must already be mapped to the output grid and polarity must use
+    ``0=OFF, 1=ON``. The integer accumulator is updated in place and therefore
+    must be preserved across source chunks.
+    """
+
+    if spatial_downsample <= 1:
+        raise ValueError("area accumulation requires spatial_downsample > 1")
+    arrays = (np.asarray(x), np.asarray(y), np.asarray(polarity))
+    if any(array.ndim != 1 for array in arrays):
+        raise ValueError("area accumulation inputs must be one-dimensional")
+    if not (len(arrays[0]) == len(arrays[1]) == len(arrays[2])):
+        raise ValueError("area accumulation inputs must have equal lengths")
+    if accumulator.ndim != 2 or not np.issubdtype(
+        accumulator.dtype, np.signedinteger
+    ):
+        raise TypeError("area accumulator must be a two-dimensional signed integer array")
+    if len(arrays[0]):
+        if (
+            int(arrays[0].min()) < 0
+            or int(arrays[0].max()) >= accumulator.shape[1]
+            or int(arrays[1].min()) < 0
+            or int(arrays[1].max()) >= accumulator.shape[0]
+        ):
+            raise ValueError("area accumulation coordinates exceed the output grid")
+        if not set(np.unique(arrays[2]).tolist()).issubset({0, 1}):
+            raise ValueError("area accumulation polarity must use 0=OFF, 1=ON")
+
+    global _AREA_ACCUMULATION_FILTER
+    if _AREA_ACCUMULATION_FILTER is None:
+        _AREA_ACCUMULATION_FILTER = _build_area_accumulation_filter()
+    threshold = spatial_downsample * spatial_downsample
+    return _AREA_ACCUMULATION_FILTER(
+        arrays[0], arrays[1], arrays[2], accumulator, threshold
+    )
+
+
 def _create_event_dataset(
     group: Any,
     name: str,
@@ -263,6 +357,34 @@ def _validate_compressed_structure(handle: Any) -> int:
     event_count = lengths.pop()
     if event_count != int(handle.attrs.get("event_count", -1)):
         raise ValueError("preprocessing output event_count attribute is inconsistent")
+    method = str(handle.attrs.get("spatial_downsample_method", "coordinate"))
+    if method not in SPATIAL_DOWNSAMPLE_METHODS:
+        raise ValueError("preprocessing output has an invalid downsample method")
+    factor = int(handle.attrs.get("spatial_downsample", 0))
+    if factor <= 0 or (method == "area_accumulate" and factor <= 1):
+        raise ValueError("preprocessing output has invalid downsample metadata")
+    source_event_count = int(handle.attrs.get("source_event_count", -1))
+    coordinate_dropped = int(
+        handle.attrs.get(
+            "source_coordinate_out_of_bounds_count",
+            handle.attrs.get("dropped_event_count", 0),
+        )
+    )
+    downsample_filtered = int(
+        handle.attrs.get("spatial_downsample_filtered_event_count", 0)
+    )
+    dropped_event_count = int(handle.attrs.get("dropped_event_count", -1))
+    if (
+        min(source_event_count, coordinate_dropped, downsample_filtered) < 0
+        or (method == "coordinate" and downsample_filtered != 0)
+        or dropped_event_count != coordinate_dropped + downsample_filtered
+        or source_event_count != event_count + dropped_event_count
+    ):
+        raise ValueError("preprocessing output event accounting is inconsistent")
+    expected_retention = event_count / max(source_event_count, 1)
+    retention = float(handle.attrs.get("event_retention_ratio", expected_retention))
+    if not math.isclose(retention, expected_retention, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("preprocessing output retention ratio is inconsistent")
     for dataset in (*datasets, handle["index/ms_to_event_idx"]):
         filters = set(hdf5_filter_ids(dataset))
         if not {2, 3, 32015}.issubset(filters):
@@ -409,6 +531,7 @@ def _conversion_config_hash(options: PreprocessOptions) -> str:
     values: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "spatial_downsample": options.spatial_downsample,
+        "spatial_downsample_method": options.spatial_downsample_method,
         "hdf5_chunk_events": options.hdf5_chunk_events,
         "zstd_level": options.zstd_level,
         "index_step_us": options.index_step_us,
@@ -460,13 +583,27 @@ def _existing_record(
             "source_width": int(handle.attrs["source_width"]),
             "source_height": int(handle.attrs["source_height"]),
             "spatial_downsample": int(handle.attrs["spatial_downsample"]),
+            "spatial_downsample_method": str(
+                handle.attrs.get("spatial_downsample_method", "coordinate")
+            ),
             "timestamp_reference": str(handle.attrs["source_timestamp_reference"]),
             "timestamp_synchronized": bool(
                 handle.attrs["source_timestamp_synchronized"]
             ),
+            "source_event_count": int(handle.attrs["source_event_count"]),
             "event_count": int(handle.attrs["event_count"]),
             "dropped_event_count": int(
                 handle.attrs.get("dropped_event_count", 0)
+            ),
+            "spatial_downsample_filtered_event_count": int(
+                handle.attrs.get("spatial_downsample_filtered_event_count", 0)
+            ),
+            "event_retention_ratio": float(
+                handle.attrs.get(
+                    "event_retention_ratio",
+                    int(handle.attrs["event_count"])
+                    / max(int(handle.attrs["source_event_count"]), 1),
+                )
             ),
             "source_coordinate_out_of_bounds_count": int(
                 handle.attrs.get(
@@ -505,7 +642,10 @@ def _preprocess_sequence_unlocked(
     try:
         h5py, hdf5plugin = _require_hdf5()
         metadata = source.metadata
-        if metadata.dataset == "dsec" and options.spatial_downsample != 1:
+        if metadata.dataset == "dsec" and (
+            options.spatial_downsample != 1
+            or options.spatial_downsample_method != "coordinate"
+        ):
             raise ValueError(
                 "DSEC must remain at native resolution so its official label and "
                 "rectification coordinates remain recoverable"
@@ -530,6 +670,14 @@ def _preprocess_sequence_unlocked(
         timestamp_dtype = _timestamp_numpy_dtype(duration_us, options.timestamp_dtype)
         output_width = math.ceil(metadata.width / options.spatial_downsample)
         output_height = math.ceil(metadata.height / options.spatial_downsample)
+        if options.spatial_downsample_method == "area_accumulate" and (
+            metadata.width % options.spatial_downsample != 0
+            or metadata.height % options.spatial_downsample != 0
+        ):
+            raise ValueError(
+                "area_accumulate requires source width and height to be divisible "
+                "by spatial_downsample"
+            )
         if max(output_width, output_height) > np.iinfo(np.uint16).max:
             raise ValueError("output coordinates do not fit uint16")
 
@@ -585,6 +733,12 @@ def _preprocess_sequence_unlocked(
                         "width": output_width,
                         "height": output_height,
                         "spatial_downsample": options.spatial_downsample,
+                        "spatial_downsample_method": (
+                            options.spatial_downsample_method
+                        ),
+                        "spatial_downsample_area": (
+                            options.spatial_downsample * options.spatial_downsample
+                        ),
                         "coordinate_frame": metadata.coordinate_frame,
                         "time_unit": "microseconds",
                         "time_origin": "first_source_event",
@@ -592,6 +746,8 @@ def _preprocess_sequence_unlocked(
                         "zstd_level": options.zstd_level,
                         "event_count": 0,
                         "dropped_event_count": 0,
+                        "spatial_downsample_filtered_event_count": 0,
+                        "event_retention_ratio": 0.0,
                         "source_coordinate_out_of_bounds_count": 0,
                         "source_declared_duration_us": duration_us,
                         "timestamp_duration_extension_us": 0,
@@ -644,11 +800,29 @@ def _preprocess_sequence_unlocked(
                 index_dataset.attrs["semantics"] = (
                     "searchsorted(t_us, boundary, side=left)"
                 )
+                if options.spatial_downsample_method == "area_accumulate":
+                    downsample_group = handle.create_group("downsample_checkpoint")
+                    state_shape = (output_height, output_width)
+                    for slot in (0, 1):
+                        downsample_group.create_dataset(
+                            f"accumulator_{slot}",
+                            shape=state_shape,
+                            dtype=np.int32,
+                        )
+                    initial_state_hash = hashlib.sha256(
+                        np.zeros(state_shape, dtype=np.int32).tobytes()
+                    ).hexdigest()
+                else:
+                    initial_state_hash = None
                 checkpoint = {
                     **identity,
                     "source_events_read": 0,
                     "written_events": 0,
                     "dropped_events": 0,
+                    "coordinate_dropped_events": 0,
+                    "downsample_filtered_events": 0,
+                    "downsample_state_slot": 0,
+                    "downsample_state_sha256": initial_state_hash,
                     "index_entries": 0,
                     "next_index_boundary_us": 0,
                     "previous_timestamp_us": None,
@@ -671,7 +845,36 @@ def _preprocess_sequence_unlocked(
             index_dtype = index_dataset.dtype
             source_events_read = int(checkpoint["source_events_read"])
             written_events = int(checkpoint["written_events"])
-            dropped_events = int(checkpoint["dropped_events"])
+            coordinate_dropped_events = int(
+                checkpoint.get(
+                    "coordinate_dropped_events", checkpoint.get("dropped_events", 0)
+                )
+            )
+            downsample_filtered_events = int(
+                checkpoint.get("downsample_filtered_events", 0)
+            )
+            dropped_events = coordinate_dropped_events + downsample_filtered_events
+            downsample_state_slot = int(checkpoint.get("downsample_state_slot", 0))
+            area_accumulator: np.ndarray | None = None
+            if options.spatial_downsample_method == "area_accumulate":
+                if downsample_state_slot not in {0, 1}:
+                    raise ValueError("partial downsample state slot is invalid")
+                state_path = (
+                    f"downsample_checkpoint/accumulator_{downsample_state_slot}"
+                )
+                if state_path not in handle:
+                    if not (
+                        bool(checkpoint.get("complete", False))
+                        and source_events_read == metadata.event_count
+                    ):
+                        raise ValueError("partial output has no area accumulator state")
+                else:
+                    area_accumulator = np.asarray(handle[state_path], dtype=np.int32)
+                    actual_state_hash = hashlib.sha256(
+                        area_accumulator.tobytes()
+                    ).hexdigest()
+                    if actual_state_hash != checkpoint.get("downsample_state_sha256"):
+                        raise ValueError("partial area accumulator checksum is invalid")
             index_entries = int(checkpoint["index_entries"])
             next_index_boundary_us = int(checkpoint["next_index_boundary_us"])
             previous_value = checkpoint["previous_timestamp_us"]
@@ -708,7 +911,15 @@ def _preprocess_sequence_unlocked(
             handle.attrs["complete"] = False
             handle.attrs["event_count"] = written_events
             handle.attrs["dropped_event_count"] = dropped_events
-            handle.attrs["source_coordinate_out_of_bounds_count"] = dropped_events
+            handle.attrs["source_coordinate_out_of_bounds_count"] = (
+                coordinate_dropped_events
+            )
+            handle.attrs["spatial_downsample_filtered_event_count"] = (
+                downsample_filtered_events
+            )
+            handle.attrs["event_retention_ratio"] = (
+                written_events / max(source_events_read, 1)
+            )
             handle.attrs["source_timestamp_repair_count"] = timestamp_repair_count
             handle.attrs["source_timestamp_max_backward_us"] = (
                 timestamp_max_backward_us
@@ -773,40 +984,77 @@ def _preprocess_sequence_unlocked(
                     downsample=options.spatial_downsample,
                     drop_out_of_bounds=drop_out_of_bounds,
                 )
-                dropped_events += int((~valid).sum())
-                if not bool(valid.any()):
-                    continue
+                coordinate_dropped_events += int((~valid).sum())
                 x = x[valid]
                 y = y[valid]
                 relative_timestamps = relative_timestamps[valid]
                 polarity = (arrays["polarity"][valid] > 0).astype(np.uint8, copy=False)
-                if relative_timestamps[-1] > np.iinfo(timestamp_dtype).max:
+                if options.spatial_downsample_method == "area_accumulate":
+                    assert area_accumulator is not None
+                    keep = area_accumulation_mask(
+                        x,
+                        y,
+                        polarity,
+                        area_accumulator,
+                        spatial_downsample=options.spatial_downsample,
+                    )
+                    downsample_filtered_events += int(len(keep) - np.count_nonzero(keep))
+                    x = x[keep]
+                    y = y[keep]
+                    relative_timestamps = relative_timestamps[keep]
+                    polarity = polarity[keep]
+                dropped_events = (
+                    coordinate_dropped_events + downsample_filtered_events
+                )
+                if (
+                    len(relative_timestamps)
+                    and relative_timestamps[-1] > np.iinfo(timestamp_dtype).max
+                ):
                     raise ValueError(
                         f"timestamp exceeds {timestamp_dtype}; use --timestamp-dtype uint64"
                     )
 
                 chunk_start = written_events
-                _append(x_dataset, x.astype(np.uint16, copy=False))
-                _append(y_dataset, y.astype(np.uint16, copy=False))
-                _append(t_dataset, relative_timestamps.astype(timestamp_dtype, copy=False))
-                _append(p_dataset, polarity)
-                written_events += len(relative_timestamps)
-
-                last_timestamp = int(relative_timestamps[-1])
-                if next_index_boundary_us <= last_timestamp:
-                    entries, next_index_boundary_us = coarse_index_entries(
-                        relative_timestamps,
-                        next_boundary_us=next_index_boundary_us,
-                        step_us=options.index_step_us,
-                        global_event_offset=chunk_start,
+                if len(relative_timestamps):
+                    _append(x_dataset, x.astype(np.uint16, copy=False))
+                    _append(y_dataset, y.astype(np.uint16, copy=False))
+                    _append(
+                        t_dataset,
+                        relative_timestamps.astype(timestamp_dtype, copy=False),
                     )
-                    _append(index_dataset, entries.astype(index_dtype, copy=False))
+                    _append(p_dataset, polarity)
+                    written_events += len(relative_timestamps)
+
+                    last_timestamp = int(relative_timestamps[-1])
+                    if next_index_boundary_us <= last_timestamp:
+                        entries, next_index_boundary_us = coarse_index_entries(
+                            relative_timestamps,
+                            next_boundary_us=next_index_boundary_us,
+                            step_us=options.index_step_us,
+                            global_event_offset=chunk_start,
+                        )
+                        _append(index_dataset, entries.astype(index_dtype, copy=False))
                 index_entries = len(index_dataset)
+                if area_accumulator is not None:
+                    next_state_slot = 1 - downsample_state_slot
+                    handle[
+                        f"downsample_checkpoint/accumulator_{next_state_slot}"
+                    ][:] = area_accumulator
+                    downsample_state_slot = next_state_slot
+                    downsample_state_hash = hashlib.sha256(
+                        area_accumulator.tobytes()
+                    ).hexdigest()
+                else:
+                    downsample_state_hash = None
                 checkpoint.update(
                     {
                         "source_events_read": source_events_read,
                         "written_events": written_events,
                         "dropped_events": dropped_events,
+                        "coordinate_dropped_events": coordinate_dropped_events,
+                        "downsample_filtered_events": downsample_filtered_events,
+                        "downsample_state_slot": downsample_state_slot,
+                        "downsample_state_sha256": downsample_state_hash,
                         "index_entries": index_entries,
                         "next_index_boundary_us": next_index_boundary_us,
                         "previous_timestamp_us": previous_timestamp,
@@ -820,7 +1068,13 @@ def _preprocess_sequence_unlocked(
                 handle.attrs["event_count"] = written_events
                 handle.attrs["dropped_event_count"] = dropped_events
                 handle.attrs["source_coordinate_out_of_bounds_count"] = (
-                    dropped_events
+                    coordinate_dropped_events
+                )
+                handle.attrs["spatial_downsample_filtered_event_count"] = (
+                    downsample_filtered_events
+                )
+                handle.attrs["event_retention_ratio"] = (
+                    written_events / max(source_events_read, 1)
                 )
                 handle.attrs["source_timestamp_repair_count"] = (
                     timestamp_repair_count
@@ -862,7 +1116,16 @@ def _preprocess_sequence_unlocked(
                                 "timestamp_duration_extension_us": max(
                                     0, effective_duration_us - duration_us
                                 ),
-                                "coordinate_out_of_bounds_count": dropped_events,
+                                "coordinate_out_of_bounds_count": (
+                                    coordinate_dropped_events
+                                ),
+                                "downsample_filtered_event_count": (
+                                    downsample_filtered_events
+                                ),
+                                "output_events": written_events,
+                                "event_retention_ratio": round(
+                                    written_events / max(source_events_read, 1), 6
+                                ),
                             },
                             sort_keys=True,
                         ),
@@ -916,7 +1179,16 @@ def _preprocess_sequence_unlocked(
                                 "timestamp_duration_extension_us": max(
                                     0, effective_duration_us - duration_us
                                 ),
-                                "coordinate_out_of_bounds_count": dropped_events,
+                                "coordinate_out_of_bounds_count": (
+                                    coordinate_dropped_events
+                                ),
+                                "downsample_filtered_event_count": (
+                                    downsample_filtered_events
+                                ),
+                                "output_events": written_events,
+                                "event_retention_ratio": round(
+                                    written_events / max(source_events_read, 1), 6
+                                ),
                             },
                             sort_keys=True,
                         ),
@@ -928,6 +1200,12 @@ def _preprocess_sequence_unlocked(
                 raise ValueError(
                     "source event count changed while preprocessing: "
                     f"expected {metadata.event_count}, read {source_events_read}"
+                )
+            if written_events + dropped_events != source_events_read:
+                raise ValueError(
+                    "preprocessing event accounting is inconsistent: "
+                    f"written={written_events}, dropped={dropped_events}, "
+                    f"read={source_events_read}"
                 )
             if _metadata_identity(metadata, split, config_hash) != identity:
                 raise ValueError("source file metadata changed while preprocessing")
@@ -945,7 +1223,15 @@ def _preprocess_sequence_unlocked(
 
             handle.attrs["event_count"] = written_events
             handle.attrs["dropped_event_count"] = dropped_events
-            handle.attrs["source_coordinate_out_of_bounds_count"] = dropped_events
+            handle.attrs["source_coordinate_out_of_bounds_count"] = (
+                coordinate_dropped_events
+            )
+            handle.attrs["spatial_downsample_filtered_event_count"] = (
+                downsample_filtered_events
+            )
+            handle.attrs["event_retention_ratio"] = (
+                written_events / max(source_events_read, 1)
+            )
             handle.attrs["source_timestamp_repair_count"] = timestamp_repair_count
             handle.attrs["source_timestamp_max_backward_us"] = (
                 timestamp_max_backward_us
@@ -963,6 +1249,12 @@ def _preprocess_sequence_unlocked(
                     "source_events_read": source_events_read,
                     "written_events": written_events,
                     "dropped_events": dropped_events,
+                    "coordinate_dropped_events": coordinate_dropped_events,
+                    "downsample_filtered_events": downsample_filtered_events,
+                    "downsample_state_slot": downsample_state_slot,
+                    "downsample_state_sha256": checkpoint.get(
+                        "downsample_state_sha256"
+                    ),
                     "index_entries": len(index_dataset),
                     "next_index_boundary_us": next_index_boundary_us,
                     "previous_timestamp_us": previous_timestamp,
@@ -974,6 +1266,9 @@ def _preprocess_sequence_unlocked(
                 }
             )
             _write_json_atomic(checkpoint_path, checkpoint)
+            if "downsample_checkpoint" in handle:
+                del handle["downsample_checkpoint"]
+                handle.flush()
 
         with temporary.open("r+b") as file_handle:
             os.fsync(file_handle.fileno())
@@ -1026,6 +1321,7 @@ _MANIFEST_IDENTITY_FIELDS = (
     "width",
     "height",
     "spatial_downsample",
+    "spatial_downsample_method",
     "source_time_origin_us",
     "coordinate_frame",
     "timestamp_reference",

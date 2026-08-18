@@ -58,8 +58,17 @@ def _parse_args() -> argparse.Namespace:
         "--spatial-downsample",
         type=int,
         help=(
-            "Integer coordinate downsample. Defaults to 2 for M3ED/1Mpx and 1 "
-            "for DSEC/Gen1. This does not discard events or create time windows."
+            "Integer spatial downsample. Defaults to 2 for M3ED/Gen4/1Mpx and 1 "
+            "for DSEC/Gen1."
+        ),
+    )
+    parser.add_argument(
+        "--spatial-downsample-method",
+        choices=("coordinate", "area_accumulate"),
+        help=(
+            "coordinate keeps every valid event; area_accumulate applies DAGR-style "
+            "per-cell contrast accumulation. Defaults to area_accumulate for factor-2 "
+            "M3ED/Gen4/1Mpx and coordinate otherwise."
         ),
     )
     parser.add_argument("--width", type=int)
@@ -152,6 +161,26 @@ def _resolved_spatial_downsample(dataset: str, requested: int | None) -> int:
         value = 1
     if value <= 0:
         raise ValueError("--spatial-downsample must be positive")
+    return value
+
+
+def _resolved_spatial_downsample_method(
+    dataset: str, spatial_downsample: int, requested: str | None
+) -> str:
+    if requested is not None:
+        value = requested
+    elif (
+        spatial_downsample > 1
+        and dataset in {"m3ed", "prophesee_1mpx", "gen4"}
+    ):
+        value = "area_accumulate"
+    else:
+        value = "coordinate"
+    if value == "area_accumulate" and spatial_downsample <= 1:
+        raise ValueError(
+            "--spatial-downsample-method area_accumulate requires "
+            "--spatial-downsample greater than 1"
+        )
     return value
 
 
@@ -296,11 +325,18 @@ def main() -> None:
     spatial_downsample = _resolved_spatial_downsample(
         args.dataset, args.spatial_downsample
     )
+    spatial_downsample_method = _resolved_spatial_downsample_method(
+        args.dataset,
+        spatial_downsample,
+        args.spatial_downsample_method,
+    )
     if (args.width is None) != (args.height is None):
         raise ValueError("--width and --height must be provided together")
     if args.limit is not None and args.limit <= 0:
         raise ValueError("--limit must be positive")
-    if args.dataset == "dsec" and spatial_downsample != 1:
+    if args.dataset == "dsec" and (
+        spatial_downsample != 1 or spatial_downsample_method != "coordinate"
+    ):
         raise ValueError(
             "DSEC must remain at native resolution; apply rectification or label-aware "
             "resizing in the downstream adapter"
@@ -455,6 +491,7 @@ def main() -> None:
     )
     options = PreprocessOptions(
         spatial_downsample=spatial_downsample,
+        spatial_downsample_method=spatial_downsample_method,
         read_chunk_events=args.read_chunk_events,
         hdf5_chunk_events=args.hdf5_chunk_events,
         zstd_level=args.zstd_level,
@@ -505,6 +542,7 @@ def main() -> None:
                         ],
                         "stored_resolution": [output_width, output_height],
                         "spatial_downsample": spatial_downsample,
+                        "spatial_downsample_method": spatial_downsample_method,
                         "output": str(output),
                         "bbox_source": (
                             None if bbox_source is None else str(bbox_source)
@@ -535,6 +573,7 @@ def main() -> None:
                     "source_resolution": [source.metadata.width, source.metadata.height],
                     "stored_resolution": [output_width, output_height],
                     "spatial_downsample": spatial_downsample,
+                    "spatial_downsample_method": spatial_downsample_method,
                     "output": str(output),
                 },
                 sort_keys=True,
@@ -575,6 +614,16 @@ def main() -> None:
                     "status": "complete",
                     "sequence": record["sequence_id"],
                     "event_count": record["event_count"],
+                    "source_event_count": source.metadata.event_count,
+                    "spatial_downsample_method": record[
+                        "spatial_downsample_method"
+                    ],
+                    "downsample_filtered_event_count": record.get(
+                        "spatial_downsample_filtered_event_count", 0
+                    ),
+                    "event_retention_ratio": record.get(
+                        "event_retention_ratio", 1.0
+                    ),
                     "output_bytes": record["output_file_size"],
                     "source_file_bytes": record["source_file_size"],
                     "bbox": record.get("bbox_path"),
@@ -605,7 +654,13 @@ def main() -> None:
                     "source_events": planned_events,
                     "source_bytes": planned_source_bytes,
                     "spatial_downsample": spatial_downsample,
-                    "note": "event count is preserved; output size is data dependent",
+                    "spatial_downsample_method": spatial_downsample_method,
+                    "note": (
+                        "area_accumulate output event count is at most approximately "
+                        "1/factor^2 of valid input events"
+                        if spatial_downsample_method == "area_accumulate"
+                        else "event count is preserved; output size is data dependent"
+                    ),
                 },
                 sort_keys=True,
             )
