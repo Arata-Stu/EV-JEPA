@@ -14,6 +14,7 @@ import torch.distributed as distributed
 import yaml
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm.auto import tqdm
 
 from event_window_jepa.config import ExperimentConfig
 from event_window_jepa.data.anchor_sampler import UniformTimeAnchorSampler, WindowPairSampler
@@ -197,9 +198,48 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def _create_summary_writer(output_dir: Path, global_step: int) -> Any:
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError as error:
+        raise ImportError(
+            "TensorBoard logging requires the tensorboard package; reinstall the "
+            "project with `python -m pip install -e '.[hdf5]'`"
+        ) from error
+    options: dict[str, Any] = {
+        "log_dir": str(output_dir / "tensorboard"),
+        "max_queue": 20,
+        "flush_secs": 30,
+    }
+    if global_step > 0:
+        options["purge_step"] = global_step
+    return SummaryWriter(**options)
+
+
+def _write_tensorboard_metrics(writer: Any, record: dict[str, Any]) -> None:
+    step = int(record["global_step"])
+    # Keep the dashboard intentionally small: the objective components, two
+    # collapse diagnostics, and the learning-rate schedule are sufficient for
+    # routine monitoring. Full diagnostics remain available in train.jsonl.
+    for name, value in (
+        ("loss/total", record["loss"]),
+        ("loss/masked", record["masked_loss"]),
+        ("loss/canonical", record["canonical_loss"]),
+        ("representation/prediction_std", record["prediction_std"]),
+        ("representation/target_std", record["target_std"]),
+        ("optimization/learning_rate", record["learning_rate"]),
+    ):
+        writer.add_scalar(name, value, step)
+
+
 def train(config: ExperimentConfig, resume_override: Path | None = None) -> None:
     world_size, rank, local_rank, device = _distributed_context()
     _seed_everything(config.runtime.seed, rank)
+    if rank == 0:
+        print(
+            f"[window-jepa] validating dataset: {config.data.manifest}",
+            flush=True,
+        )
     dataset = build_dataset(config)
     sampler = (
         DistributedSampler(dataset, shuffle=True, seed=config.runtime.seed)
@@ -264,105 +304,149 @@ def train(config: ExperimentConfig, resume_override: Path | None = None) -> None
     if warmup_steps >= total_steps:
         raise ValueError("warmup duration must be shorter than total training")
     metrics_path = output_dir / "train.jsonl"
-
-    for epoch in range(start_epoch, config.optimization.epochs):
-        dataset.set_epoch(epoch)
-        if sampler is not None:
-            sampler.set_epoch(epoch)
-        model.train()
-        for step_in_epoch, raw_batch in enumerate(loader):
-            batch = _move_batch(raw_batch, device)
-            learning_rate = learning_rate_at_step(
-                global_step,
-                total_steps,
-                warmup_steps,
-                config.optimization.learning_rate,
-                config.optimization.minimum_learning_rate,
-            )
-            for group in optimizer.param_groups:
-                group["lr"] = learning_rate
-            optimizer.zero_grad(set_to_none=True)
-            with _autocast_context(device, config.optimization.precision):
-                output = model(
-                    x_context=batch["x_context"],
-                    x_target=batch["x_target"],
-                    dt_context_ms=batch["dt_context_ms"],
-                    dt_target_ms=batch["dt_target_ms"],
-                    context_mask=batch["context_mask"],
-                    target_mask=batch["target_mask"],
-                    objective=config.optimization.objective,
-                )
-            finite_flag = torch.isfinite(output.loss).to(dtype=torch.int32)
-            if world_size > 1:
-                distributed.all_reduce(finite_flag, op=distributed.ReduceOp.MIN)
-            if not bool(finite_flag):
-                raise FloatingPointError(f"non-finite loss at global step {global_step}")
-            output.loss.backward()
-            gradient_norm = torch.nn.utils.clip_grad_norm_(
-                (parameter for parameter in model.parameters() if parameter.requires_grad),
-                config.optimization.gradient_clip,
-                error_if_nonfinite=True,
-            )
-            optimizer.step()
-            momentum = ema_momentum_at_step(
-                global_step,
-                total_steps,
-                config.optimization.target_ema_start,
-                config.optimization.target_ema_end,
-            )
-            _unwrap(model).update_target_encoder(momentum)
-            global_step += 1
-
-            if global_step % config.runtime.log_every_steps == 0:
-                metric_values = torch.stack(
-                    [
-                        output.loss.detach().float(),
-                        output.masked_loss.detach().float(),
-                        output.canonical_loss.detach().float(),
-                        output.prediction_std.detach().float(),
-                        output.target_std.detach().float(),
-                        gradient_norm.detach().float(),
-                    ]
-                )
-                if world_size > 1:
-                    distributed.all_reduce(metric_values, op=distributed.ReduceOp.SUM)
-                    metric_values /= world_size
-                if rank == 0:
-                    _append_jsonl(
-                        metrics_path,
-                        {
-                            "epoch": epoch,
-                            "step_in_epoch": step_in_epoch,
-                            "global_step": global_step,
-                            "loss": float(metric_values[0]),
-                            "masked_loss": float(metric_values[1]),
-                            "canonical_loss": float(metric_values[2]),
-                            "prediction_std": float(metric_values[3]),
-                            "target_std": float(metric_values[4]),
-                            "gradient_norm": float(metric_values[5]),
-                            "learning_rate": learning_rate,
-                            "ema_momentum": momentum,
-                        },
-                    )
-
-        should_checkpoint = (
-            (epoch + 1) % config.runtime.checkpoint_every_epochs == 0
-            or epoch + 1 == config.optimization.epochs
+    writer = _create_summary_writer(output_dir, global_step) if rank == 0 else None
+    if rank == 0:
+        print(
+            "[window-jepa] training ready: "
+            f"device={device}, epochs={config.optimization.epochs}, "
+            f"steps_per_epoch={len(loader)}, tensorboard={output_dir / 'tensorboard'}",
+            flush=True,
         )
-        if should_checkpoint:
-            if rank == 0:
-                save_checkpoint_atomic(
-                    output_dir / "checkpoint-latest.pt",
-                    _unwrap(model),
-                    optimizer,
-                    config,
-                    epoch=epoch + 1,
-                    global_step=global_step,
-                    world_size=world_size,
-                    steps_per_epoch=len(loader),
-                )
-            if world_size > 1:
-                distributed.barrier()
+
+    try:
+        for epoch in range(start_epoch, config.optimization.epochs):
+            dataset.set_epoch(epoch)
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            model.train()
+            progress = tqdm(
+                loader,
+                desc=f"epoch {epoch + 1}/{config.optimization.epochs}",
+                disable=rank != 0,
+                dynamic_ncols=True,
+                mininterval=1.0,
+                leave=True,
+            )
+            try:
+                for step_in_epoch, raw_batch in enumerate(progress):
+                    batch = _move_batch(raw_batch, device)
+                    learning_rate = learning_rate_at_step(
+                        global_step,
+                        total_steps,
+                        warmup_steps,
+                        config.optimization.learning_rate,
+                        config.optimization.minimum_learning_rate,
+                    )
+                    for group in optimizer.param_groups:
+                        group["lr"] = learning_rate
+                    optimizer.zero_grad(set_to_none=True)
+                    with _autocast_context(device, config.optimization.precision):
+                        output = model(
+                            x_context=batch["x_context"],
+                            x_target=batch["x_target"],
+                            dt_context_ms=batch["dt_context_ms"],
+                            dt_target_ms=batch["dt_target_ms"],
+                            context_mask=batch["context_mask"],
+                            target_mask=batch["target_mask"],
+                            objective=config.optimization.objective,
+                        )
+                    finite_flag = torch.isfinite(output.loss).to(dtype=torch.int32)
+                    if world_size > 1:
+                        distributed.all_reduce(finite_flag, op=distributed.ReduceOp.MIN)
+                    if not bool(finite_flag):
+                        raise FloatingPointError(
+                            f"non-finite loss at global step {global_step}"
+                        )
+                    output.loss.backward()
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        (
+                            parameter
+                            for parameter in model.parameters()
+                            if parameter.requires_grad
+                        ),
+                        config.optimization.gradient_clip,
+                        error_if_nonfinite=True,
+                    )
+                    optimizer.step()
+                    momentum = ema_momentum_at_step(
+                        global_step,
+                        total_steps,
+                        config.optimization.target_ema_start,
+                        config.optimization.target_ema_end,
+                    )
+                    _unwrap(model).update_target_encoder(momentum)
+                    global_step += 1
+
+                    should_log = (
+                        global_step % config.runtime.log_every_steps == 0
+                        or step_in_epoch + 1 == len(loader)
+                    )
+                    if should_log:
+                        metric_values = torch.stack(
+                            [
+                                output.loss.detach().float(),
+                                output.masked_loss.detach().float(),
+                                output.canonical_loss.detach().float(),
+                                output.prediction_std.detach().float(),
+                                output.target_std.detach().float(),
+                                gradient_norm.detach().float(),
+                            ]
+                        )
+                        if world_size > 1:
+                            distributed.all_reduce(
+                                metric_values, op=distributed.ReduceOp.SUM
+                            )
+                            metric_values /= world_size
+                        if rank == 0:
+                            record = {
+                                "epoch": epoch,
+                                "step_in_epoch": step_in_epoch,
+                                "global_step": global_step,
+                                "loss": float(metric_values[0]),
+                                "masked_loss": float(metric_values[1]),
+                                "canonical_loss": float(metric_values[2]),
+                                "prediction_std": float(metric_values[3]),
+                                "target_std": float(metric_values[4]),
+                                "gradient_norm": float(metric_values[5]),
+                                "learning_rate": learning_rate,
+                                "ema_momentum": momentum,
+                            }
+                            _append_jsonl(metrics_path, record)
+                            if writer is not None:
+                                _write_tensorboard_metrics(writer, record)
+                            progress.set_postfix(
+                                loss=f"{record['loss']:.4f}",
+                                pred_std=f"{record['prediction_std']:.3f}",
+                                target_std=f"{record['target_std']:.3f}",
+                                lr=f"{record['learning_rate']:.2e}",
+                                refresh=False,
+                            )
+            finally:
+                progress.close()
+
+            if writer is not None:
+                writer.flush()
+            should_checkpoint = (
+                (epoch + 1) % config.runtime.checkpoint_every_epochs == 0
+                or epoch + 1 == config.optimization.epochs
+            )
+            if should_checkpoint:
+                if rank == 0:
+                    save_checkpoint_atomic(
+                        output_dir / "checkpoint-latest.pt",
+                        _unwrap(model),
+                        optimizer,
+                        config,
+                        epoch=epoch + 1,
+                        global_step=global_step,
+                        world_size=world_size,
+                        steps_per_epoch=len(loader),
+                    )
+                if world_size > 1:
+                    distributed.barrier()
+    finally:
+        if writer is not None:
+            writer.close()
     if world_size > 1:
         distributed.barrier()
         distributed.destroy_process_group()

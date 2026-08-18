@@ -355,12 +355,24 @@ class RVTGenXH5EventSource:
             raise ValueError("start_event is outside the source event stream")
         for start in range(start_event, self.metadata.event_count, chunk_events):
             stop = min(start + chunk_events, self.metadata.event_count)
-            yield {
-                "x": np.asarray(self._events["x"][start:stop]),
-                "y": np.asarray(self._events["y"][start:stop]),
-                "t_us": np.asarray(self._events["t"][start:stop], dtype=np.int64),
-                "polarity": np.asarray(self._events["p"][start:stop]),
-            }
+            arrays: dict[str, np.ndarray] = {}
+            for output_name, source_name, dtype in (
+                ("x", "x", None),
+                ("y", "y", None),
+                ("t_us", "t", np.int64),
+                ("polarity", "p", None),
+            ):
+                try:
+                    arrays[output_name] = np.asarray(
+                        self._events[source_name][start:stop], dtype=dtype
+                    )
+                except OSError as error:
+                    raise OSError(
+                        "failed to read RVT source HDF5 chunk: "
+                        f"path={self.path}, field=/events/{source_name}, "
+                        f"events=[{start},{stop})"
+                    ) from error
+            yield arrays
 
     def close(self) -> None:
         if self._handle:

@@ -521,8 +521,11 @@ class H5EventStore(EventStore):
                     "canonical event arrays must use shuffle, Fletcher32, and Zstd"
                 )
         timestamps = datasets["t_us"]
-        if int(timestamps[0]) != info.t_start_us or int(timestamps[-1]) != info.t_end_us:
-            raise ValueError("canonical HDF5 timestamp endpoints disagree with manifest")
+        if (
+            int(timestamps[0]) < info.t_start_us
+            or int(timestamps[-1]) > info.t_end_us
+        ):
+            raise ValueError("canonical HDF5 timestamps exceed manifest coverage")
         root_group, _ = self._groups[info.sequence_id]
         root = handle[root_group]
         if "index/ms_to_event_idx" not in root:

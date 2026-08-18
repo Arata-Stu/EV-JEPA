@@ -107,6 +107,20 @@ NPZは参照のたびにsequence全体を展開する形式なので、少数seq
 window-jepa-pretrain --config configs/pretrain/window_jepa_vits.yaml
 ```
 
+学習中はrank 0だけにepoch単位の進捗バーを表示し、loss、prediction/target std、
+learning rateだけを簡潔に更新します。JSONLの完全な記録は従来どおり
+`OUTPUT_DIR/train.jsonl`へ保存し、TensorBoardには次の最小6系列だけを書きます。
+
+- `loss/total`, `loss/masked`, `loss/canonical`
+- `representation/prediction_std`, `representation/target_std`
+- `optimization/learning_rate`
+
+TensorBoardは次のように起動します。
+
+```bash
+tensorboard --logdir outputs/window_jepa_vits/tensorboard --port 6006
+```
+
 複数GPUでは次の形です。
 
 ```bash
