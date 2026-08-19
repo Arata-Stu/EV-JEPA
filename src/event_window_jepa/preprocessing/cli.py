@@ -3,9 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
-import shutil
-import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -17,6 +14,13 @@ from event_window_jepa.preprocessing.common import (
     PreprocessOptions,
     preprocess_sequence,
     write_manifest,
+)
+from event_window_jepa.preprocessing.m3ed_labels import (
+    copy_file_atomic,
+    copy_m3ed_calibration,
+    copy_m3ed_labels,
+    discover_m3ed_labels,
+    inspect_m3ed_label,
 )
 from event_window_jepa.preprocessing.sources import (
     discover_sequence_paths,
@@ -53,6 +57,23 @@ def _parse_args() -> argparse.Namespace:
         "--m3ed-dataset-list",
         type=Path,
         help="Official M3ED dataset_list.yaml used to enforce is_test_file",
+    )
+    parser.add_argument(
+        "--m3ed-labels",
+        choices=("none", "copy"),
+        default="none",
+        help=(
+            "For M3ED, validate and copy every available depth, semantics, and "
+            "pose HDF5 into the portable preprocessing bundle"
+        ),
+    )
+    parser.add_argument(
+        "--m3ed-label-output-root",
+        type=Path,
+        help=(
+            "Destination containing depth/, semantics/, and pose/; required when "
+            "--m3ed-labels=copy"
+        ),
     )
     parser.add_argument(
         "--spatial-downsample",
@@ -200,28 +221,7 @@ def _matching_bbox(path: Path) -> Path | None:
 
 
 def _copy_bbox_atomic(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    source_stat = source.stat()
-    if destination.is_file():
-        destination_stat = destination.stat()
-        if (
-            destination_stat.st_size == source_stat.st_size
-            and destination_stat.st_mtime_ns == source_stat.st_mtime_ns
-        ):
-            return
-    temporary = destination.with_name(
-        f".{destination.name}.{uuid.uuid4().hex}.partial"
-    )
-    try:
-        with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
-            shutil.copyfileobj(source_handle, target_handle, length=16 * 1024 * 1024)
-            target_handle.flush()
-            os.fsync(target_handle.fileno())
-        shutil.copystat(source, temporary)
-        os.replace(temporary, destination)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    copy_file_atomic(source, destination)
 
 
 def _validate_bbox(
@@ -355,6 +355,14 @@ def main() -> None:
         raise ValueError(
             "--allow-missing-bboxes is only valid for Prophesee/RVT datasets"
         )
+    if args.dataset != "m3ed" and (
+        args.m3ed_labels != "none" or args.m3ed_label_output_root is not None
+    ):
+        raise ValueError("M3ED label options require --dataset m3ed")
+    if args.m3ed_labels == "copy" and args.m3ed_label_output_root is None:
+        raise ValueError(
+            "--m3ed-label-output-root is required with --m3ed-labels copy"
+        )
 
     input_path = args.input.expanduser().resolve()
     paths = discover_sequence_paths(args.dataset, input_path, args.camera)
@@ -484,6 +492,11 @@ def main() -> None:
         if args.bbox_output_root is not None
         else output_root / "labels"
     )
+    m3ed_label_output_root = (
+        None
+        if args.m3ed_label_output_root is None
+        else args.m3ed_label_output_root.expanduser().resolve()
+    )
     manifest = (
         args.manifest.expanduser().resolve()
         if args.manifest is not None
@@ -523,6 +536,11 @@ def main() -> None:
             if bbox_source is not None
             else None
         )
+        m3ed_label_sources = (
+            discover_m3ed_labels(path)
+            if args.dataset == "m3ed" and args.m3ed_labels == "copy"
+            else {}
+        )
         if args.plan_only:
             planned_source_bytes += path.stat().st_size
             planned_events += source.metadata.event_count
@@ -555,6 +573,18 @@ def main() -> None:
                             if bbox_source is None
                             else bbox_metadata[path]["bbox_count"]
                         ),
+                        "m3ed_labels": {
+                            kind: {
+                                "source": str(label_path),
+                                "source_bytes": label_path.stat().st_size,
+                                "metadata": inspect_m3ed_label(
+                                    label_path,
+                                    kind=kind,
+                                    event_camera=args.camera,
+                                ),
+                            }
+                            for kind, label_path in m3ed_label_sources.items()
+                        },
                     },
                     sort_keys=True,
                 ),
@@ -607,6 +637,28 @@ def main() -> None:
                     **bbox_metadata[path],
                 }
             )
+        if args.dataset == "m3ed":
+            sequence_name = _source_sequence_name(args.dataset, path)
+            record.update(
+                {
+                    "source_sequence_name": sequence_name,
+                    "storage_split": args.split,
+                }
+            )
+            if args.m3ed_labels == "copy":
+                assert m3ed_label_output_root is not None
+                record.update(
+                    copy_m3ed_labels(
+                        path,
+                        m3ed_label_output_root,
+                        event_camera=args.camera,
+                    )
+                )
+                record.update(
+                    copy_m3ed_calibration(
+                        path, m3ed_label_output_root.parent / "calibration"
+                    )
+                )
         records.append(record)
         print(
             json.dumps(

@@ -383,6 +383,7 @@ class H5EventStore(EventStore):
         self.manifest = Path(manifest).expanduser().resolve()
         self._metadata: dict[str, SequenceInfo] = {}
         self._groups: dict[str, tuple[str, str]] = {}
+        self._storage_splits: dict[str, str] = {}
         with self.manifest.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
@@ -433,6 +434,9 @@ class H5EventStore(EventStore):
                 self._groups[sequence_id] = (
                     str(row.get("group", "/")),
                     str(row.get("events_group", "events")),
+                )
+                self._storage_splits[sequence_id] = str(
+                    row.get("storage_split", row.get("split", "train"))
                 )
         if not self._metadata:
             raise ValueError("manifest contains no sequences")
@@ -487,7 +491,10 @@ class H5EventStore(EventStore):
             "source_timestamp_reference": info.timestamp_reference,
             "source_timestamp_synchronized": info.timestamp_synchronized,
             "source_recording_id": info.source_recording_id,
-            "logical_split": info.split,
+            # ``logical_split`` is immutable conversion metadata. A derived
+            # experiment manifest may change ``split`` while preserving the
+            # original value in ``storage_split``.
+            "logical_split": self._storage_splits[info.sequence_id],
         }
         for attribute, expected in metadata_pairs.items():
             if expected is None:

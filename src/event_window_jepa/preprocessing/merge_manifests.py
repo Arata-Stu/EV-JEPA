@@ -5,7 +5,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from event_window_jepa.preprocessing.common import write_manifest
+from event_window_jepa.preprocessing.common import (
+    MANIFEST_ARTIFACT_PATH_FIELDS,
+    write_manifest,
+)
 
 
 def merge_manifests(inputs: list[str | Path], output: str | Path) -> None:
@@ -21,7 +24,7 @@ def merge_manifests(inputs: list[str | Path], output: str | Path) -> None:
                     raise ValueError(
                         f"{manifest}:{line_number} has no sequence_id/path"
                     )
-                for path_field in ("path", "bbox_path"):
+                for path_field in MANIFEST_ARTIFACT_PATH_FIELDS:
                     if row.get(path_field) is None:
                         continue
                     artifact_path = Path(str(row[path_field]))

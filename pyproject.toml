@@ -36,12 +36,16 @@ window-jepa-pretrain = "event_window_jepa.train.pretrain:main"
 window-jepa-inspect = "event_window_jepa.inspection:main"
 window-jepa-preprocess = "event_window_jepa.preprocessing.cli:main"
 window-jepa-merge-manifests = "event_window_jepa.preprocessing.merge_manifests:main"
+window-jepa-m3ed-splits = "event_window_jepa.preprocessing.m3ed_splits:main"
 window-jepa-summarize = "event_window_jepa.evaluation.window_sweep:main"
 window-jepa-gen1-probe = "event_window_jepa.downstream.gen1_roi_probe:main"
 window-jepa-gen1-detect = "event_window_jepa.downstream.gen1_detection:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"event_window_jepa.third_party.rvt_detection" = ["LICENSE", "README.md"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
@@ -50,6 +54,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["src/event_window_jepa/third_party/rvt_detection"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

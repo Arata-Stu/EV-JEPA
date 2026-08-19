@@ -1,0 +1,26 @@
+name: m3ed_f3_route_holdout_v1
+description: >-
+  Recording-level car split inspired by Fast Feature Fields. Daytime Rittenhouse
+  and UCity-small remain held out as in F3; their night counterparts are held out
+  too to avoid route leakage. Horse is a short independent validation recording.
+  Official M3ED test recordings are not used for train or validation.
+splits:
+  train:
+    - car_forest_into_ponds_long
+    - car_forest_into_ponds_short
+    - car_forest_sand_1
+    - car_forest_tree_tunnel
+    - car_urban_day_city_hall
+    - car_urban_day_penno_big_loop
+    - car_urban_day_penno_small_loop
+    - car_urban_night_city_hall
+    - car_urban_night_penno_big_loop
+    - car_urban_night_penno_small_loop
+    - car_urban_night_penno_small_loop_darker
+  val:
+    - car_urban_day_horse
+  test:
+    - car_urban_day_rittenhouse
+    - car_urban_day_ucity_small_loop
+    - car_urban_night_rittenhouse
+    - car_urban_night_ucity_small_loop

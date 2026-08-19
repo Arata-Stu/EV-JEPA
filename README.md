@@ -250,17 +250,15 @@ python -m event_window_jepa.downstream.gen1_roi_probe \
 
 ### Gen1 YOLOX Detection
 
-実Detectionでは、全304x240画面を256x320へzero-padし、ViTの位置埋め込みを16x20 patch gridへ補間します。そのtokenからstride 8/16/32のfeature pyramidを作り、外部RVT checkoutのYOLOX headを学習します。評価はRVTが含むProphesee COCO evaluatorを使い、小boxと各recording先頭0.5秒を公式protocolどおり除外します。
+実Detectionでは、全304x240画面を256x320へzero-padし、ViTの位置埋め込みを16x20 patch gridへ補間します。そのtokenからstride 8/16/32のfeature pyramidを作り、プロジェクトに同梱したRVT版YOLOX headを学習します。評価も同梱したProphesee COCO evaluatorを使い、小boxと各recording先頭0.5秒を公式protocolどおり除外します。必要部分はライセンス表示付きで固定しているため、外部RVT repositoryのcloneは不要です。
 
 これは正解bboxを推論入力に使わず、予測bboxからmAPを計算します。一方、RVTのrecurrent backboneや21-step sequenceは使わないため、RVTそのものの再現実験ではありません。まず凍結backboneで事前学習特徴を評価し、必要な場合だけ`--unfreeze-backbone`でfine-tuneします。
 
 ```bash
 python -m pip install -e '.[hdf5,detection]'
-git clone https://github.com/uzh-rpg/RVT.git /path/to/RVT
 
 python -m event_window_jepa.downstream.gen1_detection \
   --checkpoint /path/to/checkpoint-latest.pt \
-  --rvt-root /path/to/RVT \
   --train-manifest /path/to/gen1_304x240/manifests/train.jsonl \
   --val-manifest /path/to/gen1_304x240/manifests/val.jsonl \
   --output-dir /path/to/runs/gen1_detection_smoke \

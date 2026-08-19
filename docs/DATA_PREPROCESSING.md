@@ -127,6 +127,20 @@ M3EDのdecoded event座標もこの段階ではrectifyせず、`distorted`とし
 depth・flowなどと組み合わせる場合は、別途保持した公式calibrationによる変換を下流側で
 適用します。
 
+`--m3ed-labels copy`を指定すると、同じsequence directoryにある
+`*_depth_gt.h5`、`*_semantics.h5`、`*_pose_gt.h5`を検査して前処理bundleへatomic copy
+します。同時に、巨大な`*_data.h5`からcamera intrinsics、distortion、
+`T_to_prophesee_left`を含む小さなcalibration HDF5だけを抽出します。イベントだけを
+DAGR方式で1280×720から640×360へ変換し、ラベルHDF5は
+再量子化せずnative解像度・native timestampのまま保持します。depthとsemanticを
+640×360で学習する際は、下流adapterでdepthをvalid-aware補間、semanticをnearest
+neighborで縮小してください。semanticは手動GTではなくInternImage由来のpseudo-labelで、
+ignore indexは255です。
+
+manifestの`storage_split`はHDF5作成時の固定値、`split`は実験protocolの値です。
+`window-jepa-m3ed-splits`は`storage_split`を保ったまま`split`だけを変えるため、巨大な
+イベントHDF5やラベルを再変換せずにrecording単位のtrain/val/testを作り直せます。
+
 ```bash
 window-jepa-preprocess \
   --dataset m3ed \
@@ -139,6 +153,34 @@ window-jepa-preprocess \
   --sequence-list /path/to/m3ed_train_sequences.txt \
   --spatial-downsample 2 \
   --spatial-downsample-method area_accumulate
+```
+
+car subset全体を順次処理し、F3を参考にroute leakageを避けたtrain/val/test manifestまで
+一度に作る推奨commandです。標準では公式test 5系列を変換せず、ラベルを持つ公式non-test
+16系列をtrain=11、val=1、test=4へ分けます。公式test eventも必要な場合だけ末尾へ
+`--include-official-test`を追加します。
+その場合、公式test系列は実験用`test.jsonl`へ混ぜず、別の
+`manifests/official_test.jsonl`にも保存します。
+
+```bash
+cd /home/aten-22/project/research/EV-JEPA
+source env/bin/activate
+python -m pip install -e '.[hdf5]'
+
+bash scripts/preprocess/preprocess_m3ed.sh \
+  --raw-root /mnt/ssd-4tb/dataset/m3ed \
+  --output-root /mnt/ssd-4tb/dataset/evjepa/m3ed_640x360_dagr
+```
+
+出力は次のportable layoutになります。
+
+```text
+m3ed_640x360_dagr/
+├── events/storage_train/*.h5
+├── labels/{depth,semantics,pose}/*.h5
+├── calibration/*_calibration.h5
+├── manifests/{storage_train,all,train,val,test}.jsonl
+└── logs/preprocess_storage_train.log
 ```
 
 公式`dataset_list.yaml`の`is_test_file`を必ず照合します。M3EDには公式validation

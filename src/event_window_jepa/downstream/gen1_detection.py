@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import random
-import sys
 import tempfile
 from collections import OrderedDict
 from contextlib import nullcontext
@@ -62,7 +60,6 @@ def _parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--rvt-root", required=True, type=Path)
     parser.add_argument("--train-manifest", required=True, type=Path)
     parser.add_argument("--val-manifest", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -92,36 +89,22 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_rvt_components(root: Path) -> RVTComponents:
-    root = root.expanduser().resolve()
-    required = (
-        root / "models/detection/yolox/models/yolo_head.py",
-        root / "models/detection/yolox/utils/boxes.py",
-        root / "utils/evaluation/prophesee/evaluation.py",
-    )
-    missing = [str(path) for path in required if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(f"RVT checkout is incomplete: {missing}")
-    root_text = str(root)
-    if root_text not in sys.path:
-        sys.path.insert(0, root_text)
+def _load_rvt_components() -> RVTComponents:
     try:
-        head_module = importlib.import_module(
-            "models.detection.yolox.models.yolo_head"
-        )
-        boxes_module = importlib.import_module("models.detection.yolox.utils.boxes")
-        evaluator_module = importlib.import_module(
-            "utils.evaluation.prophesee.evaluation"
+        from event_window_jepa.third_party.rvt_detection import (
+            YOLOXHead,
+            evaluate_list,
+            postprocess,
         )
     except ImportError as error:
         raise ImportError(
-            "RVT detection requires its dependencies, notably torchvision and "
-            "pycocotools; install event-window-jepa[detection,hdf5]"
+            "Gen1 detection requires torchvision and pycocotools; install "
+            "event-window-jepa[detection,hdf5]"
         ) from error
     return RVTComponents(
-        head_type=head_module.YOLOXHead,
-        postprocess=boxes_module.postprocess,
-        evaluate_list=evaluator_module.evaluate_list,
+        head_type=YOLOXHead,
+        postprocess=postprocess,
+        evaluate_list=evaluate_list,
     )
 
 
@@ -479,7 +462,7 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    components = _load_rvt_components(args.rvt_root)
+    components = _load_rvt_components()
     backbone, config = load_pretrained_model(args.checkpoint, device=device)
     if args.backbone_init == "random":
         from event_window_jepa.train.pretrain import build_model

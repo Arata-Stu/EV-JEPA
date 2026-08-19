@@ -27,6 +27,11 @@ from event_window_jepa.preprocessing.cli import (
     _validate_bbox,
 )
 from event_window_jepa.preprocessing.merge_manifests import merge_manifests
+from event_window_jepa.preprocessing.m3ed_labels import (
+    copy_file_atomic,
+    discover_m3ed_labels,
+)
+from event_window_jepa.preprocessing.m3ed_splits import create_m3ed_split_manifests
 from event_window_jepa.preprocessing.sources import sequence_identifier
 
 
@@ -289,6 +294,88 @@ def test_bbox_copy_and_manifest_paths_are_portable(tmp_path) -> None:
             manifest,
             merge_existing=True,
         )
+
+
+def test_m3ed_label_discovery_and_atomic_copy(tmp_path) -> None:
+    raw = tmp_path / "raw" / "car_urban_day_horse"
+    raw.mkdir(parents=True)
+    data = raw / "car_urban_day_horse_data.h5"
+    depth = raw / "car_urban_day_horse_depth_gt.h5"
+    pose = raw / "car_urban_day_horse_pose_gt.h5"
+    data.write_bytes(b"events")
+    depth.write_bytes(b"depth")
+    pose.write_bytes(b"pose")
+
+    assert discover_m3ed_labels(data) == {"depth": depth, "pose": pose}
+    destination = tmp_path / "bundle" / "labels" / "depth" / depth.name
+    copy_file_atomic(depth, destination)
+    copy_file_atomic(depth, destination)
+    assert destination.read_bytes() == b"depth"
+
+
+def test_m3ed_experiment_split_preserves_storage_split_and_portable_paths(
+    tmp_path,
+) -> None:
+    bundle = tmp_path / "bundle"
+    events = bundle / "events" / "storage_train"
+    labels = bundle / "labels" / "depth"
+    calibration = bundle / "calibration"
+    events.mkdir(parents=True)
+    labels.mkdir(parents=True)
+    calibration.mkdir(parents=True)
+    source_names = ("train_recording", "val_recording", "test_recording")
+    records = []
+    for name in source_names:
+        event_path = events / f"m3ed__{name}__left.h5"
+        depth_path = labels / f"{name}_depth_gt.h5"
+        calibration_path = calibration / f"{name}_calibration.h5"
+        event_path.write_bytes(b"event")
+        depth_path.write_bytes(b"depth")
+        calibration_path.write_bytes(b"calibration")
+        records.append(
+            {
+                "sequence_id": f"m3ed__{name}__left",
+                "source_recording_id": f"m3ed__{name}",
+                "source_sequence_name": name,
+                "path": str(event_path),
+                "depth_path": str(depth_path),
+                "calibration_path": str(calibration_path),
+                "dataset": "m3ed",
+                "camera": "left",
+                "split": "train",
+                "storage_split": "train",
+            }
+        )
+    storage_manifest = bundle / "manifests" / "storage_train.jsonl"
+    write_manifest(records, storage_manifest)
+
+    dataset_list = tmp_path / "dataset_list.yaml"
+    dataset_list.write_text(
+        "".join(
+            f"- file: {name}\n  filetype: data\n  is_test_file: false\n"
+            for name in source_names
+        ),
+        encoding="utf-8",
+    )
+    protocol = tmp_path / "protocol.yaml"
+    protocol.write_text(
+        "name: unit_test\nsplits:\n"
+        "  train: [train_recording]\n"
+        "  val: [val_recording]\n"
+        "  test: [test_recording]\n",
+        encoding="utf-8",
+    )
+    output_dir = bundle / "manifests" / "protocol"
+    assert create_m3ed_split_manifests(
+        storage_manifest, protocol, dataset_list, output_dir
+    ) == {"train": 1, "val": 1, "test": 1}
+
+    val_row = json.loads((output_dir / "val.jsonl").read_text(encoding="utf-8"))
+    assert val_row["split"] == "val"
+    assert val_row["storage_split"] == "train"
+    assert val_row["path"] == "../../events/storage_train/m3ed__val_recording__left.h5"
+    assert val_row["depth_path"] == "../../labels/depth/val_recording_depth_gt.h5"
+    assert val_row["calibration_path"] == "../../calibration/val_recording_calibration.h5"
 
 
 def test_bbox_validation_checks_structure_and_native_bounds(tmp_path) -> None:

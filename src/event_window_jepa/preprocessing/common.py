@@ -18,6 +18,14 @@ import numpy as np
 SCHEMA_NAME = "event-window-jepa-events"
 SCHEMA_VERSION = 1
 SPATIAL_DOWNSAMPLE_METHODS = {"coordinate", "area_accumulate"}
+MANIFEST_ARTIFACT_PATH_FIELDS = (
+    "path",
+    "bbox_path",
+    "depth_path",
+    "semantics_path",
+    "pose_path",
+    "calibration_path",
+)
 
 
 @dataclass(frozen=True)
@@ -575,6 +583,7 @@ def _existing_record(
             "t_start_us": 0,
             "t_end_us": int(handle.attrs["duration_us"]),
             "split": split,
+            "storage_split": split,
             "dataset": str(handle.attrs["source_dataset"]),
             "source_recording_id": str(handle.attrs["source_recording_id"]),
             "camera": str(handle.attrs["camera"]),
@@ -1315,6 +1324,7 @@ _MANIFEST_IDENTITY_FIELDS = (
     "source_recording_id",
     "dataset",
     "split",
+    "storage_split",
     "camera",
     "source_width",
     "source_height",
@@ -1339,7 +1349,7 @@ def _resolved_manifest_records(manifest: Path) -> list[dict[str, Any]]:
                 raise ValueError(
                     f"{manifest}:{line_number} has no sequence_id/path"
                 )
-            for path_field in ("path", "bbox_path"):
+            for path_field in MANIFEST_ARTIFACT_PATH_FIELDS:
                 if row.get(path_field) is None:
                     continue
                 artifact_path = Path(str(row[path_field]))
@@ -1388,7 +1398,7 @@ def _merge_manifest_records(
 
 def _validate_manifest_artifacts(records: list[Mapping[str, Any]]) -> None:
     for record in records:
-        for path_field in ("path", "bbox_path"):
+        for path_field in MANIFEST_ARTIFACT_PATH_FIELDS:
             if record.get(path_field) is None:
                 continue
             artifact = Path(str(record[path_field])).resolve()
@@ -1424,7 +1434,7 @@ def _write_manifest_unlocked(
         with temporary.open("w", encoding="utf-8") as handle:
             for record in sorted(records, key=lambda item: str(item["sequence_id"])):
                 row = dict(record)
-                for path_field in ("path", "bbox_path"):
+                for path_field in MANIFEST_ARTIFACT_PATH_FIELDS:
                     if row.get(path_field) is None:
                         continue
                     artifact_path = Path(str(row[path_field])).resolve()

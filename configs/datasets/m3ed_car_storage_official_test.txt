@@ -1,0 +1,7 @@
+# Official M3ED test recordings present in the user's car subset.
+# Keep these out of SSL training and label-supervised model selection.
+car_forest_sand_2
+car_urban_day_schuylkill_tunnel
+car_urban_day_ucity_big_loop
+car_urban_night_schuylkill_tunnel
+car_urban_night_ucity_big_loop
