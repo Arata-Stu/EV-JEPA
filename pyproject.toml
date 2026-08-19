@@ -22,6 +22,10 @@ hdf5 = [
   "hdf5plugin>=4.4",
   "numba>=0.59",
 ]
+detection = [
+  "pycocotools>=2.0.7",
+  "torchvision>=0.17",
+]
 dev = [
   "pytest>=8.0",
   "ruff>=0.6",
@@ -34,6 +38,7 @@ window-jepa-preprocess = "event_window_jepa.preprocessing.cli:main"
 window-jepa-merge-manifests = "event_window_jepa.preprocessing.merge_manifests:main"
 window-jepa-summarize = "event_window_jepa.evaluation.window_sweep:main"
 window-jepa-gen1-probe = "event_window_jepa.downstream.gen1_roi_probe:main"
+window-jepa-gen1-detect = "event_window_jepa.downstream.gen1_detection:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

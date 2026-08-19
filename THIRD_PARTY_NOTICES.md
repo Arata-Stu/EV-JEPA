@@ -15,3 +15,8 @@ Prophesee DAT公開仕様／toolbox、hdf5plugin公式Usageを参照しました
 DSEC-Detectionが公開する公式論理splitを転記したものです。
 
 今後、参照実装のファイルをコピーまたは改変して取り込む場合は、元著作権表示・ライセンス本文・変更内容をこのファイルへ追記してください。特にI-JEPAコードの直接利用には非商用条件があるため、本体へ取り込まない方針です。
+
+`event_window_jepa.downstream.gen1_detection`は、利用者が別途用意したRVT checkoutから
+MITライセンスのYOLOX head、postprocess、Prophesee evaluatorを実行時にimportします。
+RVTコード自体はこのリポジトリへコピーしません。利用時はRVTのLICENSEと、RVTが
+改変元として明記するYOLOXのライセンス・著作権表示にも従ってください。

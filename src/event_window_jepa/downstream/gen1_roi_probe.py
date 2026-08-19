@@ -66,6 +66,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode", choices=("encoder_only", "canonical"), default="encoder_only"
     )
+    parser.add_argument(
+        "--backbone-init",
+        choices=("pretrained", "random"),
+        default="pretrained",
+        help="Use checkpoint weights or a fresh model with the checkpoint architecture",
+    )
     parser.add_argument("--train-window-ms", type=float, default=40.0)
     parser.add_argument(
         "--eval-window-ms", type=float, nargs="+", default=(40.0,)
@@ -334,12 +340,16 @@ def _feature_cache_path(
     mode: str,
     duration_ms: float,
     canonical_ms: float,
+    backbone_init: str,
+    seed: int,
     checkpoint: Path,
     sample_hash: str,
 ) -> Path:
     identity = hashlib.sha256(
-        f"{checkpoint.resolve()}:{checkpoint.stat().st_size}:{checkpoint.stat().st_mtime_ns}"
-        .encode("utf-8")
+        (
+            f"{checkpoint.resolve()}:{checkpoint.stat().st_size}:"
+            f"{checkpoint.stat().st_mtime_ns}:{backbone_init}:{seed}"
+        ).encode("utf-8")
     ).hexdigest()[:12]
     duration = f"{duration_ms:g}".replace(".", "p")
     canonical = f"{canonical_ms:g}".replace(".", "p")
@@ -563,6 +573,13 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("CUDA was requested but is unavailable")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model, config = load_pretrained_model(args.checkpoint, device=device)
+    if args.backbone_init == "random":
+        from event_window_jepa.train.pretrain import build_model
+
+        # load_pretrained_model above is still the strict source of architecture metadata.
+        torch.manual_seed(args.seed)
+        model = build_model(config).to(device)
+        model.eval()
     model.requires_grad_(False)
     image_size = tuple(config.model.image_size)
     representation = _representation(config)
@@ -588,7 +605,7 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("no valid labeled frames remain after the maximum-window filter")
     print(
         f"[gen1-probe] frames: train={len(train_references)}, "
-        f"val={len(val_references)}, mode={args.mode}"
+        f"val={len(val_references)}, mode={args.mode}, init={args.backbone_init}"
     )
 
     def features_for(
@@ -614,6 +631,8 @@ def run(args: argparse.Namespace) -> None:
             mode=args.mode,
             duration_ms=duration_ms,
             canonical_ms=args.canonical_ms,
+            backbone_init=args.backbone_init,
+            seed=args.seed,
             checkpoint=args.checkpoint,
             sample_hash=sample_hash,
         )
@@ -660,14 +679,23 @@ def run(args: argparse.Namespace) -> None:
         seed=args.seed,
         device=device,
     )
+    output_name = (
+        args.mode
+        if args.backbone_init == "pretrained"
+        else f"{args.mode}_{args.backbone_init}"
+    )
     torch.save(
-        {"head": head.cpu().state_dict(), "class_mapping": mapping},
-        args.output_dir / f"head_{args.mode}.pt",
+        {
+            "head": head.cpu().state_dict(),
+            "class_mapping": mapping,
+            "backbone_init": args.backbone_init,
+        },
+        args.output_dir / f"head_{output_name}.pt",
     )
     head.to(device)
 
     results: list[dict[str, Any]] = []
-    metrics_path = args.output_dir / f"window_metrics_{args.mode}.jsonl"
+    metrics_path = args.output_dir / f"window_metrics_{output_name}.jsonl"
     with metrics_path.open("w", encoding="utf-8") as handle:
         for duration_ms in args.eval_window_ms:
             val_features, raw_val_labels = features_for(
@@ -689,7 +717,11 @@ def run(args: argparse.Namespace) -> None:
                 device=device,
             )
             record = {
-                "method": f"gen1_roi_probe_{args.mode}",
+                "method": (
+                    f"gen1_roi_probe_{args.mode}"
+                    if args.backbone_init == "pretrained"
+                    else f"gen1_roi_probe_{args.mode}_{args.backbone_init}"
+                ),
                 "metric": "macro_f1",
                 "seed": args.seed,
                 "window_ms": float(duration_ms),
@@ -713,6 +745,7 @@ def run(args: argparse.Namespace) -> None:
         "protocol": "frozen_roi_classification_probe_not_detection_map",
         "checkpoint": str(args.checkpoint.resolve()),
         "mode": args.mode,
+        "backbone_init": args.backbone_init,
         "train_window_ms": args.train_window_ms,
         "class_mapping": mapping,
         "train_frames": len(train_references),
@@ -720,7 +753,7 @@ def run(args: argparse.Namespace) -> None:
         "train_rois": len(train_labels),
         "results": results,
     }
-    (args.output_dir / f"summary_{args.mode}.json").write_text(
+    (args.output_dir / f"summary_{output_name}.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 

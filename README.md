@@ -211,6 +211,47 @@ python -m event_window_jepa.downstream.gen1_roi_probe \
 
 `--mode canonical`でも別output directoryへ実行すると、predictorによる40 ms canonical化の効果を比較できます。主要な結果は`summary_<mode>.json`、窓ごとのmacro-F1は`window_metrics_<mode>.jsonl`へ保存されます。
 
+事前学習済みbackboneの寄与は、同じarchitectureをランダム初期化した対照と比較します。
+
+```bash
+python -m event_window_jepa.downstream.gen1_roi_probe \
+  --checkpoint /path/to/checkpoint-latest.pt \
+  --train-manifest /path/to/gen1_304x240/manifests/train.jsonl \
+  --val-manifest /path/to/gen1_304x240/manifests/val.jsonl \
+  --output-dir /path/to/runs/gen1_roi_probe_random \
+  --mode encoder_only \
+  --backbone-init random \
+  --eval-window-ms 40 \
+  --max-train-frames 20000 \
+  --max-val-frames 5000 \
+  --no-cache
+```
+
+### Gen1 YOLOX Detection
+
+実Detectionでは、全304x240画面を256x320へzero-padし、ViTの位置埋め込みを16x20 patch gridへ補間します。そのtokenからstride 8/16/32のfeature pyramidを作り、外部RVT checkoutのYOLOX headを学習します。評価はRVTが含むProphesee COCO evaluatorを使い、小boxと各recording先頭0.5秒を公式protocolどおり除外します。
+
+これは正解bboxを推論入力に使わず、予測bboxからmAPを計算します。一方、RVTのrecurrent backboneや21-step sequenceは使わないため、RVTそのものの再現実験ではありません。まず凍結backboneで事前学習特徴を評価し、必要な場合だけ`--unfreeze-backbone`でfine-tuneします。
+
+```bash
+python -m pip install -e '.[hdf5,detection]'
+git clone https://github.com/uzh-rpg/RVT.git /path/to/RVT
+
+python -m event_window_jepa.downstream.gen1_detection \
+  --checkpoint /path/to/checkpoint-latest.pt \
+  --rvt-root /path/to/RVT \
+  --train-manifest /path/to/gen1_304x240/manifests/train.jsonl \
+  --val-manifest /path/to/gen1_304x240/manifests/val.jsonl \
+  --output-dir /path/to/runs/gen1_detection_smoke \
+  --window-ms 40 \
+  --epochs 3 \
+  --eval-every 1 \
+  --max-train-frames 2000 \
+  --max-val-frames 1000
+```
+
+smoke test完走後はframe上限を外します。`train.jsonl`にYOLOX lossと`AP/AP_50/AP_75/AP_S/AP_M/AP_L`、`checkpoint-latest.pt`に再開可能なhead・optimizer状態を保存します。
+
 ## Window sweepの集計
 
 下流evaluatorが次のJSONLを出力するものとします。
