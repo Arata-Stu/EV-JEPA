@@ -20,6 +20,13 @@ SCHEMA_VERSION = 2
 
 def config_hash(config: ExperimentConfig) -> str:
     resolved = config.to_dict()
+    # Keep schema-v2 checkpoints created before the optional V-JEPA 2.1
+    # architecture fields loadable. Their implicit architecture is v1.
+    model = resolved["model"]
+    if model.get("architecture") == "event_vit_v1":
+        model.pop("architecture", None)
+        if not model.get("deep_supervision_layers"):
+            model.pop("deep_supervision_layers", None)
     # Runtime destinations/cadence do not change optimization semantics and may
     # legitimately differ on resume. The seed remains part of the identity.
     resolved["runtime"] = {"seed": resolved["runtime"]["seed"]}

@@ -27,6 +27,7 @@
 - 2極性 × 5 bin、時間線形補間、窓境界基準、要素ごとの`log1p` voxel grid
 - 2チャネルON/OFF event image ablation
 - ViT-S/16相当のonline/EMA encoder
+- V-JEPA 2.1型のflat global ViT（2-D RoPE、SDPA、中間層監督）
 - `log(Δ)` Fourier embedding
 - `Δc`、`Δt`、`log(Δt/Δc)`で条件付けたcross-attention predictor
 - disjoint multiblock spatial mask
@@ -108,6 +109,23 @@ NPZは参照のたびにsequence全体を展開する形式なので、少数seq
 window-jepa-pretrain --config configs/pretrain/window_jepa_vits.yaml
 ```
 
+Gen1をV-JEPA 2.1型backboneで最初から学習し直す設定は
+[configs/pretrain/window_jepa21_vits_gen1.yaml](configs/pretrain/window_jepa21_vits_gen1.yaml)です。
+これはConv2d patch projectionの直後をflatなglobal ViTへ入力し、learned absolute
+position embeddingの代わりに2-D RoPE、attentionにはSDPAを使います。
+`deep_supervision_layers: [2, 5, 8, 11]`は同じ15×19 token gridの中間出力であり、
+feature pyramidや階層型ViTではありません。保持context patchから全patchを予測し、
+visible/maskedの両方を含むdense lossを4深度で平均します。
+
+```bash
+cd ~/Arata_ws/EV-JEPA
+PYTHONUNBUFFERED=1 window-jepa-pretrain \
+  --config configs/pretrain/window_jepa21_vits_gen1.yaml
+```
+
+checkpoint、`train.jsonl`、TensorBoardは外部SSDではなく、project内の
+`outputs/pretrain/vjepa21_vits_gen1_seed0/`へ保存されます。
+
 学習前に、同じ設定とサンプリング処理で context/target、時間bin、patch maskを
 目視確認できます。レポートは追加の描画ライブラリを使わない自己完結HTMLです。
 
@@ -123,7 +141,9 @@ HTMLと同じ場所に、各整合性検査の結果を含む`samples.json`も�
 
 学習中はrank 0だけにepoch単位の進捗バーを表示し、loss、prediction/target std、
 learning rateだけを簡潔に更新します。JSONLの完全な記録は従来どおり
-`OUTPUT_DIR/train.jsonl`へ保存し、TensorBoardには次の最小6系列だけを書きます。
+`OUTPUT_DIR/train.jsonl`へ保存し、TensorBoardにはobjective、collapse診断、学習率を
+記録します。Dense objectiveでは`loss/dense`、`loss/visible`、
+`loss/deep_supervision`も追加されます。
 
 - `loss/total`, `loss/masked`, `loss/canonical`
 - `representation/prediction_std`, `representation/target_std`
@@ -149,6 +169,7 @@ torchrun --standalone --nproc-per-node=4 \
 - [direct_consistency.yaml](configs/pretrain/direct_consistency.yaml): 異なる窓のglobal featureを直接一致し、variance/covariance項でcollapseを防止
 - [unconditioned_window_jepa.yaml](configs/pretrain/unconditioned_window_jepa.yaml): B5に対応する時間条件なしcross-window JEPA
 - [window_jepa_vits.yaml](configs/pretrain/window_jepa_vits.yaml): 異なる窓の条件付きpatch latent prediction
+- [window_jepa21_vits_gen1.yaml](configs/pretrain/window_jepa21_vits_gen1.yaml): V-JEPA 2.1型global ViTとdense/deep-supervision lossによるGen1事前学習
 
 `variance_weight`は既定で0です。`train.jsonl`の`prediction_std`と`target_std`でcollapseを確認した後にだけ有効化します。
 

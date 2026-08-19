@@ -37,6 +37,17 @@ def _pair_of_ints(value: Any, name: str) -> tuple[int, int]:
     return result
 
 
+def _tuple_of_nonnegative_ints(value: Any, name: str) -> tuple[int, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} must be a list of zero-based block indices")
+    result = tuple(int(item) for item in value)
+    if any(item < 0 for item in result):
+        raise ValueError(f"{name} cannot contain negative block indices")
+    if len(result) != len(set(result)):
+        raise ValueError(f"{name} cannot contain duplicate block indices")
+    return result
+
+
 @dataclass(frozen=True)
 class DataConfig:
     manifest: str
@@ -206,6 +217,7 @@ class WindowsConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
+    architecture: str = "event_vit_v1"
     image_size: tuple[int, int] = (224, 224)
     patch_size: int = 16
     embed_dim: int = 384
@@ -217,12 +229,14 @@ class ModelConfig:
     scale_dim: int = 128
     scale_fourier_bands: int = 16
     condition_on_scale: bool = True
+    deep_supervision_layers: tuple[int, ...] = ()
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> ModelConfig:
         _reject_unknown(
             values,
             {
+                "architecture",
                 "image_size",
                 "patch_size",
                 "embed_dim",
@@ -234,10 +248,12 @@ class ModelConfig:
                 "scale_dim",
                 "scale_fourier_bands",
                 "condition_on_scale",
+                "deep_supervision_layers",
             },
             "model",
         )
         return cls(
+            architecture=str(values.get("architecture", "event_vit_v1")),
             image_size=_pair_of_ints(values.get("image_size", [224, 224]), "model.image_size"),
             patch_size=int(values.get("patch_size", 16)),
             embed_dim=int(values.get("embed_dim", 384)),
@@ -251,9 +267,15 @@ class ModelConfig:
             condition_on_scale=_boolean(
                 values.get("condition_on_scale", True), "model.condition_on_scale"
             ),
+            deep_supervision_layers=_tuple_of_nonnegative_ints(
+                values.get("deep_supervision_layers", []),
+                "model.deep_supervision_layers",
+            ),
         )
 
     def __post_init__(self) -> None:
+        if self.architecture not in {"event_vit_v1", "vjepa2_1"}:
+            raise ValueError("model.architecture must be event_vit_v1 or vjepa2_1")
         h, w = self.image_size
         dimensions = (
             self.patch_size,
@@ -274,6 +296,16 @@ class ModelConfig:
             raise ValueError("embed_dim must be divisible by encoder_heads")
         if self.predictor_dim % self.predictor_heads:
             raise ValueError("predictor_dim must be divisible by predictor_heads")
+        if self.deep_supervision_layers and max(self.deep_supervision_layers) >= self.encoder_depth:
+            raise ValueError("deep_supervision_layers must be smaller than encoder_depth")
+        if self.architecture == "event_vit_v1" and self.deep_supervision_layers:
+            raise ValueError("deep_supervision_layers require model.architecture=vjepa2_1")
+        if self.architecture == "vjepa2_1" and (
+            self.embed_dim // self.encoder_heads
+        ) % 4:
+            raise ValueError(
+                "vjepa2_1 requires the attention head dimension to be divisible by four"
+            )
 
 
 @dataclass(frozen=True)
@@ -371,8 +403,14 @@ class OptimizationConfig:
         )
 
     def __post_init__(self) -> None:
-        if self.objective not in {"window_jepa", "feature_consistency"}:
-            raise ValueError("objective must be window_jepa or feature_consistency")
+        if self.objective not in {
+            "window_jepa",
+            "dense_window_jepa",
+            "feature_consistency",
+        }:
+            raise ValueError(
+                "objective must be window_jepa, dense_window_jepa, or feature_consistency"
+            )
         if self.epochs <= 0 or self.warmup_epochs < 0:
             raise ValueError("epochs must be positive and warmup_epochs non-negative")
         if self.learning_rate <= 0 or self.minimum_learning_rate < 0:
@@ -444,7 +482,7 @@ class ExperimentConfig:
             raise ValueError("data.crop_size must equal model.image_size")
         if self.data.batch_size < 2:
             raise ValueError("per-rank batch_size must be at least 2 for collapse diagnostics")
-        if self.optimization.objective == "window_jepa":
+        if self.optimization.objective in {"window_jepa", "dense_window_jepa"}:
             if self.optimization.covariance_weight:
                 raise ValueError("covariance_weight is only used by feature_consistency")
             if (
@@ -464,6 +502,13 @@ class ExperimentConfig:
                 raise ValueError(
                     "feature_consistency requires variance or covariance anti-collapse loss"
                 )
+        if (
+            self.optimization.objective == "dense_window_jepa"
+            and self.model.architecture != "vjepa2_1"
+        ):
+            raise ValueError(
+                "dense_window_jepa requires model.architecture=vjepa2_1"
+            )
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> ExperimentConfig:

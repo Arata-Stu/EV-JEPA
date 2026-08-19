@@ -17,6 +17,7 @@ from event_window_jepa.losses.variance_regularization import (
 from event_window_jepa.models.ema_encoder import make_ema_copy, update_ema
 from event_window_jepa.models.event_vit import EventVisionTransformer
 from event_window_jepa.models.scale_embedding import LogFourierScaleEmbedding
+from event_window_jepa.models.vjepa21_event_vit import VJEPA21EventVisionTransformer
 from event_window_jepa.models.window_predictor import WindowPredictor
 
 
@@ -25,6 +26,9 @@ class WindowJEPAOutput:
     loss: torch.Tensor
     masked_loss: torch.Tensor
     canonical_loss: torch.Tensor
+    dense_loss: torch.Tensor
+    visible_loss: torch.Tensor
+    deep_supervision_loss: torch.Tensor
     prediction: torch.Tensor
     target: torch.Tensor
     prediction_std: torch.Tensor
@@ -34,7 +38,7 @@ class WindowJEPAOutput:
 class WindowJEPA(nn.Module):
     def __init__(
         self,
-        encoder: EventVisionTransformer,
+        encoder: EventVisionTransformer | VJEPA21EventVisionTransformer,
         predictor: WindowPredictor,
         scale_embedding: LogFourierScaleEmbedding,
         condition_on_scale: bool = True,
@@ -106,6 +110,15 @@ class WindowJEPA(nn.Module):
                 dt_context_ms=dt_context_ms,
                 dt_target_ms=dt_target_ms,
             )
+        if objective == "dense_window_jepa":
+            return self.dense_window_jepa(
+                x_context=x_context,
+                x_target=x_target,
+                dt_context_ms=dt_context_ms,
+                dt_target_ms=dt_target_ms,
+                context_mask=context_mask,
+                target_mask=target_mask,
+            )
         if objective != "window_jepa":
             raise ValueError("unsupported pretraining objective")
         if x_context.shape != x_target.shape or x_context.ndim != 4:
@@ -158,6 +171,122 @@ class WindowJEPA(nn.Module):
             loss=loss,
             masked_loss=masked_loss,
             canonical_loss=canonical_loss,
+            dense_loss=masked_loss,
+            visible_loss=masked_loss.new_zeros(()),
+            deep_supervision_loss=masked_loss.new_zeros(()),
+            prediction=prediction,
+            target=target_tokens,
+            prediction_std=masked_position_standard_deviation(
+                prediction.detach(), target_mask
+            ),
+            target_std=masked_position_standard_deviation(target_tokens, target_mask),
+        )
+
+    def dense_window_jepa(
+        self,
+        x_context: torch.Tensor,
+        x_target: torch.Tensor,
+        dt_context_ms: torch.Tensor,
+        dt_target_ms: torch.Tensor,
+        context_mask: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> WindowJEPAOutput:
+        """V-JEPA 2.1-style all-token loss with intermediate-layer supervision.
+
+        The online encoder sees only retained context patches. The predictor
+        queries the complete grid, and the objective applies equal-weight loss
+        to masked target tokens and retained visible tokens. Every selected
+        encoder depth uses the same flat spatial grid and shared predictor.
+        """
+
+        if not isinstance(self.online_encoder, VJEPA21EventVisionTransformer):
+            raise ValueError("dense_window_jepa requires a V-JEPA 2.1 encoder")
+        if x_context.shape != x_target.shape or x_context.ndim != 4:
+            raise ValueError("context and target inputs must share shape [B, C, H, W]")
+        batch_size = x_context.shape[0]
+        context_ms = dt_context_ms.reshape(batch_size)
+        target_ms = dt_target_ms.reshape(batch_size)
+        source_scale, target_scale, ratio_scale = self._scale_features(context_ms, target_ms)
+        context_layers = self.online_encoder.forward_intermediates(
+            x_context, source_scale, context_mask
+        )
+        with torch.no_grad():
+            ema_target_scale = self.target_scale_embedding(target_ms)
+            if not self.condition_on_scale:
+                ema_target_scale = torch.zeros_like(ema_target_scale)
+            if not isinstance(self.target_encoder, VJEPA21EventVisionTransformer):
+                raise RuntimeError("online and EMA target encoder architectures differ")
+            target_layers = self.target_encoder.forward_intermediates(
+                x_target, ema_target_scale, None
+            )
+        if len(context_layers) != len(target_layers) or not context_layers:
+            raise RuntimeError("deep-supervision encoder outputs do not match")
+
+        full_mask = torch.ones_like(context_mask)
+        predictions: list[torch.Tensor] = []
+        dense_losses: list[torch.Tensor] = []
+        masked_losses: list[torch.Tensor] = []
+        visible_losses: list[torch.Tensor] = []
+        for context_tokens, target_tokens in zip(
+            context_layers, target_layers, strict=True
+        ):
+            prediction = self.predictor(
+                context_tokens=context_tokens,
+                context_keep_mask=context_mask,
+                target_mask=full_mask,
+                source_scale=source_scale,
+                target_scale=target_scale,
+                ratio_scale=ratio_scale,
+            )
+            predictions.append(prediction)
+            masked_layer_loss = latent_prediction_loss(
+                prediction, target_tokens, target_mask=target_mask, kind=self.loss_kind
+            )
+            visible_layer_loss = latent_prediction_loss(
+                prediction, target_tokens, target_mask=context_mask, kind=self.loss_kind
+            )
+            masked_losses.append(masked_layer_loss)
+            visible_losses.append(visible_layer_loss)
+            dense_losses.append((masked_layer_loss + visible_layer_loss) * 0.5)
+
+        dense_loss = torch.stack(dense_losses).mean()
+        masked_loss = torch.stack(masked_losses).mean()
+        visible_loss = torch.stack(visible_losses).mean()
+        deep_supervision_loss = (
+            torch.stack(dense_losses[:-1]).mean()
+            if len(dense_losses) > 1
+            else dense_loss.new_zeros(())
+        )
+        prediction = predictions[-1]
+        target_tokens = target_layers[-1]
+
+        canonical_loss = dense_loss.new_zeros(())
+        canonical_prediction = prediction
+        if self.canonical_query_weight:
+            full_context_tokens = self.online_encoder(x_context, source_scale, None)
+            canonical_prediction = self.predictor(
+                context_tokens=full_context_tokens,
+                context_keep_mask=full_mask,
+                target_mask=full_mask,
+                source_scale=source_scale,
+                target_scale=target_scale,
+                ratio_scale=ratio_scale,
+            )
+            canonical_loss = latent_prediction_loss(
+                canonical_prediction, target_tokens, target_mask=None, kind=self.loss_kind
+            )
+        loss = dense_loss + self.canonical_query_weight * canonical_loss
+        if self.variance_weight:
+            loss = loss + self.variance_weight * masked_position_variance_regularization(
+                canonical_prediction, full_mask
+            )
+        return WindowJEPAOutput(
+            loss=loss,
+            masked_loss=masked_loss,
+            canonical_loss=canonical_loss,
+            dense_loss=dense_loss,
+            visible_loss=visible_loss,
+            deep_supervision_loss=deep_supervision_loss,
             prediction=prediction,
             target=target_tokens,
             prediction_std=masked_position_standard_deviation(
@@ -199,6 +328,9 @@ class WindowJEPA(nn.Module):
             loss=loss,
             masked_loss=loss,
             canonical_loss=loss.new_zeros(()),
+            dense_loss=loss,
+            visible_loss=loss.new_zeros(()),
+            deep_supervision_loss=loss.new_zeros(()),
             prediction=prediction,
             target=target,
             prediction_std=feature_standard_deviation(prediction.detach()),

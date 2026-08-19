@@ -24,6 +24,7 @@ from event_window_jepa.data.spatial_transforms import SharedRandomSpatialTransfo
 from event_window_jepa.masks.multiblock import MultiBlockMaskGenerator
 from event_window_jepa.models.event_vit import EventVisionTransformer
 from event_window_jepa.models.scale_embedding import LogFourierScaleEmbedding
+from event_window_jepa.models.vjepa21_event_vit import VJEPA21EventVisionTransformer
 from event_window_jepa.models.window_jepa import WindowJEPA
 from event_window_jepa.models.window_predictor import WindowPredictor
 from event_window_jepa.representations.event_image import EventImage
@@ -33,6 +34,9 @@ from event_window_jepa.train.checkpoint import (
     load_training_checkpoint,
     save_checkpoint_atomic,
 )
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -69,15 +73,27 @@ def _seed_everything(seed: int, rank: int) -> None:
 
 def build_model(config: ExperimentConfig) -> WindowJEPA:
     model_config = config.model
-    encoder = EventVisionTransformer(
-        image_size=model_config.image_size,
-        patch_size=model_config.patch_size,
-        input_channels=config.representation.channels,
-        embed_dim=model_config.embed_dim,
-        depth=model_config.encoder_depth,
-        num_heads=model_config.encoder_heads,
-        scale_dim=model_config.scale_dim,
-    )
+    if model_config.architecture == "vjepa2_1":
+        encoder = VJEPA21EventVisionTransformer(
+            image_size=model_config.image_size,
+            patch_size=model_config.patch_size,
+            input_channels=config.representation.channels,
+            embed_dim=model_config.embed_dim,
+            depth=model_config.encoder_depth,
+            num_heads=model_config.encoder_heads,
+            scale_dim=model_config.scale_dim,
+            supervision_layers=model_config.deep_supervision_layers,
+        )
+    else:
+        encoder = EventVisionTransformer(
+            image_size=model_config.image_size,
+            patch_size=model_config.patch_size,
+            input_channels=config.representation.channels,
+            embed_dim=model_config.embed_dim,
+            depth=model_config.encoder_depth,
+            num_heads=model_config.encoder_heads,
+            scale_dim=model_config.scale_dim,
+        )
     predictor = WindowPredictor(
         num_patches=encoder.num_patches,
         encoder_dim=model_config.embed_dim,
@@ -198,6 +214,11 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def _project_output_path(configured_path: str) -> Path:
+    path = Path(configured_path).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 def _create_summary_writer(output_dir: Path, global_step: int) -> Any:
     try:
         from torch.utils.tensorboard import SummaryWriter
@@ -224,6 +245,9 @@ def _write_tensorboard_metrics(writer: Any, record: dict[str, Any]) -> None:
     for name, value in (
         ("loss/total", record["loss"]),
         ("loss/masked", record["masked_loss"]),
+        ("loss/dense", record["dense_loss"]),
+        ("loss/visible", record["visible_loss"]),
+        ("loss/deep_supervision", record["deep_supervision_loss"]),
         ("loss/canonical", record["canonical_loss"]),
         ("representation/prediction_std", record["prediction_std"]),
         ("representation/target_std", record["target_std"]),
@@ -275,7 +299,7 @@ def train(config: ExperimentConfig, resume_override: Path | None = None) -> None
         weight_decay=config.optimization.weight_decay,
     )
 
-    output_dir = Path(config.runtime.output_dir)
+    output_dir = _project_output_path(config.runtime.output_dir)
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
         with (output_dir / "resolved_config.yaml").open("w", encoding="utf-8") as handle:
@@ -387,6 +411,9 @@ def train(config: ExperimentConfig, resume_override: Path | None = None) -> None
                                 output.loss.detach().float(),
                                 output.masked_loss.detach().float(),
                                 output.canonical_loss.detach().float(),
+                                output.dense_loss.detach().float(),
+                                output.visible_loss.detach().float(),
+                                output.deep_supervision_loss.detach().float(),
                                 output.prediction_std.detach().float(),
                                 output.target_std.detach().float(),
                                 gradient_norm.detach().float(),
@@ -405,9 +432,12 @@ def train(config: ExperimentConfig, resume_override: Path | None = None) -> None
                                 "loss": float(metric_values[0]),
                                 "masked_loss": float(metric_values[1]),
                                 "canonical_loss": float(metric_values[2]),
-                                "prediction_std": float(metric_values[3]),
-                                "target_std": float(metric_values[4]),
-                                "gradient_norm": float(metric_values[5]),
+                                "dense_loss": float(metric_values[3]),
+                                "visible_loss": float(metric_values[4]),
+                                "deep_supervision_loss": float(metric_values[5]),
+                                "prediction_std": float(metric_values[6]),
+                                "target_std": float(metric_values[7]),
+                                "gradient_norm": float(metric_values[8]),
                                 "learning_rate": learning_rate,
                                 "ema_momentum": momentum,
                             }

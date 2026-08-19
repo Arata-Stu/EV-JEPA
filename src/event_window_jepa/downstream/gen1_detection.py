@@ -249,6 +249,8 @@ def _dynamic_encoder_feature_map(
     scale = model.scale_embedding(duration_ms.reshape(len(images)))
     if not model.condition_on_scale:
         scale = torch.zeros_like(scale)
+    if hasattr(encoder, "forward_feature_map"):
+        return encoder.forward_feature_map(images, scale)
     patches_2d = encoder.patch_embed(images)
     grid_size = tuple(patches_2d.shape[-2:])
     patches = patches_2d.flatten(2).transpose(1, 2)
