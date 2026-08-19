@@ -179,6 +179,38 @@ feature_map = tokens_to_feature_map(tokens, model.online_encoder.grid_size)
 `mode="encoder_only"`との比較で、predictorを蓄積時間変換器として使う効果を切り分けられます。canonical経路はtarget event、target event数、target voxelを一切入力に取りません。
 標準設定ではequal-window pairも一部学習し、40→40を含むpredictorのidentity変換を較正します。また、masked patch lossに加えて同じlatent lossをfull-context/full-queryにも0.25の重みで適用し、canonical推論の単一passと学習時の条件を一致させます。この重みは`canonical_query_weight`でablationできます。
 
+### Gen1 frozen ROI probe
+
+Gen1のbbox位置でpatch tokenを平均し、凍結したbackbone上で線形分類器だけを学習する診断用probeを用意しています。これは位置推定を正解bboxに依存するため、公式DetectionのmAPではありません。事前学習済み特徴が物体クラスを分離できるか、また窓長を変えたときに性能が保たれるかを短時間で確認する用途です。
+
+まず40 msだけで少数フレームを試します。
+
+```bash
+python -m event_window_jepa.downstream.gen1_roi_probe \
+  --checkpoint /path/to/checkpoint-latest.pt \
+  --train-manifest /path/to/gen1_304x240/manifests/train.jsonl \
+  --val-manifest /path/to/gen1_304x240/manifests/val.jsonl \
+  --output-dir /path/to/runs/gen1_roi_probe \
+  --mode encoder_only \
+  --eval-window-ms 40 \
+  --max-train-frames 20000 \
+  --max-val-frames 5000
+```
+
+問題なく完走したら、上限を外してwindow sweepを実行します。抽出featureはoutput directory以下へfloat16でcacheされるため、同じチェックポイント・同じサンプルでの再実行では再計算しません。
+
+```bash
+python -m event_window_jepa.downstream.gen1_roi_probe \
+  --checkpoint /path/to/checkpoint-latest.pt \
+  --train-manifest /path/to/gen1_304x240/manifests/train.jsonl \
+  --val-manifest /path/to/gen1_304x240/manifests/val.jsonl \
+  --output-dir /path/to/runs/gen1_roi_probe_encoder \
+  --mode encoder_only \
+  --eval-window-ms 5 10 15 20 30 40 60 80 120
+```
+
+`--mode canonical`でも別output directoryへ実行すると、predictorによる40 ms canonical化の効果を比較できます。主要な結果は`summary_<mode>.json`、窓ごとのmacro-F1は`window_metrics_<mode>.jsonl`へ保存されます。
+
 ## Window sweepの集計
 
 下流evaluatorが次のJSONLを出力するものとします。
