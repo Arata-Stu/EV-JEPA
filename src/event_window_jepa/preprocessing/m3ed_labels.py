@@ -93,20 +93,43 @@ def _frame_geometry(dataset: Any, path: Path) -> tuple[int, int, int]:
     return shape[0], shape[1], shape[2]
 
 
+def _monotonic_timestamp_bounds(dataset: Any, path: Path) -> tuple[int, int]:
+    """Validate one M3ED timestamp vector without loading it all into memory."""
+
+    if dataset.ndim != 1 or not np.issubdtype(dataset.dtype, np.integer):
+        raise TypeError(
+            f"M3ED label /ts must be one-dimensional integers: {path}"
+        )
+    if len(dataset) == 0:
+        raise ValueError(f"M3ED label /ts cannot be empty: {path}")
+
+    first: int | None = None
+    previous: int | None = None
+    for start in range(0, len(dataset), 1_000_000):
+        stop = min(start + 1_000_000, len(dataset))
+        values = np.asarray(dataset[start:stop])
+        if np.any(values < 0) or np.any(values[1:] < values[:-1]):
+            raise ValueError(f"M3ED label timestamps are invalid: {path}")
+        current_first = int(values[0])
+        if previous is not None and current_first < previous:
+            raise ValueError(f"M3ED label timestamps are invalid: {path}")
+        if first is None:
+            first = current_first
+        previous = int(values[-1])
+
+    assert first is not None and previous is not None
+    return first, previous
+
+
 def _timestamp_metadata(handle: Any, frame_count: int, path: Path) -> dict[str, Any]:
     if "ts" not in handle:
         raise KeyError(f"M3ED label HDF5 has no /ts dataset: {path}")
     timestamps = handle["ts"]
-    if timestamps.ndim != 1 or not np.issubdtype(timestamps.dtype, np.integer):
-        raise TypeError(f"M3ED label /ts must be one-dimensional integers: {path}")
     if len(timestamps) != frame_count:
         raise ValueError(
             f"M3ED label frame count and /ts length disagree: {path}"
         )
-    first = int(timestamps[0])
-    last = int(timestamps[-1])
-    if first < 0 or last < first:
-        raise ValueError(f"M3ED label timestamps are invalid: {path}")
+    first, last = _monotonic_timestamp_bounds(timestamps, path)
     return {
         "timestamp_dataset": "/ts",
         "first_timestamp_us": first,
@@ -202,19 +225,16 @@ def inspect_m3ed_label(
         }
         if "ts" in handle:
             timestamps = handle["ts"]
-            if timestamps.ndim != 1 or not np.issubdtype(
-                timestamps.dtype, np.integer
-            ):
-                raise TypeError(
-                    f"M3ED pose /ts must be one-dimensional integers: {label_path}"
-                )
             if len(timestamps):
+                first, last = _monotonic_timestamp_bounds(
+                    timestamps, label_path
+                )
                 metadata.update(
                     {
                         "pose_timestamp_dataset": "/ts",
                         "pose_count": len(timestamps),
-                        "pose_first_timestamp_us": int(timestamps[0]),
-                        "pose_last_timestamp_us": int(timestamps[-1]),
+                        "pose_first_timestamp_us": first,
+                        "pose_last_timestamp_us": last,
                         "pose_timestamp_reference": (
                             "M3ED synchronized global clock (microseconds)"
                         ),

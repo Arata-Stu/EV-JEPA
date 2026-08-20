@@ -48,6 +48,11 @@ mask:
   target_area_range: [0.15, 0.25]
   target_aspect_range: [0.5, 2.0]
   context_keep_ratio: 0.60
+  # Prefer masks containing context activity without making mask geometry a
+  # deterministic event-location oracle. The remaining 30% stays uniform.
+  activity_aware_probability: 0.70
+  activity_candidates: 32
+  minimum_active_target_ratio: 0.25
 
 optimization:
   # Predict masked targets and retained visible tokens at four encoder depths.
@@ -69,7 +74,7 @@ optimization:
 runtime:
   seed: 0
   # Relative to the EV-JEPA project root, not the external dataset SSD.
-  output_dir: outputs/pretrain/vjepa21_vits_gen1_seed0
+  output_dir: outputs/pretrain/vjepa21_vits_gen1_event_aware_seed0
   log_every_steps: 20
   checkpoint_every_epochs: 1
   resume: null

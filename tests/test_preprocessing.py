@@ -28,6 +28,7 @@ from event_window_jepa.preprocessing.cli import (
 )
 from event_window_jepa.preprocessing.merge_manifests import merge_manifests
 from event_window_jepa.preprocessing.m3ed_labels import (
+    _monotonic_timestamp_bounds,
     copy_file_atomic,
     discover_m3ed_labels,
 )
@@ -311,6 +312,16 @@ def test_m3ed_label_discovery_and_atomic_copy(tmp_path) -> None:
     copy_file_atomic(depth, destination)
     copy_file_atomic(depth, destination)
     assert destination.read_bytes() == b"depth"
+
+
+def test_m3ed_label_timestamps_are_validated_across_chunks(tmp_path) -> None:
+    path = tmp_path / "label.h5"
+    timestamps = np.arange(1_000_002, dtype=np.int64)
+    assert _monotonic_timestamp_bounds(timestamps, path) == (0, 1_000_001)
+
+    timestamps[1_000_000] = timestamps[999_999] - 1
+    with pytest.raises(ValueError, match="timestamps are invalid"):
+        _monotonic_timestamp_bounds(timestamps, path)
 
 
 def test_m3ed_experiment_split_preserves_storage_split_and_portable_paths(

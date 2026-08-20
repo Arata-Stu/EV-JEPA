@@ -359,6 +359,22 @@ def _sample_section(
         "target_ms": float(sample["dt_target_ms"]),
         "context_events": debug.context.event_count,
         "target_events": debug.target.event_count,
+        "mask": {
+            "activity_aware": debug.masks.activity_aware,
+            "activity_fallback": debug.masks.activity_fallback,
+            "context_active_patch_ratio": (
+                debug.masks.selection_active_patch_ratio
+            ),
+            "context_event_mass_coverage": (
+                debug.masks.selection_event_mass_coverage
+            ),
+            "target_active_patch_ratio": float(
+                sample["mask_target_active_patch_ratio"]
+            ),
+            "target_event_mass_coverage": float(
+                sample["mask_target_event_mass_coverage"]
+            ),
+        },
         "crop": {
             "x0": params.x0,
             "y0": params.y0,

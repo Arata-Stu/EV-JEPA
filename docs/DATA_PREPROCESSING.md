@@ -129,7 +129,9 @@ depth・flowなどと組み合わせる場合は、別途保持した公式calib
 
 `--m3ed-labels copy`を指定すると、同じsequence directoryにある
 `*_depth_gt.h5`、`*_semantics.h5`、`*_pose_gt.h5`を検査して前処理bundleへatomic copy
-します。同時に、巨大な`*_data.h5`からcamera intrinsics、distortion、
+します。各ラベルHDF5はdataset shape・dtype・frame数だけでなく、`/ts`全体をchunkで
+走査してmicrosecond timestampが非負かつ単調非減少であることも確認します。同時に、
+巨大な`*_data.h5`からcamera intrinsics、distortion、
 `T_to_prophesee_left`を含む小さなcalibration HDF5だけを抽出します。イベントだけを
 DAGR方式で1280×720から640×360へ変換し、ラベルHDF5は
 再量子化せずnative解像度・native timestampのまま保持します。depthとsemanticを

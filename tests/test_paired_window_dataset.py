@@ -4,7 +4,11 @@ import numpy as np
 
 from event_window_jepa.data.anchor_sampler import UniformTimeAnchorSampler, WindowPairSampler
 from event_window_jepa.data.event_store import InMemoryEventStore
-from event_window_jepa.data.paired_window_dataset import PairedWindowDataset
+from event_window_jepa.data.paired_window_dataset import (
+    PairedWindowDataset,
+    _masked_activity_metrics,
+    _patch_event_activity,
+)
 from event_window_jepa.data.spatial_transforms import SharedRandomSpatialTransform
 from event_window_jepa.data.types import SequenceInfo
 from event_window_jepa.masks.multiblock import MultiBlockMaskGenerator
@@ -55,3 +59,22 @@ def test_dataset_uses_one_causal_end_for_both_windows() -> None:
     assert store.calls[0][1] == sample["t_end_us"]
     assert store.calls[0][2] == 40_000
     assert sample["x_context"].shape == sample["x_target"].shape == (2, 4, 4)
+    assert sample["mask_target_active_patch_ratio"].ndim == 0
+    assert sample["mask_target_event_mass_coverage"].ndim == 0
+
+
+def test_patch_event_activity_uses_raw_cropped_event_counts() -> None:
+    store = RecordingStore()
+    window = store.slice("s", 100_000, 40_000)
+    activity = _patch_event_activity(window, (2, 2))
+
+    assert activity.shape == (2, 2)
+    assert activity.dtype == np.int64
+    assert activity.sum() == window.event_count
+    assert activity[0, 0] == window.event_count
+
+    active_ratio, mass_coverage = _masked_activity_metrics(
+        activity, np.array([True, False, False, False])
+    )
+    assert active_ratio == 1.0
+    assert mass_coverage == 1.0

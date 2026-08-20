@@ -180,6 +180,9 @@ def build_dataset(config: ExperimentConfig) -> PairedWindowDataset:
         target_area_range=config.mask.target_area_range,
         target_aspect_range=config.mask.target_aspect_range,
         context_keep_ratio=config.mask.context_keep_ratio,
+        activity_aware_probability=config.mask.activity_aware_probability,
+        activity_candidates=config.mask.activity_candidates,
+        minimum_active_target_ratio=config.mask.minimum_active_target_ratio,
     )
     return PairedWindowDataset(
         store=store,
@@ -251,6 +254,19 @@ def _write_tensorboard_metrics(writer: Any, record: dict[str, Any]) -> None:
         ("loss/canonical", record["canonical_loss"]),
         ("representation/prediction_std", record["prediction_std"]),
         ("representation/target_std", record["target_std"]),
+        ("mask/activity_aware_fraction", record["mask_activity_aware_fraction"]),
+        ("mask/activity_fallback_fraction", record["mask_activity_fallback_fraction"]),
+        ("mask/context_active_patch_ratio", record["mask_context_active_patch_ratio"]),
+        (
+            "mask/context_event_mass_coverage",
+            record["mask_context_event_mass_coverage"],
+        ),
+        ("mask/target_active_patch_ratio", record["mask_target_active_patch_ratio"]),
+        (
+            "mask/target_event_mass_coverage",
+            record["mask_target_event_mass_coverage"],
+        ),
+        ("mask/empty_target_fraction", record["mask_empty_target_fraction"]),
         ("optimization/learning_rate", record["learning_rate"]),
     ):
         writer.add_scalar(name, value, step)
@@ -417,6 +433,25 @@ def train(config: ExperimentConfig, resume_override: Path | None = None) -> None
                                 output.prediction_std.detach().float(),
                                 output.target_std.detach().float(),
                                 gradient_norm.detach().float(),
+                                batch["mask_activity_aware"].mean().detach().float(),
+                                batch["mask_activity_fallback"].mean().detach().float(),
+                                batch["mask_context_active_patch_ratio"]
+                                .mean()
+                                .detach()
+                                .float(),
+                                batch["mask_context_event_mass_coverage"]
+                                .mean()
+                                .detach()
+                                .float(),
+                                batch["mask_target_active_patch_ratio"]
+                                .mean()
+                                .detach()
+                                .float(),
+                                batch["mask_target_event_mass_coverage"]
+                                .mean()
+                                .detach()
+                                .float(),
+                                batch["mask_empty_target"].mean().detach().float(),
                             ]
                         )
                         if world_size > 1:
@@ -438,6 +473,27 @@ def train(config: ExperimentConfig, resume_override: Path | None = None) -> None
                                 "prediction_std": float(metric_values[6]),
                                 "target_std": float(metric_values[7]),
                                 "gradient_norm": float(metric_values[8]),
+                                "mask_activity_aware_fraction": float(
+                                    metric_values[9]
+                                ),
+                                "mask_activity_fallback_fraction": float(
+                                    metric_values[10]
+                                ),
+                                "mask_context_active_patch_ratio": float(
+                                    metric_values[11]
+                                ),
+                                "mask_context_event_mass_coverage": float(
+                                    metric_values[12]
+                                ),
+                                "mask_target_active_patch_ratio": float(
+                                    metric_values[13]
+                                ),
+                                "mask_target_event_mass_coverage": float(
+                                    metric_values[14]
+                                ),
+                                "mask_empty_target_fraction": float(
+                                    metric_values[15]
+                                ),
                                 "learning_rate": learning_rate,
                                 "ema_momentum": momentum,
                             }
@@ -448,6 +504,9 @@ def train(config: ExperimentConfig, resume_override: Path | None = None) -> None
                                 loss=f"{record['loss']:.4f}",
                                 pred_std=f"{record['prediction_std']:.3f}",
                                 target_std=f"{record['target_std']:.3f}",
+                                mask_active=(
+                                    f"{record['mask_target_active_patch_ratio']:.2f}"
+                                ),
                                 lr=f"{record['learning_rate']:.2e}",
                                 refresh=False,
                             )

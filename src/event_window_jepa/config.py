@@ -314,6 +314,9 @@ class MaskConfig:
     target_area_range: tuple[float, float] = (0.15, 0.25)
     target_aspect_range: tuple[float, float] = (0.5, 2.0)
     context_keep_ratio: float = 0.60
+    activity_aware_probability: float = 0.0
+    activity_candidates: int = 32
+    minimum_active_target_ratio: float = 0.25
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> MaskConfig:
@@ -324,6 +327,9 @@ class MaskConfig:
                 "target_area_range",
                 "target_aspect_range",
                 "context_keep_ratio",
+                "activity_aware_probability",
+                "activity_candidates",
+                "minimum_active_target_ratio",
             },
             "mask",
         )
@@ -334,6 +340,13 @@ class MaskConfig:
             target_area_range=(float(area[0]), float(area[1])),
             target_aspect_range=(float(aspect[0]), float(aspect[1])),
             context_keep_ratio=float(values.get("context_keep_ratio", 0.60)),
+            activity_aware_probability=float(
+                values.get("activity_aware_probability", 0.0)
+            ),
+            activity_candidates=int(values.get("activity_candidates", 32)),
+            minimum_active_target_ratio=float(
+                values.get("minimum_active_target_ratio", 0.25)
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -345,6 +358,12 @@ class MaskConfig:
             raise ValueError("target_aspect_range must be positive")
         if not 0 < self.context_keep_ratio < 1:
             raise ValueError("context_keep_ratio must lie inside (0, 1)")
+        if not 0 <= self.activity_aware_probability <= 1:
+            raise ValueError("activity_aware_probability must lie inside [0, 1]")
+        if self.activity_candidates <= 0:
+            raise ValueError("activity_candidates must be positive")
+        if not 0 <= self.minimum_active_target_ratio <= 1:
+            raise ValueError("minimum_active_target_ratio must lie inside [0, 1]")
         if self.context_keep_ratio + self.target_area_range[1] > 1.0:
             raise ValueError("context and maximum target area cannot be disjoint")
 
