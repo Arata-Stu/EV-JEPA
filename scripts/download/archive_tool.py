@@ -810,8 +810,14 @@ def _parse_m3ed_dataset_list(path: Path) -> dict[str, bool]:
             stripped = stripped[1:].strip()
             if not stripped:
                 continue
-        if current is None or ":" not in stripped:
+        if current is None:
             raise ValueError(f"unsupported M3ED YAML syntax at line {line_number}")
+        if ":" not in stripped:
+            # The official manifest contains folded ``notes: >`` values whose
+            # continuation lines are ordinary prose. This dependency-free
+            # parser only needs the three split-related scalar fields, so the
+            # body of unrelated multiline values can be ignored safely.
+            continue
         key, value = stripped.split(":", 1)
         key = key.strip()
         if key in {"file", "filetype", "is_test_file"}:

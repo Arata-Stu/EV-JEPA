@@ -132,6 +132,9 @@ class DownloadToolTests(unittest.TestCase):
                 "- file: train_recording\n"
                 "  filetype: data\n"
                 "  is_test_file: false\n"
+                "  notes: >\n"
+                "    A multiline description without a colon must not be\n"
+                "    interpreted as another dataset-list field.\n"
                 "- file: test_recording\n"
                 "  filetype: data\n"
                 "  is_test_file: true\n",
