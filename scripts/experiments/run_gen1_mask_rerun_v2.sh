@@ -250,6 +250,8 @@ pretrain_metrics = (
     "target_std",
     "mask_activity_aware_fraction",
     "mask_activity_fallback_fraction",
+    "mask_context_active_patch_ratio",
+    "mask_context_event_mass_coverage",
     "mask_target_active_patch_ratio",
     "mask_target_event_mass_coverage",
     "mask_empty_target_fraction",
@@ -372,8 +374,9 @@ lines = [
     "## Pretrain final-epoch averages",
     "",
     "| Strategy | Epoch | Loss | Masked loss | Prediction std | Target std | "
-    "Aware fraction | Target active ratio | Event-mass coverage | Empty target |",
-    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    "Aware fraction | Context active ratio | Context event mass | Target active ratio | "
+    "Target event mass | Empty target |",
+    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
 ]
 for result in pretrain_results:
     lines.append(
@@ -381,6 +384,8 @@ for result in pretrain_results:
         f"| {fmt(result['loss'])} | {fmt(result['masked_loss'])} "
         f"| {fmt(result['prediction_std'])} | {fmt(result['target_std'])} "
         f"| {fmt(result['mask_activity_aware_fraction'])} "
+        f"| {fmt(result['mask_context_active_patch_ratio'])} "
+        f"| {fmt(result['mask_context_event_mass_coverage'])} "
         f"| {fmt(result['mask_target_active_patch_ratio'])} "
         f"| {fmt(result['mask_target_event_mass_coverage'])} "
         f"| {fmt(result['mask_empty_target_fraction'])} |"
