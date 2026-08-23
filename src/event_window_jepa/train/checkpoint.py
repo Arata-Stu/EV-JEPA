@@ -27,6 +27,14 @@ def config_hash(config: ExperimentConfig) -> str:
         model.pop("architecture", None)
         if not model.get("deep_supervision_layers"):
             model.pop("deep_supervision_layers", None)
+    # Preserve hashes from checkpoints created before ranked activity-aware
+    # selection was added. Non-default ranked selection remains part of the
+    # experiment identity.
+    mask = resolved["mask"]
+    if mask.get("activity_selection_strategy") == "minimum_active_ratio":
+        mask.pop("activity_selection_strategy", None)
+    if mask.get("activity_topk_fraction") == 0.25:
+        mask.pop("activity_topk_fraction", None)
     # Runtime destinations/cadence do not change optimization semantics and may
     # legitimately differ on resume. The seed remains part of the identity.
     resolved["runtime"] = {"seed": resolved["runtime"]["seed"]}

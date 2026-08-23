@@ -54,3 +54,35 @@ def test_activity_aware_mask_falls_back_for_an_empty_context() -> None:
     assert masks.activity_fallback is True
     assert masks.selection_active_patch_ratio == 0.0
     assert masks.selection_event_mass_coverage == 0.0
+
+
+def test_topk_enrichment_selects_denser_event_regions() -> None:
+    activity = np.ones((8, 8), dtype=np.int64)
+    activity[:, :2] = 50
+    random_generator = MultiBlockMaskGenerator(
+        (8, 8),
+        activity_aware_probability=0.0,
+        activity_candidates=64,
+    )
+    ranked_generator = MultiBlockMaskGenerator(
+        (8, 8),
+        activity_aware_probability=1.0,
+        activity_candidates=64,
+        activity_selection_strategy="topk_enrichment",
+        activity_topk_fraction=0.125,
+    )
+
+    random_mass = []
+    ranked_mass = []
+    for seed in range(32):
+        random_mass.append(
+            random_generator.sample(
+                random.Random(seed), activity=activity
+            ).selection_event_mass_coverage
+        )
+        ranked = ranked_generator.sample(random.Random(seed), activity=activity)
+        assert ranked.activity_aware is True
+        assert ranked.activity_fallback is False
+        ranked_mass.append(ranked.selection_event_mass_coverage)
+
+    assert np.mean(ranked_mass) > 1.5 * np.mean(random_mass)

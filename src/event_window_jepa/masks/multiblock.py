@@ -39,6 +39,8 @@ class MultiBlockMaskGenerator:
         activity_aware_probability: float = 0.0,
         activity_candidates: int = 32,
         minimum_active_target_ratio: float = 0.25,
+        activity_selection_strategy: str = "minimum_active_ratio",
+        activity_topk_fraction: float = 0.25,
     ) -> None:
         self.grid_height, self.grid_width = grid_size
         self.num_patches = self.grid_height * self.grid_width
@@ -49,6 +51,8 @@ class MultiBlockMaskGenerator:
         self.activity_aware_probability = activity_aware_probability
         self.activity_candidates = activity_candidates
         self.minimum_active_target_ratio = minimum_active_target_ratio
+        self.activity_selection_strategy = activity_selection_strategy
+        self.activity_topk_fraction = activity_topk_fraction
         if min(grid_size) <= 0 or target_blocks <= 0:
             raise ValueError("grid dimensions and target_blocks must be positive")
         if not 0 < target_area_range[0] <= target_area_range[1] < 1:
@@ -63,6 +67,16 @@ class MultiBlockMaskGenerator:
             raise ValueError("activity_candidates must be positive")
         if not 0 <= minimum_active_target_ratio <= 1:
             raise ValueError("minimum_active_target_ratio must lie in [0, 1]")
+        if activity_selection_strategy not in {
+            "minimum_active_ratio",
+            "topk_enrichment",
+        }:
+            raise ValueError(
+                "activity_selection_strategy must be minimum_active_ratio or "
+                "topk_enrichment"
+            )
+        if not 0 < activity_topk_fraction <= 1:
+            raise ValueError("activity_topk_fraction must lie in (0, 1]")
         maximum_target = math.ceil(target_area_range[1] * self.num_patches)
         context_count = round(context_keep_ratio * self.num_patches)
         if math.floor(target_area_range[1] * self.num_patches) < target_blocks:
@@ -134,6 +148,15 @@ class MultiBlockMaskGenerator:
         )
         return active_patch_ratio, event_mass_coverage
 
+    def _event_enrichment(
+        self, activity: NDArray[np.float64], target_indices: set[int]
+    ) -> float:
+        """Event-mass density relative to uniform selection of the same area."""
+
+        _, event_mass_coverage = self._activity_metrics(activity, target_indices)
+        area_fraction = len(target_indices) / self.num_patches
+        return event_mass_coverage / area_fraction
+
     def _validated_activity(
         self, activity: NDArray[np.generic] | None
     ) -> NDArray[np.float64] | None:
@@ -166,21 +189,38 @@ class MultiBlockMaskGenerator:
         activity_fallback = False
         if activity_requested and activity_values is not None and activity_values.sum() > 0:
             candidates: list[tuple[list[set[int]], set[int]]] = []
-            qualified: list[tuple[list[set[int]], set[int]]] = []
             for _ in range(self.activity_candidates):
                 candidate = self._sample_target_geometry(rng)
                 candidates.append(candidate)
-                active_ratio, _ = self._activity_metrics(
-                    activity_values, candidate[1]
+            if self.activity_selection_strategy == "topk_enrichment":
+                # Candidate area varies inside target_area_range, so raw event
+                # mass would favor larger masks. Enrichment divides mass
+                # coverage by area fraction and ranks spatial event density.
+                ranked = sorted(
+                    candidates,
+                    key=lambda candidate: self._event_enrichment(
+                        activity_values, candidate[1]
+                    ),
+                    reverse=True,
                 )
-                if active_ratio >= self.minimum_active_target_ratio:
-                    qualified.append(candidate)
-            if qualified:
-                sampled_blocks, target_indices = rng.choice(qualified)
+                top_count = max(
+                    1, math.ceil(self.activity_topk_fraction * len(ranked))
+                )
+                sampled_blocks, target_indices = rng.choice(ranked[:top_count])
                 activity_aware = True
             else:
-                sampled_blocks, target_indices = rng.choice(candidates)
-                activity_fallback = True
+                qualified = [
+                    candidate
+                    for candidate in candidates
+                    if self._activity_metrics(activity_values, candidate[1])[0]
+                    >= self.minimum_active_target_ratio
+                ]
+                if qualified:
+                    sampled_blocks, target_indices = rng.choice(qualified)
+                    activity_aware = True
+                else:
+                    sampled_blocks, target_indices = rng.choice(candidates)
+                    activity_fallback = True
         else:
             sampled_blocks, target_indices = self._sample_target_geometry(rng)
             activity_fallback = activity_requested

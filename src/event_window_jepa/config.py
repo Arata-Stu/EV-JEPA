@@ -317,6 +317,8 @@ class MaskConfig:
     activity_aware_probability: float = 0.0
     activity_candidates: int = 32
     minimum_active_target_ratio: float = 0.25
+    activity_selection_strategy: str = "minimum_active_ratio"
+    activity_topk_fraction: float = 0.25
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> MaskConfig:
@@ -330,6 +332,8 @@ class MaskConfig:
                 "activity_aware_probability",
                 "activity_candidates",
                 "minimum_active_target_ratio",
+                "activity_selection_strategy",
+                "activity_topk_fraction",
             },
             "mask",
         )
@@ -347,6 +351,10 @@ class MaskConfig:
             minimum_active_target_ratio=float(
                 values.get("minimum_active_target_ratio", 0.25)
             ),
+            activity_selection_strategy=str(
+                values.get("activity_selection_strategy", "minimum_active_ratio")
+            ),
+            activity_topk_fraction=float(values.get("activity_topk_fraction", 0.25)),
         )
 
     def __post_init__(self) -> None:
@@ -364,6 +372,16 @@ class MaskConfig:
             raise ValueError("activity_candidates must be positive")
         if not 0 <= self.minimum_active_target_ratio <= 1:
             raise ValueError("minimum_active_target_ratio must lie inside [0, 1]")
+        if self.activity_selection_strategy not in {
+            "minimum_active_ratio",
+            "topk_enrichment",
+        }:
+            raise ValueError(
+                "activity_selection_strategy must be minimum_active_ratio or "
+                "topk_enrichment"
+            )
+        if not 0 < self.activity_topk_fraction <= 1:
+            raise ValueError("activity_topk_fraction must lie inside (0, 1]")
         if self.context_keep_ratio + self.target_area_range[1] > 1.0:
             raise ValueError("context and maximum target area cannot be disjoint")
 

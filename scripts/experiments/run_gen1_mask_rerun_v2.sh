@@ -14,7 +14,7 @@ usage() {
   printf '%s\n' \
     'Usage: bash scripts/experiments/run_gen1_mask_rerun_v2.sh [options]' \
     '' \
-    '  --action ACTION   prepare, pretrain, detection, summary, or all (default: all)' \
+    '  --action ACTION   prepare, mask-audit, pretrain, detection, summary, or all' \
     '  --data-root DIR   Gen1 processed dataset root' \
     '  -h, --help        Show this help' \
     '' \
@@ -45,7 +45,7 @@ while (($#)); do
 done
 
 case "$ACTION" in
-  prepare|pretrain|detection|summary|all) ;;
+  prepare|mask-audit|pretrain|detection|summary|all) ;;
   *)
     printf 'Unsupported action: %s\n' "$ACTION" >&2
     usage >&2
@@ -491,6 +491,48 @@ print(f"Pretrain CSV: {pretrain_csv}")
 PY
 }
 
+run_mask_audit() {
+  require_file "$BASE_CONFIG"
+  require_file "$TRAIN_MANIFEST"
+  local audit_root="$PROJECT_ROOT/outputs/mask_audit/topk_enrichment_seed0"
+  mkdir -p "$audit_root"
+  local specification
+  local fraction
+  local label
+  for specification in 0.25:top25 0.125:top12_5 0.0625:top6_25; do
+    fraction=${specification%%:*}
+    label=${specification##*:}
+    printf 'Auditing top-k fraction %s (%s)\n' "$fraction" "$label"
+    if (
+      cd "$PROJECT_ROOT"
+      PYTHONUNBUFFERED=1 python -m event_window_jepa.evaluation.mask_strategy_audit \
+        --config "$BASE_CONFIG" \
+        --output "outputs/mask_audit/topk_enrichment_seed0/audit_$label.json" \
+        --samples 10000 \
+        --epoch 0 \
+        --topk-fraction "$fraction" \
+        --minimum-context-mass-lift 0.15 \
+        --minimum-target-mass-lift 0.05 \
+        --minimum-context-enrichment 1.15 \
+        --require-pass
+    ); then
+      printf '%s\n' "$fraction" > "$audit_root/selected_topk_fraction.txt"
+      printf 'Mask audit passed; selected the least aggressive passing fraction: %s\n' \
+        "$fraction"
+      return 0
+    else
+      local status=$?
+      if [[ $status -ne 2 ]]; then
+        return "$status"
+      fi
+      printf 'Acceptance checks failed for top-k fraction %s; trying the next value.\n' \
+        "$fraction"
+    fi
+  done
+  printf 'No audited top-k fraction met every acceptance criterion.\n' >&2
+  return 2
+}
+
 require_command perl
 require_command grep
 require_command python
@@ -499,6 +541,9 @@ require_command tee
 case "$ACTION" in
   prepare)
     prepare_configs
+    ;;
+  mask-audit)
+    run_mask_audit
     ;;
   pretrain)
     prepare_configs

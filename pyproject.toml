@@ -40,6 +40,7 @@ window-jepa-m3ed-splits = "event_window_jepa.preprocessing.m3ed_splits:main"
 window-jepa-summarize = "event_window_jepa.evaluation.window_sweep:main"
 window-jepa-gen1-probe = "event_window_jepa.downstream.gen1_roi_probe:main"
 window-jepa-gen1-detect = "event_window_jepa.downstream.gen1_detection:main"
+window-jepa-mask-audit = "event_window_jepa.evaluation.mask_strategy_audit:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

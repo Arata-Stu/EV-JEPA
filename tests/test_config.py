@@ -36,11 +36,21 @@ def test_event_aware_mask_configuration_is_validated() -> None:
             "activity_aware_probability": 0.7,
             "activity_candidates": 32,
             "minimum_active_target_ratio": 0.25,
+            "activity_selection_strategy": "topk_enrichment",
+            "activity_topk_fraction": 0.25,
         }
     )
     assert config.activity_aware_probability == 0.7
     assert config.activity_candidates == 32
     assert config.minimum_active_target_ratio == 0.25
+    assert config.activity_selection_strategy == "topk_enrichment"
+    assert config.activity_topk_fraction == 0.25
 
     with pytest.raises(ValueError, match="activity_aware_probability"):
         MaskConfig(activity_aware_probability=1.1)
+
+    with pytest.raises(ValueError, match="activity_selection_strategy"):
+        MaskConfig(activity_selection_strategy="maximum_mass")
+
+    with pytest.raises(ValueError, match="activity_topk_fraction"):
+        MaskConfig(activity_topk_fraction=0.0)

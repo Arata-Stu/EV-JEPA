@@ -183,6 +183,8 @@ def build_dataset(config: ExperimentConfig) -> PairedWindowDataset:
         activity_aware_probability=config.mask.activity_aware_probability,
         activity_candidates=config.mask.activity_candidates,
         minimum_active_target_ratio=config.mask.minimum_active_target_ratio,
+        activity_selection_strategy=config.mask.activity_selection_strategy,
+        activity_topk_fraction=config.mask.activity_topk_fraction,
     )
     return PairedWindowDataset(
         store=store,
