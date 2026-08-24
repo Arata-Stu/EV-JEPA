@@ -20,9 +20,20 @@ from event_window_jepa.config import ExperimentConfig
 from event_window_jepa.data.anchor_sampler import UniformTimeAnchorSampler, WindowPairSampler
 from event_window_jepa.data.event_store import H5EventStore, NpzEventStore
 from event_window_jepa.data.paired_window_dataset import PairedWindowDataset
+from event_window_jepa.data.recurrent_window_dataset import RecurrentWindowDataset
+from event_window_jepa.data.sequence_sampler import (
+    MixedRecurrentBatchSampler,
+    UniformSequenceClipSampler,
+)
 from event_window_jepa.data.spatial_transforms import SharedRandomSpatialTransform
 from event_window_jepa.masks.multiblock import MultiBlockMaskGenerator
 from event_window_jepa.models.event_vit import EventVisionTransformer
+from event_window_jepa.models.recurrent_vjepa21_event_vit import (
+    RecurrentState,
+    RecurrentVJEPA21EventVisionTransformer,
+    detach_recurrent_state,
+    reset_recurrent_state,
+)
 from event_window_jepa.models.scale_embedding import LogFourierScaleEmbedding
 from event_window_jepa.models.vjepa21_event_vit import VJEPA21EventVisionTransformer
 from event_window_jepa.models.window_jepa import WindowJEPA
@@ -31,6 +42,7 @@ from event_window_jepa.representations.event_image import EventImage
 from event_window_jepa.representations.voxel_grid import VoxelGrid
 from event_window_jepa.train.callbacks import ema_momentum_at_step, learning_rate_at_step
 from event_window_jepa.train.checkpoint import (
+    collect_rng_states,
     load_training_checkpoint,
     save_checkpoint_atomic,
 )
@@ -80,7 +92,20 @@ def _seed_everything(seed: int, rank: int) -> None:
 
 def build_model(config: ExperimentConfig) -> WindowJEPA:
     model_config = config.model
-    if model_config.architecture == "vjepa2_1":
+    if config.recurrent.enabled:
+        encoder = RecurrentVJEPA21EventVisionTransformer(
+            image_size=model_config.image_size,
+            patch_size=model_config.patch_size,
+            input_channels=config.representation.channels,
+            embed_dim=model_config.embed_dim,
+            depth=model_config.encoder_depth,
+            num_heads=model_config.encoder_heads,
+            scale_dim=model_config.scale_dim,
+            supervision_layers=model_config.deep_supervision_layers,
+            recurrent_cell=config.recurrent.cell,
+            recurrent_kernel_size=config.recurrent.kernel_size,
+        )
+    elif model_config.architecture == "vjepa2_1":
         encoder = VJEPA21EventVisionTransformer(
             image_size=model_config.image_size,
             patch_size=model_config.patch_size,
@@ -131,7 +156,9 @@ def build_model(config: ExperimentConfig) -> WindowJEPA:
     return model
 
 
-def build_dataset(config: ExperimentConfig) -> PairedWindowDataset:
+def build_dataset(
+    config: ExperimentConfig,
+) -> PairedWindowDataset | RecurrentWindowDataset:
     store = (
         NpzEventStore(config.data.manifest)
         if config.data.store == "npz"
@@ -151,21 +178,6 @@ def build_dataset(config: ExperimentConfig) -> PairedWindowDataset:
             "preprocessed resolutions are smaller than data.crop_size: "
             f"{too_small[:5]}"
         )
-    maximum_window = max(config.windows.train_ms + config.windows.target_ms)
-    anchor_sampler = UniformTimeAnchorSampler(
-        sequences,
-        maximum_window_ms=maximum_window,
-        samples_per_epoch=config.data.samples_per_epoch,
-        seed=config.runtime.seed,
-        sampling_strategy=config.data.sequence_sampling,
-    )
-    pair_sampler = WindowPairSampler(
-        config.windows.train_ms,
-        config.windows.target_ms,
-        minimum_ratio=config.windows.minimum_ratio,
-        direction=config.windows.direction,
-        allow_equal=config.windows.allow_equal,
-    )
     if config.representation.kind == "voxel_grid":
         representation = VoxelGrid(
             temporal_bins=config.representation.temporal_bins,
@@ -193,6 +205,42 @@ def build_dataset(config: ExperimentConfig) -> PairedWindowDataset:
         activity_selection_strategy=config.mask.activity_selection_strategy,
         activity_topk_fraction=config.mask.activity_topk_fraction,
     )
+    if config.recurrent.enabled:
+        clip_sampler = UniformSequenceClipSampler(
+            sequences,
+            base_window_ms=config.recurrent.window_ms,
+            stride_ms=config.recurrent.stride_ms,
+            sequence_length=config.recurrent.sequence_length,
+            burn_in_steps=config.recurrent.burn_in_steps,
+            samples_per_epoch=config.data.samples_per_epoch,
+            seed=config.runtime.seed,
+            sampling_strategy=config.data.sequence_sampling,
+        )
+        return RecurrentWindowDataset(
+            store=store,
+            clip_sampler=clip_sampler,
+            representation=representation,
+            mask_generator=mask,
+            spatial_transform=transform,
+            tbptt_steps=config.recurrent.tbptt_steps,
+            seed=config.runtime.seed,
+        )
+
+    maximum_window = max(config.windows.train_ms + config.windows.target_ms)
+    anchor_sampler = UniformTimeAnchorSampler(
+        sequences,
+        maximum_window_ms=maximum_window,
+        samples_per_epoch=config.data.samples_per_epoch,
+        seed=config.runtime.seed,
+        sampling_strategy=config.data.sequence_sampling,
+    )
+    pair_sampler = WindowPairSampler(
+        config.windows.train_ms,
+        config.windows.target_ms,
+        minimum_ratio=config.windows.minimum_ratio,
+        direction=config.windows.direction,
+        allow_equal=config.windows.allow_equal,
+    )
     return PairedWindowDataset(
         store=store,
         anchor_sampler=anchor_sampler,
@@ -204,11 +252,142 @@ def build_dataset(config: ExperimentConfig) -> PairedWindowDataset:
     )
 
 
+def build_recurrent_batch_sampler(
+    config: ExperimentConfig,
+    dataset: RecurrentWindowDataset,
+    *,
+    world_size: int,
+    rank: int,
+) -> MixedRecurrentBatchSampler:
+    """Build the RVT-style stream/random sampler for one DDP rank."""
+
+    if not config.recurrent.enabled or config.recurrent.sampling != "mixed":
+        raise ValueError("mixed recurrent batch sampling is not enabled")
+    stream_batch_size = round(
+        config.data.batch_size * config.recurrent.stream_ratio
+    )
+    random_batch_size = config.data.batch_size - stream_batch_size
+    return MixedRecurrentBatchSampler(
+        dataset.clip_sampler.sequences,
+        base_window_ms=config.recurrent.window_ms,
+        stride_ms=config.recurrent.stride_ms,
+        sequence_length=config.recurrent.sequence_length,
+        burn_in_steps=config.recurrent.burn_in_steps,
+        samples_per_epoch=config.data.samples_per_epoch,
+        batch_size=config.data.batch_size,
+        stream_ratio=(stream_batch_size, random_batch_size),
+        world_size=world_size,
+        rank=rank,
+        seed=config.runtime.seed,
+        random_sampling_strategy=config.data.sequence_sampling,
+    )
+
+
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {
         key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
         for key, value in batch.items()
     }
+
+
+MixedStreamContract = tuple[tuple[str, str, str, int], ...]
+
+
+def _validate_mixed_recurrent_batch(
+    batch: dict[str, Any],
+    *,
+    batch_size: int,
+    stream_batch_size: int,
+    stride_us: int,
+    previous_streams: MixedStreamContract | None,
+) -> MixedStreamContract:
+    """Validate lane stability and causality before a mixed batch reaches the GPU."""
+
+    if not 0 < stream_batch_size < batch_size:
+        raise ValueError("mixed batches require both stream and random rows")
+    expected_modes = ["stream"] * stream_batch_size + ["random"] * (
+        batch_size - stream_batch_size
+    )
+    modes = batch.get("sampling_mode")
+    if not isinstance(modes, (list, tuple)) or list(modes) != expected_modes:
+        raise ValueError(
+            "mixed recurrent rows must be ordered as fixed stream lanes followed "
+            "by random clips"
+        )
+
+    resets = batch.get("state_reset")
+    timestamps = batch.get("t_end_us")
+    if (
+        not isinstance(resets, torch.Tensor)
+        or resets.dtype != torch.bool
+        or tuple(resets.shape) != (batch_size,)
+    ):
+        raise ValueError("mixed recurrent state_reset must be a boolean [B] tensor")
+    if (
+        not isinstance(timestamps, torch.Tensor)
+        or timestamps.ndim != 2
+        or timestamps.shape[0] != batch_size
+        or timestamps.shape[1] == 0
+    ):
+        raise ValueError("mixed recurrent t_end_us must have shape [B,T]")
+
+    sequence_ids = batch.get("sequence_id")
+    stream_ids = batch.get("stream_id")
+    augmentation_ids = batch.get("augmentation_id")
+    for name, values in (
+        ("sequence_id", sequence_ids),
+        ("stream_id", stream_ids),
+        ("augmentation_id", augmentation_ids),
+    ):
+        if not isinstance(values, (list, tuple)) or len(values) != batch_size:
+            raise ValueError(f"mixed recurrent {name} must contain one value per row")
+
+    if previous_streams is not None and len(previous_streams) != stream_batch_size:
+        raise ValueError("previous mixed stream contract has the wrong lane count")
+    current_streams: list[tuple[str, str, str, int]] = []
+    for row in range(stream_batch_size):
+        stream_id = str(stream_ids[row])
+        sequence_id = str(sequence_ids[row])
+        augmentation_id = str(augmentation_ids[row])
+        first_end_us = int(timestamps[row, 0])
+        last_end_us = int(timestamps[row, -1])
+        reset = bool(resets[row])
+        if not stream_id:
+            raise ValueError("stream rows require stable non-empty stream_id values")
+        if previous_streams is None:
+            if not reset:
+                raise ValueError("the first mixed batch must reset every stream lane")
+        else:
+            (
+                previous_stream_id,
+                previous_sequence_id,
+                previous_augmentation_id,
+                previous_last_end_us,
+            ) = previous_streams[row]
+            if stream_id != previous_stream_id:
+                raise ValueError("a mixed stream lane changed position between batches")
+            is_adjacent = first_end_us == previous_last_end_us + stride_us
+            if not reset and (
+                sequence_id != previous_sequence_id
+                or augmentation_id != previous_augmentation_id
+                or not is_adjacent
+            ):
+                raise ValueError(
+                    "a non-reset stream row changed sequence, augmentation, or causal "
+                    "timestamp continuity"
+                )
+            if reset and sequence_id == previous_sequence_id and is_adjacent:
+                raise ValueError("a continuous stream row was reset before its next chunk")
+        current_streams.append(
+            (stream_id, sequence_id, augmentation_id, last_end_us)
+        )
+
+    for row in range(stream_batch_size, batch_size):
+        if str(stream_ids[row]):
+            raise ValueError("random rows must not carry a stream_id")
+        if not bool(resets[row]):
+            raise ValueError("random rows must reset recurrent state every batch")
+    return tuple(current_streams)
 
 
 def _unwrap(model: WindowJEPA | DistributedDataParallel) -> WindowJEPA:
@@ -279,6 +458,147 @@ def _write_tensorboard_metrics(writer: Any, record: dict[str, Any]) -> None:
         ("optimization/learning_rate", record["learning_rate"]),
     ):
         writer.add_scalar(name, value, step)
+    if "recurrent_state_rms" in record:
+        writer.add_scalar(
+            "recurrent/state_rms", record["recurrent_state_rms"], step
+        )
+
+
+def _output_metric_tensor(output: Any) -> torch.Tensor:
+    return torch.stack(
+        [
+            output.loss.detach().float(),
+            output.masked_loss.detach().float(),
+            output.canonical_loss.detach().float(),
+            output.dense_loss.detach().float(),
+            output.visible_loss.detach().float(),
+            output.deep_supervision_loss.detach().float(),
+            output.prediction_std.detach().float(),
+            output.target_std.detach().float(),
+        ]
+    )
+
+
+def _recurrent_chunk_ranges(
+    loss_mask: torch.Tensor, detach_mask: torch.Tensor
+) -> tuple[tuple[int, int], ...]:
+    """Validate collated temporal control masks and return loss chunk ranges."""
+
+    if (
+        loss_mask.ndim != 2
+        or detach_mask.shape != loss_mask.shape
+        or loss_mask.dtype is not torch.bool
+        or detach_mask.dtype is not torch.bool
+    ):
+        raise ValueError("recurrent loss/detach masks must be boolean [B,T] tensors")
+    if not bool((loss_mask == loss_mask[:1]).all()) or not bool(
+        (detach_mask == detach_mask[:1]).all()
+    ):
+        raise ValueError("all clips in a batch must share BPTT control masks")
+    supervised = torch.nonzero(loss_mask[0], as_tuple=False).flatten().tolist()
+    if not supervised:
+        raise ValueError("recurrent clip has no loss-bearing timesteps")
+    expected = list(range(supervised[0], supervised[-1] + 1))
+    if supervised != expected:
+        raise ValueError("loss-bearing recurrent timesteps must form one suffix")
+    if bool(loss_mask[0, : supervised[0]].any()) or not bool(
+        loss_mask[0, supervised[0] :].all()
+    ):
+        raise ValueError("burn-in must be a prefix followed by supervised timesteps")
+    if not bool(detach_mask[0, supervised[0]]):
+        raise ValueError("recurrent state must detach at the burn-in boundary")
+
+    boundaries = [
+        index
+        for index in supervised
+        if index == supervised[0] or bool(detach_mask[0, index])
+    ]
+    ranges: list[tuple[int, int]] = []
+    for offset, start in enumerate(boundaries):
+        end = boundaries[offset + 1] if offset + 1 < len(boundaries) else supervised[-1] + 1
+        if end <= start:
+            raise ValueError("TBPTT boundaries must be strictly increasing")
+        ranges.append((start, end))
+    return tuple(ranges)
+
+
+def _recurrent_state_rms(state: Any) -> torch.Tensor:
+    values = state if isinstance(state, tuple) else (state,)
+    tensors = [value.detach().float() for value in values if isinstance(value, torch.Tensor)]
+    if not tensors:
+        raise RuntimeError("recurrent encoder did not return a tensor state")
+    mean_square = torch.stack([value.square().mean() for value in tensors]).mean()
+    return mean_square.sqrt()
+
+
+def _recurrent_backward(
+    *,
+    model: WindowJEPA | DistributedDataParallel,
+    core_model: WindowJEPA,
+    batch: dict[str, Any],
+    config: ExperimentConfig,
+    device: torch.device,
+    world_size: int,
+    initial_state: RecurrentState | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, RecurrentState]:
+    """Run BPTT inside a batch and return state for optional cross-batch TBPTT."""
+
+    ranges = _recurrent_chunk_ranges(batch["loss_mask"], batch["detach_mask"])
+    first_supervised = ranges[0][0]
+    state = detach_recurrent_state(initial_state)
+    if first_supervised:
+        with _autocast_context(device, config.optimization.precision):
+            state = core_model.recurrent_burn_in(
+                x=batch["x"][:, :first_supervised],
+                duration_ms=batch["dt_ms"][:, :first_supervised],
+                context_mask=batch["context_mask"][:, :first_supervised],
+                online_state=state,
+            )
+    total_supervised = sum(end - start for start, end in ranges)
+    if total_supervised != config.recurrent.sequence_length:
+        raise ValueError(
+            "dataset supervised length differs from recurrent.sequence_length"
+        )
+
+    accumulated_metrics = torch.zeros(8, device=device, dtype=torch.float32)
+    for chunk_index, (start, end) in enumerate(ranges):
+        state = detach_recurrent_state(state)
+        is_final_chunk = chunk_index + 1 == len(ranges)
+        synchronization = (
+            model.no_sync()
+            if isinstance(model, DistributedDataParallel) and not is_final_chunk
+            else nullcontext()
+        )
+        with synchronization:
+            with _autocast_context(device, config.optimization.precision):
+                output = model(
+                    x_context=batch["x"][:, start:end],
+                    x_target=batch["x"][:, start:end],
+                    dt_context_ms=batch["dt_ms"][:, start:end],
+                    dt_target_ms=batch["dt_ms"][:, start:end],
+                    context_mask=batch["context_mask"][:, start:end],
+                    target_mask=batch["target_mask"][:, start:end],
+                    objective=config.optimization.objective,
+                    online_state=state,
+                )
+            finite_flag = torch.isfinite(output.loss).to(dtype=torch.int32)
+            if world_size > 1:
+                distributed.all_reduce(finite_flag, op=distributed.ReduceOp.MIN)
+            if not bool(finite_flag):
+                raise FloatingPointError("non-finite loss in recurrent BPTT chunk")
+            chunk_steps = end - start
+            weight = chunk_steps / total_supervised
+            (output.loss * weight).backward()
+        state = output.online_state
+        accumulated_metrics += _output_metric_tensor(output) * chunk_steps
+
+    if state is None:
+        raise RuntimeError("recurrent training did not produce online state")
+    return (
+        accumulated_metrics / total_supervised,
+        _recurrent_state_rms(state),
+        state,
+    )
 
 
 def train(
@@ -297,21 +617,41 @@ def train(
             flush=True,
         )
     dataset = build_dataset(config)
-    sampler = (
-        DistributedSampler(dataset, shuffle=True, seed=config.runtime.seed)
-        if world_size > 1
-        else None
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=config.data.batch_size,
-        sampler=sampler,
-        shuffle=sampler is None,
-        num_workers=config.data.workers,
-        pin_memory=device.type == "cuda",
-        drop_last=True,
-        persistent_workers=False,
-    )
+    mixed_batch_sampler: MixedRecurrentBatchSampler | None = None
+    sampler: DistributedSampler | None = None
+    loader_options: dict[str, Any] = {
+        "dataset": dataset,
+        "num_workers": config.data.workers,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": False,
+    }
+    if (
+        config.recurrent.enabled
+        and config.recurrent.sampling == "mixed"
+        and isinstance(dataset, RecurrentWindowDataset)
+    ):
+        mixed_batch_sampler = build_recurrent_batch_sampler(
+            config,
+            dataset,
+            world_size=world_size,
+            rank=rank,
+        )
+        loader_options["batch_sampler"] = mixed_batch_sampler
+    else:
+        sampler = (
+            DistributedSampler(dataset, shuffle=True, seed=config.runtime.seed)
+            if world_size > 1
+            else None
+        )
+        loader_options.update(
+            {
+                "batch_size": config.data.batch_size,
+                "sampler": sampler,
+                "shuffle": sampler is None,
+                "drop_last": True,
+            }
+        )
+    loader = DataLoader(**loader_options)
     if not loader:
         raise ValueError("data loader is empty; lower batch_size or increase samples_per_epoch")
 
@@ -353,7 +693,10 @@ def train(
             device,
             world_size=world_size,
             steps_per_epoch=len(loader),
+            rank=rank,
         )
+        if global_step != start_epoch * len(loader):
+            raise ValueError("checkpoint is not aligned to a completed epoch boundary")
 
     total_steps = config.optimization.epochs * len(loader)
     warmup_steps = config.optimization.warmup_epochs * len(loader)
@@ -362,18 +705,54 @@ def train(
     metrics_path = output_dir / "train.jsonl"
     writer = _create_summary_writer(output_dir, global_step) if rank == 0 else None
     if rank == 0:
+        trainable_parameters = sum(
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+        )
         print(
             "[window-jepa] training ready: "
             f"device={device}, epochs={config.optimization.epochs}, "
-            f"steps_per_epoch={len(loader)}, tensorboard={output_dir / 'tensorboard'}",
+            f"steps_per_epoch={len(loader)}, trainable_parameters={trainable_parameters:,}, "
+            f"tensorboard={output_dir / 'tensorboard'}",
             flush=True,
         )
+        if config.recurrent.enabled:
+            chunks = (
+                config.recurrent.sequence_length + config.recurrent.tbptt_steps - 1
+            ) // config.recurrent.tbptt_steps
+            effective_clips = len(loader) * config.data.batch_size * world_size
+            processed_frames = (
+                effective_clips * config.recurrent.sequence_length
+            )
+            input_frames = effective_clips * (
+                config.recurrent.burn_in_steps
+                + config.recurrent.sequence_length
+            )
+            mixture = ""
+            if mixed_batch_sampler is not None:
+                mixture = (
+                    f", stream_per_rank={mixed_batch_sampler.stream_batch_size}, "
+                    f"random_per_rank={mixed_batch_sampler.random_batch_size}"
+                )
+            print(
+                "[window-jepa] recurrent R0: "
+                f"sampling={config.recurrent.sampling}{mixture}, "
+                f"window={config.recurrent.window_ms:g}ms, "
+                f"burn_in={config.recurrent.burn_in_steps}, "
+                f"supervised_steps={config.recurrent.sequence_length}, "
+                f"tbptt_chunks_per_update={chunks}, "
+                f"effective_clips_per_epoch={effective_clips}, "
+                f"input_frames_per_epoch={input_frames}, "
+                f"supervised_frames_per_epoch={processed_frames}",
+                flush=True,
+            )
 
     try:
         for epoch in range(start_epoch, config.optimization.epochs):
             dataset.set_epoch(epoch)
             if sampler is not None:
                 sampler.set_epoch(epoch)
+            if mixed_batch_sampler is not None:
+                mixed_batch_sampler.set_epoch(epoch)
             model.train()
             progress = tqdm(
                 loader,
@@ -383,8 +762,18 @@ def train(
                 mininterval=1.0,
                 leave=True,
             )
+            carried_recurrent_state: RecurrentState | None = None
+            previous_stream_contract: MixedStreamContract | None = None
             try:
                 for step_in_epoch, raw_batch in enumerate(progress):
+                    if mixed_batch_sampler is not None:
+                        previous_stream_contract = _validate_mixed_recurrent_batch(
+                            raw_batch,
+                            batch_size=config.data.batch_size,
+                            stream_batch_size=mixed_batch_sampler.stream_batch_size,
+                            stride_us=mixed_batch_sampler.stride_us,
+                            previous_streams=previous_stream_contract,
+                        )
                     batch = _move_batch(raw_batch, device)
                     learning_rate = learning_rate_at_step(
                         global_step,
@@ -396,24 +785,66 @@ def train(
                     for group in optimizer.param_groups:
                         group["lr"] = learning_rate
                     optimizer.zero_grad(set_to_none=True)
-                    with _autocast_context(device, config.optimization.precision):
-                        output = model(
-                            x_context=batch["x_context"],
-                            x_target=batch["x_target"],
-                            dt_context_ms=batch["dt_context_ms"],
-                            dt_target_ms=batch["dt_target_ms"],
-                            context_mask=batch["context_mask"],
-                            target_mask=batch["target_mask"],
-                            objective=config.optimization.objective,
+                    recurrent_state_rms = torch.zeros((), device=device)
+                    if config.recurrent.enabled:
+                        initial_state = None
+                        if config.recurrent.sampling == "mixed":
+                            reset_mask = batch.get("state_reset")
+                            if not isinstance(reset_mask, torch.Tensor):
+                                raise ValueError(
+                                    "mixed recurrent batches require state_reset [B]"
+                                )
+                            if carried_recurrent_state is None and not bool(
+                                reset_mask.all()
+                            ):
+                                raise ValueError(
+                                    "the first mixed batch of an epoch must reset every "
+                                    "stream and random lane"
+                                )
+                            initial_state = reset_recurrent_state(
+                                carried_recurrent_state,
+                                reset_mask,
+                            )
+                        (
+                            output_metrics,
+                            recurrent_state_rms,
+                            final_recurrent_state,
+                        ) = _recurrent_backward(
+                            model=model,
+                            core_model=core_model,
+                            batch=batch,
+                            config=config,
+                            device=device,
+                            world_size=world_size,
+                            initial_state=initial_state,
                         )
-                    finite_flag = torch.isfinite(output.loss).to(dtype=torch.int32)
-                    if world_size > 1:
-                        distributed.all_reduce(finite_flag, op=distributed.ReduceOp.MIN)
-                    if not bool(finite_flag):
-                        raise FloatingPointError(
-                            f"non-finite loss at global step {global_step}"
+                        carried_recurrent_state = (
+                            detach_recurrent_state(final_recurrent_state)
+                            if config.recurrent.sampling == "mixed"
+                            else None
                         )
-                    output.loss.backward()
+                    else:
+                        with _autocast_context(device, config.optimization.precision):
+                            output = model(
+                                x_context=batch["x_context"],
+                                x_target=batch["x_target"],
+                                dt_context_ms=batch["dt_context_ms"],
+                                dt_target_ms=batch["dt_target_ms"],
+                                context_mask=batch["context_mask"],
+                                target_mask=batch["target_mask"],
+                                objective=config.optimization.objective,
+                            )
+                        finite_flag = torch.isfinite(output.loss).to(dtype=torch.int32)
+                        if world_size > 1:
+                            distributed.all_reduce(
+                                finite_flag, op=distributed.ReduceOp.MIN
+                            )
+                        if not bool(finite_flag):
+                            raise FloatingPointError(
+                                f"non-finite loss at global step {global_step}"
+                            )
+                        output.loss.backward()
+                        output_metrics = _output_metric_tensor(output)
                     gradient_norm = torch.nn.utils.clip_grad_norm_(
                         (
                             parameter
@@ -438,37 +869,34 @@ def train(
                         or step_in_epoch + 1 == len(loader)
                     )
                     if should_log:
-                        metric_values = torch.stack(
+                        temporal_selection = (
+                            batch["loss_mask"] if config.recurrent.enabled else None
+                        )
+
+                        def mask_mean(name: str) -> torch.Tensor:
+                            values = batch[name]
+                            if temporal_selection is not None:
+                                values = values.masked_select(temporal_selection)
+                            return values.mean().detach().float()
+
+                        mask_metrics = torch.stack(
                             [
-                                output.loss.detach().float(),
-                                output.masked_loss.detach().float(),
-                                output.canonical_loss.detach().float(),
-                                output.dense_loss.detach().float(),
-                                output.visible_loss.detach().float(),
-                                output.deep_supervision_loss.detach().float(),
-                                output.prediction_std.detach().float(),
-                                output.target_std.detach().float(),
-                                gradient_norm.detach().float(),
-                                batch["mask_activity_aware"].mean().detach().float(),
-                                batch["mask_activity_fallback"].mean().detach().float(),
-                                batch["mask_context_active_patch_ratio"]
-                                .mean()
-                                .detach()
-                                .float(),
-                                batch["mask_context_event_mass_coverage"]
-                                .mean()
-                                .detach()
-                                .float(),
-                                batch["mask_target_active_patch_ratio"]
-                                .mean()
-                                .detach()
-                                .float(),
-                                batch["mask_target_event_mass_coverage"]
-                                .mean()
-                                .detach()
-                                .float(),
-                                batch["mask_empty_target"].mean().detach().float(),
+                                mask_mean("mask_activity_aware"),
+                                mask_mean("mask_activity_fallback"),
+                                mask_mean("mask_context_active_patch_ratio"),
+                                mask_mean("mask_context_event_mass_coverage"),
+                                mask_mean("mask_target_active_patch_ratio"),
+                                mask_mean("mask_target_event_mass_coverage"),
+                                mask_mean("mask_empty_target"),
                             ]
+                        )
+                        metric_values = torch.cat(
+                            (
+                                output_metrics,
+                                gradient_norm.detach().float().reshape(1),
+                                mask_metrics,
+                                recurrent_state_rms.detach().float().reshape(1),
+                            )
                         )
                         if world_size > 1:
                             distributed.all_reduce(
@@ -513,6 +941,8 @@ def train(
                                 "learning_rate": learning_rate,
                                 "ema_momentum": momentum,
                             }
+                            if config.recurrent.enabled:
+                                record["recurrent_state_rms"] = float(metric_values[16])
                             _append_jsonl(metrics_path, record)
                             if writer is not None:
                                 _write_tensorboard_metrics(writer, record)
@@ -537,6 +967,7 @@ def train(
                 or epoch + 1 in milestones
             )
             if should_checkpoint:
+                rng_states = collect_rng_states(world_size)
                 if rank == 0:
                     save_checkpoint_atomic(
                         output_dir / "checkpoint-latest.pt",
@@ -547,6 +978,7 @@ def train(
                         global_step=global_step,
                         world_size=world_size,
                         steps_per_epoch=len(loader),
+                        rng_states=rng_states,
                     )
                     if epoch + 1 in milestones:
                         save_checkpoint_atomic(
@@ -558,6 +990,7 @@ def train(
                             global_step=global_step,
                             world_size=world_size,
                             steps_per_epoch=len(loader),
+                            rng_states=rng_states,
                         )
                 if world_size > 1:
                     distributed.barrier()

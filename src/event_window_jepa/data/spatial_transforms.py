@@ -18,7 +18,7 @@ class SpatialTransformParameters:
 
 
 class SharedRandomSpatialTransform:
-    """Samples geometry once and applies it identically to a window pair."""
+    """Sample geometry once and reuse it for a related pair or time sequence."""
 
     def __init__(
         self,
@@ -72,4 +72,3 @@ class SharedRandomSpatialTransform:
             height=params.output_height,
             width=params.output_width,
         )
-

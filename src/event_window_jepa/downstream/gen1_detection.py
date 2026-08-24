@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
 from event_window_jepa.data.event_store import H5EventStore
+from event_window_jepa.downstream.features import require_feedforward_feature_model
 from event_window_jepa.downstream.gen1_roi_probe import (
     FrameReference,
     LabelSource,
@@ -462,13 +463,14 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    components = _load_rvt_components()
     backbone, config = load_pretrained_model(args.checkpoint, device=device)
     if args.backbone_init == "random":
         from event_window_jepa.train.pretrain import build_model
 
         torch.manual_seed(args.seed)
         backbone = build_model(config).to(device)
+    require_feedforward_feature_model(backbone, caller="Gen1 detection")
+    components = _load_rvt_components()
     representation = _representation(config)
     train_sources = _read_label_sources(args.train_manifest)
     val_sources = _read_label_sources(args.val_manifest)

@@ -1,0 +1,94 @@
+data:
+  manifest: /media/noah-22/AT_SSD/dataset/evjepa/gen1_304x240/manifests/train.jsonl
+  store: hdf5
+  split: train
+  # Recurrent mode counts clips, not individual windows. 6250 clips × 8
+  # supervised steps keeps the nominal signal near 50k windows per epoch.
+  samples_per_epoch: 6250
+  batch_size: 4
+  workers: 4
+  sequence_sampling: sequence_balanced
+  crop_size: [240, 304]
+  horizontal_flip_probability: 0.5
+
+representation:
+  type: voxel_grid
+  temporal_bins: 5
+  split_polarity: true
+  normalization: log1p
+
+# R0 uses exactly one current-window duration. The target is the unmasked,
+# zero-state EMA representation of the same causal 50 ms interval.
+windows:
+  train_ms: [50]
+  eval_ms: [25, 50, 75, 100]
+  unseen_eval_ms: [25, 75, 100]
+  target_ms: [50]
+  canonical_ms: 50
+  minimum_ratio: 1.0
+  direction: any
+  allow_equal: true
+
+model:
+  architecture: vjepa2_1
+  image_size: [240, 304]
+  patch_size: 16
+  embed_dim: 384
+  encoder_depth: 12
+  encoder_heads: 6
+  deep_supervision_layers: [2, 5, 8, 11]
+  predictor_dim: 256
+  predictor_depth: 4
+  predictor_heads: 8
+  scale_dim: 128
+  scale_fourier_bands: 16
+  condition_on_scale: true
+
+recurrent:
+  enabled: true
+  cell: conv_lstm
+  kernel_size: 3
+  # RVT-style mixed batching: per-rank batch 4 = 2 stream + 2 random clips.
+  sampling: mixed
+  stream_ratio: 0.5
+  window_ms: 50
+  stride_ms: 50
+  # Each dataset item contains 2 burn-in + 8 supervised = 10 windows.
+  sequence_length: 8
+  burn_in_steps: 2
+  # Full BPTT over one batch. Only stream state is detached and carried to the
+  # next batch, which makes that half TBPTT; random clips reset every batch.
+  tbptt_steps: 8
+
+mask:
+  target_blocks: 4
+  target_area_range: [0.15, 0.25]
+  target_aspect_range: [0.5, 2.0]
+  context_keep_ratio: 0.60
+  # Keep the first R0 experiment free of current-activity mask side effects.
+  activity_aware_probability: 0.0
+  activity_candidates: 32
+  minimum_active_target_ratio: 0.25
+
+optimization:
+  objective: recurrent_dense_window_jepa
+  epochs: 100
+  learning_rate: 0.0003
+  minimum_learning_rate: 0.000001
+  warmup_epochs: 10
+  weight_decay: 0.05
+  target_ema_start: 0.99925
+  target_ema_end: 0.99925
+  precision: bf16
+  gradient_clip: 1.0
+  variance_weight: 0.0
+  covariance_weight: 0.0
+  # A second full-context pass would update recurrent state from masked input.
+  canonical_query_weight: 0.0
+
+runtime:
+  seed: 0
+  output_dir: outputs/pretrain/recurrent_r0_convlstm_vits_gen1_seed0
+  log_every_steps: 20
+  checkpoint_every_epochs: 1
+  resume: null

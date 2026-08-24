@@ -28,6 +28,8 @@
 - 2チャネルON/OFF event image ablation
 - ViT-S/16相当のonline/EMA encoder
 - V-JEPA 2.1型のflat global ViT（2-D RoPE、SDPA、中間層監督）
+- 50 ms連続clip用のsequence samplerとclip共有geometry
+- patch-grid ConvLSTM / ConvGRU、burn-in、BPTT＋TBPTT学習
 - `log(Δ)` Fourier embedding
 - `Δc`、`Δt`、`log(Δt/Δc)`で条件付けたcross-attention predictor
 - disjoint multiblock spatial mask
@@ -123,6 +125,82 @@ PYTHONUNBUFFERED=1 window-jepa-pretrain \
   --config configs/pretrain/window_jepa21_vits_gen1.yaml
 ```
 
+### Recurrent R0（ConvLSTM / ConvGRU）
+
+R0は50 msの連続した因果窓を同一sequenceから読み、patch projection後の空間gridを
+ConvLSTMまたはConvGRUで更新します。online encoderだけが過去stateを継続し、EMA
+target encoderは各stepでzero-stateへresetして、現在のunmasked 50 ms窓をtarget
+latentに変換します。current context maskはrecurrent convolutionより前に適用される
+ため、現在のmasked patchがstate経由でonline側へ漏れることはありません。
+
+標準設定は
+[recurrent_r0_convlstm_vits_gen1.yaml](configs/pretrain/recurrent_r0_convlstm_vits_gen1.yaml)
+です。
+
+```bash
+window-jepa-pretrain \
+  --config configs/pretrain/recurrent_r0_convlstm_vits_gen1.yaml
+```
+
+この設定ではper-rank batch 4を、RVTと同じ比率でstream 2＋random 2へ分けます。
+各itemは次の10窓です。
+
+```text
+2 burn-in steps（lossなし、no-grad）
+        ↓ stateをdetach
+8 supervised steps（batch内BPTT）
+        ↓
+optimizer / EMAを1回更新
+        ├─ stream rows: stateをdetachして同じlaneの次batchへ継承（TBPTT）
+        └─ random rows: stateを破棄し、次batchもzero-stateから開始（BPTT）
+```
+
+DataLoader出力は`x: [B,T,C,H,W]`で、cropとhorizontal flipはclip全体で共有されます。
+各窓は`(t-50 ms,t]`、strideも50 msなので、隣接窓の境界eventは重複も欠落も
+しません。stream rowsでは同じrecordingの連続chunkを同じbatch laneへ供給し、cropと
+flipもrecording全体で固定します。sequence境界だけでstateをresetします。random rowsは
+clipごとに別augmentationを抽選し、毎batch stateをresetします。checkpointには
+ConvLSTM/ConvGRUの学習済みweightを保存しますが、一時的なhidden/cell stateは
+保存しません。checkpointがepoch境界だけなのはこのためです。
+
+現時点のdata augmentationはrandom cropとhorizontal flipだけです。Gen1 R0では入力
+解像度とcropがともに240×304なのでcrop座標は常に`x0=0, y0=0`となり、実際に確率的な
+変換は`p=0.5`のhorizontal flipだけです。回転、拡大縮小、時間順序のshuffleは行いません。
+VoxelGrid化と`log1p`は決定論的なrepresentation処理で、augmentationには数えません。
+
+JEPAのcontext/target maskは空間augmentationとは別で、現在はstepごとに独立抽選です。
+これはR0の収束確認には使えますが、過去にvisibleだったpatchをstateが保持する効果を
+切り分けるため、最終比較ではtube maskも対照実験に含めます。
+
+recurrent設定での`data.samples_per_epoch`はwindow数ではなく**clip数**です。標準設定の
+6250 clips × 8 supervised stepsは、1 epochあたり約50,000 supervised windowsの
+公称値です。実際は全rankで完全なglobal batchだけを使うため端数を切り捨てます
+（1 GPU・batch 4なら6248 clips、49,984 supervised windows）。
+時系列tensorは大きいため、feedforward設定のbatch size 64をそのまま流用せず、まず
+標準設定のbatch size 4からGPU memoryに合わせて調整してください。
+
+下流のstreaming推論ではstateをsequenceごとに所有し、境界で`None`へresetします。
+
+```python
+from event_window_jepa.downstream.features import extract_recurrent_patch_features
+
+state = None
+for x_50ms in causal_windows:
+    tokens, state = extract_recurrent_patch_features(
+        model,
+        x_50ms,
+        duration_ms,
+        state,
+    )
+```
+
+R0では`canonical_query_weight=0`なので、recurrent checkpointの主評価には
+`canonical_latent()`ではなく、このstateful encoder出力を使用します。
+既存のGen1 ROI probeとYOLOX検出はframe独立のDataLoaderであり、時系列stateを
+正しく更新できないため、recurrent checkpointを明示的に拒否します。R0を評価する
+ときは、sequence順に全50 ms窓を入力し、ラベルのない中間窓でもstateを更新して、
+sequence境界だけで`None`へresetする評価経路を用意してください。
+
 checkpoint、`train.jsonl`、TensorBoardは外部SSDではなく、project内の
 `outputs/pretrain/vjepa21_vits_gen1_seed0/`へ保存されます。
 
@@ -138,6 +216,30 @@ window-jepa-inspect \
 ```
 
 HTMLと同じ場所に、各整合性検査の結果を含む`samples.json`も保存されます。
+
+Recurrent R0では、連続50 ms窓をstepごとに検査する専用レポートを使用します。
+
+```bash
+window-jepa-inspect-recurrent \
+  --config configs/pretrain/recurrent_r0_convlstm_vits_gen1.yaml \
+  --expected-dataset gen1 \
+  --sample-index 0 \
+  --output outputs/gen1-inspection/recurrent-clip.html
+```
+
+HTML・JSONに加え、各stepのevent画像、representation、時間bin、mask overlayが
+`recurrent-clip_assets/`へPNGとして保存されます。時系列・sequence境界・共有crop/flip・
+burn-in/TBPTT maskのいずれかが不整合なら、CLIはレポート保存後に終了コード1を返します。
+`recurrent.sampling: mixed`の設定では、実際のsamplerから連続する2 batchを取り出して
+rank 0相当の経路を検査します。R0のper-rank batch 4では`--sample-index`はbatch内rowを表し、0・1が
+stream、2・3がrandomです。HTMLのmixed sampler表とJSONの`mixed_batches`には、
+batch間timestamp、state reset、augmentation ID、crop・flipをrowごとに記録します。
+stream rowがresetなしで継続するのに時刻・ID・transformが変わった場合、連続した
+streamを誤ってresetした場合、random rowが毎batch resetされない場合も終了コード1に
+なります。短いsequenceの終了やrecording切替による正当なresetは境界として表示され、
+不合格にはしません。
+DDP学習時は、これと同じcontinuity/reset契約を各rankの実DataLoader batchに対して
+学習ループ内でも毎回検証します。
 
 学習中はrank 0だけにepoch単位の進捗バーを表示し、loss、prediction/target std、
 learning rateだけを簡潔に更新します。JSONLの完全な記録は従来どおり

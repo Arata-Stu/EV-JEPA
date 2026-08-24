@@ -22,7 +22,10 @@ from event_window_jepa.data.spatial_transforms import (
     SharedRandomSpatialTransform,
     SpatialTransformParameters,
 )
-from event_window_jepa.downstream.features import extract_patch_features
+from event_window_jepa.downstream.features import (
+    extract_patch_features,
+    require_feedforward_feature_model,
+)
 from event_window_jepa.representations.event_image import EventImage
 from event_window_jepa.representations.voxel_grid import VoxelGrid
 from event_window_jepa.train.checkpoint import load_pretrained_model
@@ -580,6 +583,7 @@ def run(args: argparse.Namespace) -> None:
         torch.manual_seed(args.seed)
         model = build_model(config).to(device)
         model.eval()
+    require_feedforward_feature_model(model, caller="Gen1 ROI probe")
     model.requires_grad_(False)
     image_size = tuple(config.model.image_size)
     representation = _representation(config)

@@ -309,6 +309,79 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class RecurrentConfig:
+    """Causal clip and recurrent-state settings for the R0 pretraining path.
+
+    ``sequence_length`` counts loss-bearing steps.  The dataset prepends
+    ``burn_in_steps`` additional windows, so each returned clip contains
+    ``burn_in_steps + sequence_length`` windows in total.  Gradients span at
+    most ``tbptt_steps`` loss-bearing windows before the state is detached.
+    """
+
+    enabled: bool = False
+    cell: str = "conv_lstm"
+    kernel_size: int = 3
+    sampling: str = "clip"
+    stream_ratio: float = 0.5
+    window_ms: float = 50.0
+    stride_ms: float = 50.0
+    sequence_length: int = 8
+    burn_in_steps: int = 2
+    tbptt_steps: int = 4
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any]) -> RecurrentConfig:
+        _reject_unknown(
+            values,
+            {
+                "enabled",
+                "cell",
+                "kernel_size",
+                "sampling",
+                "stream_ratio",
+                "window_ms",
+                "stride_ms",
+                "sequence_length",
+                "burn_in_steps",
+                "tbptt_steps",
+            },
+            "recurrent",
+        )
+        return cls(
+            enabled=_boolean(values.get("enabled", False), "recurrent.enabled"),
+            cell=str(values.get("cell", "conv_lstm")),
+            kernel_size=int(values.get("kernel_size", 3)),
+            sampling=str(values.get("sampling", "clip")),
+            stream_ratio=float(values.get("stream_ratio", 0.5)),
+            window_ms=float(values.get("window_ms", 50.0)),
+            stride_ms=float(values.get("stride_ms", 50.0)),
+            sequence_length=int(values.get("sequence_length", 8)),
+            burn_in_steps=int(values.get("burn_in_steps", 2)),
+            tbptt_steps=int(values.get("tbptt_steps", 4)),
+        )
+
+    def __post_init__(self) -> None:
+        if self.cell not in {"conv_lstm", "conv_gru"}:
+            raise ValueError("recurrent.cell must be conv_lstm or conv_gru")
+        if self.sampling not in {"clip", "mixed"}:
+            raise ValueError("recurrent.sampling must be clip or mixed")
+        if not 0.0 < self.stream_ratio < 1.0:
+            raise ValueError("recurrent.stream_ratio must lie inside (0, 1)")
+        if self.kernel_size <= 0 or self.kernel_size % 2 == 0:
+            raise ValueError("recurrent.kernel_size must be a positive odd integer")
+        if self.window_ms <= 0 or self.stride_ms <= 0:
+            raise ValueError("recurrent window and stride must be positive")
+        if self.sequence_length <= 0:
+            raise ValueError("recurrent.sequence_length must be positive")
+        if self.burn_in_steps < 0:
+            raise ValueError("recurrent.burn_in_steps cannot be negative")
+        if not 0 < self.tbptt_steps <= self.sequence_length:
+            raise ValueError(
+                "recurrent.tbptt_steps must lie in [1, sequence_length]"
+            )
+
+
+@dataclass(frozen=True)
 class MaskConfig:
     target_blocks: int = 4
     target_area_range: tuple[float, float] = (0.15, 0.25)
@@ -443,10 +516,13 @@ class OptimizationConfig:
         if self.objective not in {
             "window_jepa",
             "dense_window_jepa",
+            "recurrent_window_jepa",
+            "recurrent_dense_window_jepa",
             "feature_consistency",
         }:
             raise ValueError(
-                "objective must be window_jepa, dense_window_jepa, or feature_consistency"
+                "objective must be a feedforward/recurrent Window-JEPA objective "
+                "or feature_consistency"
             )
         if self.epochs <= 0 or self.warmup_epochs < 0:
             raise ValueError("epochs must be positive and warmup_epochs non-negative")
@@ -508,6 +584,7 @@ class ExperimentConfig:
     representation: RepresentationConfig = field(default_factory=RepresentationConfig)
     windows: WindowsConfig = field(default_factory=WindowsConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    recurrent: RecurrentConfig = field(default_factory=RecurrentConfig)
     mask: MaskConfig = field(default_factory=MaskConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -519,7 +596,12 @@ class ExperimentConfig:
             raise ValueError("data.crop_size must equal model.image_size")
         if self.data.batch_size < 2:
             raise ValueError("per-rank batch_size must be at least 2 for collapse diagnostics")
-        if self.optimization.objective in {"window_jepa", "dense_window_jepa"}:
+        if self.optimization.objective in {
+            "window_jepa",
+            "dense_window_jepa",
+            "recurrent_window_jepa",
+            "recurrent_dense_window_jepa",
+        }:
             if self.optimization.covariance_weight:
                 raise ValueError("covariance_weight is only used by feature_consistency")
             if (
@@ -546,12 +628,87 @@ class ExperimentConfig:
             raise ValueError(
                 "dense_window_jepa requires model.architecture=vjepa2_1"
             )
+        recurrent_objectives = {
+            "recurrent_window_jepa",
+            "recurrent_dense_window_jepa",
+        }
+        is_recurrent_objective = self.optimization.objective in recurrent_objectives
+        if self.recurrent.enabled != is_recurrent_objective:
+            raise ValueError(
+                "recurrent.enabled must be true exactly for recurrent objectives"
+            )
+        if self.recurrent.enabled:
+            if self.model.architecture != "vjepa2_1":
+                raise ValueError("R0 recurrent pretraining requires model.architecture=vjepa2_1")
+            if self.optimization.objective == "recurrent_dense_window_jepa" and not (
+                self.model.deep_supervision_layers
+            ):
+                raise ValueError(
+                    "recurrent_dense_window_jepa requires deep_supervision_layers"
+                )
+            if (
+                self.model.deep_supervision_layers
+                and self.model.encoder_depth - 1
+                not in self.model.deep_supervision_layers
+            ):
+                raise ValueError(
+                    "recurrent objectives require supervision at the final encoder "
+                    "block so DDP has no unused trailing blocks"
+                )
+            expected_windows = (self.recurrent.window_ms,)
+            if (
+                self.windows.train_ms != expected_windows
+                or self.windows.target_ms != expected_windows
+                or not self.windows.allow_equal
+            ):
+                raise ValueError(
+                    "R0 requires train_ms and target_ms to contain only "
+                    "recurrent.window_ms, with windows.allow_equal=true"
+                )
+            if self.windows.canonical_ms != self.recurrent.window_ms:
+                raise ValueError(
+                    "R0 requires windows.canonical_ms == recurrent.window_ms"
+                )
+            if self.recurrent.stride_ms != self.recurrent.window_ms:
+                raise ValueError(
+                    "R0 requires stride_ms == window_ms so consecutive event bins "
+                    "neither overlap nor leave temporal gaps"
+                )
+            if self.optimization.canonical_query_weight:
+                raise ValueError(
+                    "R0 requires canonical_query_weight=0 because a second full-context "
+                    "online pass would leak the current masked input into recurrent state"
+                )
+            if self.recurrent.sampling == "mixed":
+                stream_batch = round(
+                    self.data.batch_size * self.recurrent.stream_ratio
+                )
+                if not 0 < stream_batch < self.data.batch_size:
+                    raise ValueError(
+                        "mixed recurrent sampling requires at least one stream and one "
+                        "random sample per rank"
+                    )
+                if self.recurrent.tbptt_steps != self.recurrent.sequence_length:
+                    raise ValueError(
+                        "mixed recurrent sampling requires tbptt_steps == "
+                        "sequence_length: random clips use full BPTT within one batch, "
+                        "while stream state is detached and carried between batches"
+                    )
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> ExperimentConfig:
         _reject_unknown(
             values,
-            {"data", "representation", "windows", "model", "mask", "optimization", "runtime"},
+            {
+                "data",
+                "representation",
+                "windows",
+                "model",
+                "recurrent",
+                "mask",
+                "optimization",
+                "runtime",
+            },
             "configuration root",
         )
         return cls(
@@ -559,6 +716,7 @@ class ExperimentConfig:
             representation=RepresentationConfig.from_mapping(values.get("representation", {})),
             windows=WindowsConfig.from_mapping(values.get("windows", {})),
             model=ModelConfig.from_mapping(values.get("model", {})),
+            recurrent=RecurrentConfig.from_mapping(values.get("recurrent", {})),
             mask=MaskConfig.from_mapping(values.get("mask", {})),
             optimization=OptimizationConfig.from_mapping(values.get("optimization", {})),
             runtime=RuntimeConfig.from_mapping(values.get("runtime", {})),
