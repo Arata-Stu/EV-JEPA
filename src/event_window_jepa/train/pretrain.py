@@ -43,6 +43,13 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pretrain Event Window-JEPA")
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument(
+        "--milestone-epochs",
+        type=int,
+        nargs="*",
+        default=(),
+        help="Also preserve named checkpoints at these completed epochs",
+    )
     return parser.parse_args()
 
 
@@ -274,9 +281,16 @@ def _write_tensorboard_metrics(writer: Any, record: dict[str, Any]) -> None:
         writer.add_scalar(name, value, step)
 
 
-def train(config: ExperimentConfig, resume_override: Path | None = None) -> None:
+def train(
+    config: ExperimentConfig,
+    resume_override: Path | None = None,
+    milestone_epochs: tuple[int, ...] = (),
+) -> None:
     world_size, rank, local_rank, device = _distributed_context()
     _seed_everything(config.runtime.seed, rank)
+    milestones = tuple(sorted(set(milestone_epochs)))
+    if any(epoch <= 0 or epoch > config.optimization.epochs for epoch in milestones):
+        raise ValueError("milestone epochs must lie inside the configured training run")
     if rank == 0:
         print(
             f"[window-jepa] validating dataset: {config.data.manifest}",
@@ -520,6 +534,7 @@ def train(config: ExperimentConfig, resume_override: Path | None = None) -> None
             should_checkpoint = (
                 (epoch + 1) % config.runtime.checkpoint_every_epochs == 0
                 or epoch + 1 == config.optimization.epochs
+                or epoch + 1 in milestones
             )
             if should_checkpoint:
                 if rank == 0:
@@ -533,6 +548,17 @@ def train(config: ExperimentConfig, resume_override: Path | None = None) -> None
                         world_size=world_size,
                         steps_per_epoch=len(loader),
                     )
+                    if epoch + 1 in milestones:
+                        save_checkpoint_atomic(
+                            output_dir / f"checkpoint-epoch{epoch + 1:04d}.pt",
+                            _unwrap(model),
+                            optimizer,
+                            config,
+                            epoch=epoch + 1,
+                            global_step=global_step,
+                            world_size=world_size,
+                            steps_per_epoch=len(loader),
+                        )
                 if world_size > 1:
                     distributed.barrier()
     finally:
@@ -546,7 +572,11 @@ def train(config: ExperimentConfig, resume_override: Path | None = None) -> None
 def main() -> None:
     args = _parse_args()
     config = ExperimentConfig.from_yaml(args.config)
-    train(config, resume_override=args.resume)
+    train(
+        config,
+        resume_override=args.resume,
+        milestone_epochs=tuple(args.milestone_epochs),
+    )
 
 
 if __name__ == "__main__":
