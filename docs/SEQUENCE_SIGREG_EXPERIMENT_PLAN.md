@@ -88,8 +88,8 @@ mask、tube mask、augmentation追加、teacherless化はこの3段階では変�
 - dataset manifest、world size、per-rank batch、GPU種類、commit、resolved configを
   runごとに記録する。
 - GPU数またはbatch sizeを変更したrunは、同じseedでも別条件として扱う。
-- V100 3台では`global_batch = per_rank_batch × 3`である。ConvLSTM・10ch・FP16の実測を
-  基準にper-rank batch 24、global batch 72とする（約24 GB/32 GB/rank）。
+- V100 3台では`global_batch = per_rank_batch × 3`である。ConvLSTM・10ch・FP16の実測と
+  host-memoryの余裕を基準にper-rank batch 16、global batch 48、worker 4/rankとする。
 - gradient accumulationはSIGRegの同時標本数を増やさないため、Stage 3では
   `global_batch = per_rank_batch × world_size`を明記する。
 
@@ -117,7 +117,7 @@ s{stage}_{input}_{model}_{regularizer}_np{world_size}_bs{per_rank_batch}_{precis
 ```
 
 例えばV100 3台の基準条件は
-`s1_input_2ch_ff_nosig_np3_bs24_fp16_seed0`となる。`_smoke`は1 epoch・2 global batchesの
+`s1_input_2ch_ff_nosig_np3_bs16_fp16_seed0`となる。`_smoke`は1 epoch・2 global batchesの
 hardware確認専用で、正式runとは別artifactとして保持する。world size、per-rank batch、
 precisionをrun IDへ含めることで、互換性のないcheckpointを誤ってresumeしない。
 
@@ -155,8 +155,8 @@ channelとして残す方が有効かを調べる。この段階ではどちら�
 
 | run | `temporal_bins` | encoder入力 | 時系列処理 |
 | --- | ---: | --- | --- |
-| `s1_input_2ch_ff_nosig_np3_bs24_fp16_seedN` | 1 | `[B,T,2,H,W]` | 各50 msを独立に空間処理 |
-| `s1_input_10ch_ff_nosig_np3_bs24_fp16_seedN` | 5 | `[B,T,10,H,W]` | 各50 msを独立に空間処理 |
+| `s1_input_2ch_ff_nosig_np3_bs16_fp16_seedN` | 1 | `[B,T,2,H,W]` | 各50 msを独立に空間処理 |
+| `s1_input_10ch_ff_nosig_np3_bs16_fp16_seedN` | 5 | `[B,T,10,H,W]` | 各50 msを独立に空間処理 |
 
 `input_10ch`の各binは10 ms相当だが、5回のrecurrent updateではない。5 bin×2 polarityを
 10 channelとして一度にpatch projectionへ渡す。総window長、event集合、sequence sample、
@@ -183,9 +183,9 @@ Stage 1で固定した50 ms入力に対し、過去stateを持たないencoder�
 
 | run | `temporal_model` | objective | state |
 | --- | --- | --- | --- |
-| `s2_input_{2ch,10ch}_ff_nosig_np3_bs24_fp16_seedN` | `feedforward` | `sequence_dense_window_jepa` | なし |
-| `s2_input_{2ch,10ch}_cgru_nosig_np3_bs24_fp16_seedN` | `conv_gru` | `recurrent_dense_window_jepa` | hidden |
-| `s2_input_{2ch,10ch}_clstm_nosig_np3_bs24_fp16_seedN` | `conv_lstm` | `recurrent_dense_window_jepa` | hidden + cell |
+| `s2_input_{2ch,10ch}_ff_nosig_np3_bs16_fp16_seedN` | `feedforward` | `sequence_dense_window_jepa` | なし |
+| `s2_input_{2ch,10ch}_cgru_nosig_np3_bs16_fp16_seedN` | `conv_gru` | `recurrent_dense_window_jepa` | hidden |
+| `s2_input_{2ch,10ch}_clstm_nosig_np3_bs16_fp16_seedN` | `conv_lstm` | `recurrent_dense_window_jepa` | hidden + cell |
 
 全条件で同じsequence loaderとloss-bearing 8 stepsを使う。ConvGRU/ConvLSTMは2 stepsの
 burn-inでstateを作り、stream laneはbatch境界を越えてdetach済みstateを継承する。
@@ -229,10 +229,10 @@ SIGRegなしを対照に含めるため、実験条件は3種類ではなく4条
 
 | run | regularizer | 対象 |
 | --- | --- | --- |
-| `s3_input_X_MODEL_nosig_np3_bs24_fp16_seedN` | なし | EMA-JEPA baseline |
-| `s3_input_X_MODEL_sigreg_global_np3_bs24_fp16_seedN` | Global SIGReg | 各時刻のframe latent |
-| `s3_input_X_MODEL_sigreg_tc_np3_bs24_fp16_seedN` | TC-SIGReg | clip内時間中心を引いたframe residual |
-| `s3_input_X_MODEL_sigreg_event_tc_np3_bs24_fp16_seedN` | Event-Support TC-SIGReg | active patchの時間residual |
+| `s3_input_X_MODEL_nosig_np3_bs16_fp16_seedN` | なし | EMA-JEPA baseline |
+| `s3_input_X_MODEL_sigreg_global_np3_bs16_fp16_seedN` | Global SIGReg | 各時刻のframe latent |
+| `s3_input_X_MODEL_sigreg_tc_np3_bs16_fp16_seedN` | TC-SIGReg | clip内時間中心を引いたframe residual |
+| `s3_input_X_MODEL_sigreg_event_tc_np3_bs16_fp16_seedN` | Event-Support TC-SIGReg | active patchの時間residual |
 
 ここで`X`はStage 1で選んだ`2ch`または`10ch`、`MODEL`はStage 2で選んだ
 `ff`、`cgru`、`clstm`のいずれかである。Stage 3でbatchを6へ増やした場合はrun IDも
@@ -291,7 +291,7 @@ SIGRegのglobal batchが小さ過ぎると統計が不安定になる。gradient
 同じforward内のglobal batchを使い、最初のscaling確認では少なくとも16、可能なら32以上を
 確保する。正式値は全Stage 3条件で固定して結果表へ記載する。
 
-基準のper-rank batch 24・V100 3台ではglobal batchは72である。SIGRegの統計には従来の
+基準のper-rank batch 16・V100 3台ではglobal batchは48である。SIGRegの統計には従来の
 global batch 12より適しているが、正式実験ではglobal sample数と有効標本数を必ず記録する。
 `nosig`を含むStage 3の全4条件は同じbatchで最初から実行し、Stage 1/2の途中でも一条件だけ
 batchを変えて比較しない。
@@ -358,8 +358,8 @@ world size・per-rank batch・precision・resolved configでresume契約を確�
 理由に途中で条件を打ち切らない。
 
 OOMで条件を変える場合は、その条件だけ再開せず、比較する全runを新しい共通条件で最初から
-やり直す。例えばper-rank batch 24から16へ下げるなら、そのStageの全比較条件をbatch 16・
-global batch 48で新しいrunとして実行する。既存runは別IDで保持し、OOMしたcheckpointから
+やり直す。例えばper-rank batch 16から12へ下げるなら、そのStageの全比較条件をbatch 12・
+global batch 36で新しいrunとして実行する。既存runは別IDで保持し、OOMしたcheckpointから
 batch sizeを変えてresumeしない。
 
 ## 実験script
@@ -405,11 +405,11 @@ CUDA_VISIBLE_DEVICES=0 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage 1 --action all --seed 0 --smoke \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --nproc-per-node auto --precision auto --batch-size 24 --workers 8
+  --nproc-per-node auto --precision auto --batch-size 16 --workers 4
 ```
 
 `sig-gpu5`では、最初に実行予定の全体像だけを表示する。以下の例はV100 3台で`auto`を
-FP16へ解決し、per-rank batch 24（global batch 72）、worker 8/rankを使う。
+FP16へ解決し、per-rank batch 16（global batch 48）、worker 4/rankを使う。
 
 ```bash
 cd /home/iASL/Arata_repo/EV-JEPA
@@ -417,7 +417,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage ready --action plan \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision auto --batch-size 24 --workers 8 --nproc-per-node auto
+  --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 ```
 
 次に、正式runを作る前の必須手順として、同じ3 GPUでStage 1のhardware smokeを実行する。
@@ -429,7 +429,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage 1 --action all --seed 0 --smoke \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision auto --batch-size 24 --workers 8 --nproc-per-node auto
+  --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 ```
 
 smokeでは、3 rankが起動すること、各GPUへmodelが配置されること、forward/backward、
@@ -445,19 +445,19 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage 1 --action prepare --seed 0 \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision auto --batch-size 24 --workers 8 --nproc-per-node auto
+  --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 
 CUDA_VISIBLE_DEVICES=0,1,2 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage 1 --action inspect --seed 0 \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision auto --batch-size 24 --workers 8 --nproc-per-node auto
+  --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 
 CUDA_VISIBLE_DEVICES=0,1,2 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage 1 --action run --seed 0 \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision auto --batch-size 24 --workers 8 --nproc-per-node auto
+  --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 ```
 
 Stage 1で10 chを選んだ例では、Stage 2を次のように開始する。2 chを選んだ場合は
@@ -468,7 +468,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage 2 --action all --selected-input 10ch --seed 0 --smoke \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision auto --batch-size 24 --workers 8 --nproc-per-node auto
+  --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 ```
 
 その後、同じ条件で正式runを開始する。
@@ -478,7 +478,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage 2 --action all --selected-input 10ch --seed 0 \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision auto --batch-size 24 --workers 8 --nproc-per-node auto
+  --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 ```
 
 中断後に同じworld size・configで再開する場合だけ、明示的に`--resume`を付ける。
@@ -488,11 +488,11 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage 2 --action run --selected-input 10ch --seed 0 \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision fp16 --batch-size 24 --workers 8 --nproc-per-node 3 --resume
+  --precision fp16 --batch-size 16 --workers 4 --nproc-per-node 3 --resume
 ```
 
 resume時は、checkpoint作成時の`CUDA_VISIBLE_DEVICES`、`--nproc-per-node 3`、
-`--precision fp16`、`--batch-size 24`、`--workers 8`を変更しない。world sizeやbatchを変えたい場合は
+`--precision fp16`、`--batch-size 16`、`--workers 4`を変更しない。world sizeやbatchを変えたい場合は
 `--resume`を付けず、新しいrun IDと共通条件でそのStage全体をやり直す。
 
 正式な3 seed比較では、各Stageの選択条件を固定した後に`--seed 0`、`1`、`2`を個別に

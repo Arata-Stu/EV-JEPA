@@ -5,9 +5,9 @@ data:
   # Sequence mode counts clips. 6250 clips x 8 supervised steps keeps the
   # nominal signal near 50k windows per epoch, matching recurrent R0.
   samples_per_epoch: 6250
-  # V100 32 GB x3 baseline: 24 clips/rank, 72 clips/global update.
-  batch_size: 24
-  workers: 8
+  # V100 32 GB x3 baseline with host-memory headroom.
+  batch_size: 16
+  workers: 4
   sequence_sampling: sequence_balanced
   crop_size: [240, 304]
   horizontal_flip_probability: 0.5

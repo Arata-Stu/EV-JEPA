@@ -149,7 +149,7 @@ runnerも現時点ではStage 3の実行を明示的に拒否します。
 
 現在の基準serverは`/home/iASL/Arata_repo/EV-JEPA`、Gen1 datasetは
 `/home/iASL/Arata_repo/dataset/gen1_304x240`です。V100 32 GB × 3での実測に基づく既定値は
-auto→FP16・3-process DDP、per-rank batch 24（global batch 72）、worker 8/rankです。runnerは単一GPUと
+auto→FP16・3-process DDP、per-rank batch 16（global batch 48）、worker 4/rankです。runnerは単一GPUと
 複数GPUの両方に対応し、`--precision`には`auto|fp32|fp16|bf16`、
 `--nproc-per-node`には正の整数または`auto`を指定できます。
 
@@ -159,7 +159,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage ready --action plan \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision auto --batch-size 24 --workers 8 --nproc-per-node auto
+  --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 ```
 
 計画表示の次は、正式学習より先に同じ3 GPUで独立したhardware smokeを実行します。
@@ -169,7 +169,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage 1 --action all --seed 0 --smoke \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision auto --batch-size 24 --workers 8 --nproc-per-node auto
+  --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 ```
 
 smokeは1 epoch・2 global batchesで、通常runとは別IDになります。smokeからはresumeしません。
@@ -187,7 +187,7 @@ CUDA_VISIBLE_DEVICES=0 \
   bash scripts/experiments/run_sequence_sigreg_plan.sh \
   --stage 1 --action all --seed 0 --smoke \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
-  --precision auto --batch-size 24 --workers 8 --nproc-per-node auto
+  --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 ```
 
 `auto`の解決にはCUDAが有効なPyTorch環境が必要なので、macOSで計画だけ表示する場合は
@@ -262,7 +262,7 @@ window-jepa-pretrain \
   --config configs/pretrain/recurrent_r0_convlstm_vits_gen1.yaml
 ```
 
-この設定ではper-rank batch 24を、RVTと同じ比率でstream 12＋random 12へ分けます。
+この設定ではper-rank batch 16を、RVTと同じ比率でstream 8＋random 8へ分けます。
 各itemは次の10窓です。
 
 ```text
@@ -295,9 +295,10 @@ JEPAのcontext/target maskは空間augmentationとは別で、現在はstepご�
 recurrent設定での`data.samples_per_epoch`はwindow数ではなく**clip数**です。標準設定の
 6250 clips × 8 supervised stepsは、1 epochあたり約50,000 supervised windowsの
 公称値です。実際は全rankで完全なglobal batchだけを使うため端数を切り捨てます
-（V100 3台・per-rank batch 24ならglobal batch 72となり、6192 clips、49,536 supervised
-windows）。ConvLSTM・10ch・FP16のsmokeで約24 GB/32 GBを確認した値ですが、GPUや
-PyTorchが変わった場合はsmokeで再検証してください。
+（V100 3台・per-rank batch 16ならglobal batch 48となり、6240 clips、49,920 supervised
+windows）。ConvLSTM・10ch・FP16で約15 GB/32 GBを確認し、10ch DataLoaderの一時的な
+host-memory増加も考慮してworker 4/rankとしています。GPUやPyTorchが変わった場合は
+smokeで再検証してください。
 
 下流のstreaming推論ではstateをsequenceごとに所有し、境界で`None`へresetします。
 
@@ -352,8 +353,8 @@ HTML・JSONに加え、各stepのevent画像、representation、時間bin、mask
 `recurrent-clip_assets/`へPNGとして保存されます。時系列・sequence境界・共有crop/flip・
 burn-in/TBPTT maskのいずれかが不整合なら、CLIはレポート保存後に終了コード1を返します。
 `recurrent.sampling: mixed`の設定では、実際のsamplerから連続する2 batchを取り出して
-rank 0相当の経路を検査します。R0のper-rank batch 24では`--sample-index`はbatch内rowを表し、0〜11が
-stream、12〜23がrandomです。HTMLのmixed sampler表とJSONの`mixed_batches`には、
+rank 0相当の経路を検査します。R0のper-rank batch 16では`--sample-index`はbatch内rowを表し、0〜7が
+stream、8〜15がrandomです。HTMLのmixed sampler表とJSONの`mixed_batches`には、
 batch間timestamp、state reset、augmentation ID、crop・flipをrowごとに記録します。
 stream rowがresetなしで継続するのに時刻・ID・transformが変わった場合、連続した
 streamを誤ってresetした場合、random rowが毎batch resetされない場合も終了コード1に

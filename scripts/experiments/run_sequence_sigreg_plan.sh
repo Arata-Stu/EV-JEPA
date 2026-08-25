@@ -19,8 +19,8 @@ OUTPUT_ROOT="$PROJECT_ROOT/outputs/pretrain/sequence_sigreg"
 PYTHON_BIN=${PYTHON_BIN:-python}
 PRECISION=auto
 REQUESTED_PRECISION=$PRECISION
-BATCH_SIZE=24
-WORKERS=8
+BATCH_SIZE=16
+WORKERS=4
 KEEP_EVERY_EPOCHS=5
 SMOKE=0
 RESUME=0
@@ -36,8 +36,8 @@ usage() {
     '  --selected-model MODEL   ff, cgru, or clstm for the Stage 3 plan' \
     '  --nproc-per-node N|auto  GPUs/processes for training (default: 3)' \
     '  --precision MODE         auto, fp32, fp16, or bf16 (default: auto)' \
-    '  --batch-size N           Per-rank batch; even and >=2 (default: 24)' \
-    '  --workers N              DataLoader workers per rank (default: 8)' \
+    '  --batch-size N           Per-rank batch; even and >=2 (default: 16)' \
+    '  --workers N              DataLoader workers per rank (default: 4)' \
     '  --keep-every-epochs N    Preserve a named checkpoint every N epochs (default: 5)' \
     '  --smoke                  Isolated 1-epoch, 2-global-batch hardware check' \
     '  --sample-index N         Dataset sample used by inspect (default: 0)' \
