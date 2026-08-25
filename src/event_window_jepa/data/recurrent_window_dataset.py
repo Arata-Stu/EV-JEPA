@@ -52,7 +52,7 @@ class RecurrentWindowDebugSample:
 
 
 class RecurrentWindowDataset(Dataset[dict[str, Any]]):
-    """Build same-sequence event clips for recurrent R0 pretraining.
+    """Build same-sequence event clips for temporal pretraining.
 
     A dataset item has temporal-first image shape ``[T, C, H, W]``. PyTorch's
     default collator therefore produces ``[B, T, C, H, W]``. Geometry is
@@ -64,6 +64,12 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
     giving ``T = burn_in_steps + sequence_length``. ``loss_mask[t]`` selects
     supervised steps. ``detach_mask[t]`` requests a state detach immediately
     *before* timestep ``t`` and marks the burn-in/TBPTT boundaries.
+
+    When ``return_patch_event_activity`` is enabled, each sample additionally
+    contains ``patch_event_activity`` with shape ``[T, P]`` and dtype int64.
+    It stores raw transformed-window event counts on the same flattened patch
+    grid as ``context_mask`` and ``target_mask``.  The key is omitted when the
+    option is disabled to avoid retaining an otherwise unused batch tensor.
     """
 
     def __init__(
@@ -75,16 +81,20 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
         spatial_transform: SharedRandomSpatialTransform,
         *,
         tbptt_steps: int | None = None,
+        return_patch_event_activity: bool = False,
         seed: int = 0,
     ) -> None:
         if tbptt_steps is not None and tbptt_steps <= 0:
             raise ValueError("tbptt_steps must be positive when provided")
+        if not isinstance(return_patch_event_activity, bool):
+            raise TypeError("return_patch_event_activity must be a boolean")
         self.store = store
         self.clip_sampler = clip_sampler
         self.representation = representation
         self.mask_generator = mask_generator
         self.spatial_transform = spatial_transform
         self.tbptt_steps = tbptt_steps
+        self.return_patch_event_activity = return_patch_event_activity
         self.seed = int(seed)
         self.epoch = 0
         self._metadata = {info.sequence_id: info for info in store.sequences()}
@@ -196,6 +206,7 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
         mask_step_seeds: list[int] = []
         target_active_ratios: list[float] = []
         target_mass_coverages: list[float] = []
+        patch_event_activities: list[np.ndarray] = []
 
         # Read the whole temporal span once. This is substantially cheaper for
         # HDF5-backed stores than issuing one overlapping disk read per step.
@@ -247,6 +258,10 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
             mask_step_seeds.append(mask_step_seed)
             target_active_ratios.append(active_ratio)
             target_mass_coverages.append(mass_coverage)
+            if self.return_patch_event_activity:
+                patch_event_activities.append(
+                    np.ascontiguousarray(activity.reshape(-1), dtype=np.int64)
+                )
 
         first_shape = representations[0].shape
         if any(value.shape != first_shape for value in representations[1:]):
@@ -305,6 +320,10 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
                 dtype=torch.float32,
             ),
         }
+        if self.return_patch_event_activity:
+            sample["patch_event_activity"] = torch.from_numpy(
+                np.stack(patch_event_activities, axis=0)
+            )
         debug = RecurrentWindowDebugSample(
             request=request,
             clip=clip,

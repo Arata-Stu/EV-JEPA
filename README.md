@@ -125,6 +125,54 @@ PYTHONUNBUFFERED=1 window-jepa-pretrain \
   --config configs/pretrain/window_jepa21_vits_gen1.yaml
 ```
 
+### 時系列loaderと時間モデルの切り替え
+
+連続窓を返すloaderと、時間方向の状態を持つmodelは独立に選べます。設定section名
+`recurrent`は既存設定との互換性のため維持していますが、新しい設定では次の2項目を
+明示してください。
+
+| `sequence_loader` | `temporal_model` | objective | 用途 |
+|---|---|---|---|
+| `false` | `feedforward` | `window_jepa` / `dense_window_jepa` | 従来の独立window baseline |
+| `true` | `feedforward` | `sequence_window_jepa` / `sequence_dense_window_jepa` | 同じ時系列sampleを状態なしencoderで処理する比較 |
+| `true` | `conv_gru` / `conv_lstm` | `recurrent_window_jepa` / `recurrent_dense_window_jepa` | BPTT/TBPTTを使うrecurrent比較 |
+
+feedforwardの時系列設定例は
+[sequence_r0_feedforward_vits_gen1.yaml](configs/pretrain/sequence_r0_feedforward_vits_gen1.yaml)
+です。
+
+```bash
+window-jepa-pretrain \
+  --config configs/pretrain/sequence_r0_feedforward_vits_gen1.yaml
+```
+
+```yaml
+recurrent:
+  sequence_loader: true
+  temporal_model: feedforward  # feedforward / conv_gru / conv_lstm
+  return_patch_event_activity: false
+```
+
+`temporal_model: feedforward`では、loaderの`x: [B,T,C,H,W]`から`loss_mask=true`の
+stepだけを選び、`[B*T_loss,C,H,W]`へまとめて通常のencoderへ入力します。時間state、
+`detach_mask`、`state_reset`はmodel計算には使いません。一方、sampleの時刻順、clip全体で
+共通のcrop/flip、mixed samplerのstream/random比はrecurrent設定と同じなので、入力条件を
+揃えた比較ができます。設定内のburn-in窓はfeedforward encoderへ入力されません。
+`representation.temporal_bins: 1`かつ`split_polarity: true`なら各50 msを`[2,H,W]`へ
+一括蓄積し、`temporal_bins: 5`なら10 ms相当の5 bin×2 polarityを`[10,H,W]`のchannel
+として空間処理します。後者もConvLSTMの5 step処理ではなく、1枚の50 ms入力です。
+
+将来のEvent-Support TC-SIGRegで活動領域を使う場合だけ
+`return_patch_event_activity: true`にします。このときdatasetは、空間augmentation後の
+各patchに入ったraw event数を`patch_event_activity: [B,T,P]`（整数）として追加します。
+`false`ではkey自体を返さないため、通常のEMA-JEPA比較に余計なtensorは増えません。
+なお、この切り替えで追加されるのはloader/model比較経路までであり、SIGReg lossそのものは
+まだ有効化されません。
+
+旧設定の`enabled: true`と`cell: conv_lstm|conv_gru`も引き続き利用でき、自動的に
+`sequence_loader: true`と対応する`temporal_model`へ解決されます。新旧の指定が矛盾する
+場合は学習開始前に設定errorとなります。
+
 ### Recurrent R0（ConvLSTM / ConvGRU）
 
 R0は50 msの連続した因果窓を同一sequenceから読み、patch projection後の空間gridを
@@ -217,7 +265,8 @@ window-jepa-inspect \
 
 HTMLと同じ場所に、各整合性検査の結果を含む`samples.json`も保存されます。
 
-Recurrent R0では、連続50 ms窓をstepごとに検査する専用レポートを使用します。
+時系列loader（feedforward / ConvGRU / ConvLSTM）では、連続50 ms窓をstepごとに
+検査する専用レポートを使用します。`--config`には上記いずれの時系列設定も指定できます。
 
 ```bash
 window-jepa-inspect-recurrent \

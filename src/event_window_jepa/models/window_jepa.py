@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as functional
@@ -39,6 +39,8 @@ class WindowJEPAOutput:
     prediction_std: torch.Tensor
     target_std: torch.Tensor
     online_state: RecurrentState | None = None
+    prediction_sequence: torch.Tensor | None = None
+    target_sequence: torch.Tensor | None = None
 
 
 class WindowJEPA(nn.Module):
@@ -113,7 +115,21 @@ class WindowJEPA(nn.Module):
         target_mask: torch.Tensor,
         objective: str = "window_jepa",
         online_state: RecurrentState | None = None,
+        sequence_loss_mask: torch.Tensor | None = None,
     ) -> WindowJEPAOutput:
+        if objective in {"sequence_window_jepa", "sequence_dense_window_jepa"}:
+            if sequence_loss_mask is None:
+                raise ValueError("sequence objectives require sequence_loss_mask [B,T]")
+            return self.feedforward_sequence(
+                x_context=x_context,
+                x_target=x_target,
+                context_duration_ms=dt_context_ms,
+                target_duration_ms=dt_target_ms,
+                context_mask=context_mask,
+                target_mask=target_mask,
+                loss_mask=sequence_loss_mask,
+                dense=objective == "sequence_dense_window_jepa",
+            )
         if objective in {"recurrent_window_jepa", "recurrent_dense_window_jepa"}:
             return self.recurrent_sequence(
                 x_context=x_context,
@@ -202,6 +218,81 @@ class WindowJEPA(nn.Module):
                 prediction.detach(), target_mask
             ),
             target_std=masked_position_standard_deviation(target_tokens, target_mask),
+        )
+
+    def feedforward_sequence(
+        self,
+        x_context: torch.Tensor,
+        x_target: torch.Tensor,
+        context_duration_ms: torch.Tensor,
+        target_duration_ms: torch.Tensor,
+        context_mask: torch.Tensor,
+        target_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        *,
+        dense: bool,
+    ) -> WindowJEPAOutput:
+        """Evaluate supervised clip frames independently in one flat forward pass.
+
+        Sequence loading and temporal state are deliberately independent here: burn-in
+        frames are removed with ``loss_mask`` and no recurrent state or TBPTT boundary
+        is consumed. The sequence-shaped prediction and EMA-target views are retained
+        for temporal diagnostics and future loss wiring; they are not SIGReg projector
+        latents by themselves.
+        """
+
+        if isinstance(self.online_encoder, RecurrentVJEPA21EventVisionTransformer):
+            raise ValueError("feedforward sequence objectives require a non-recurrent encoder")
+        if x_context.ndim != 5 or x_context.shape != x_target.shape:
+            raise ValueError("feedforward sequence inputs must share shape [B,T,C,H,W]")
+        batch_size, steps = x_context.shape[:2]
+        if context_duration_ms.shape != (batch_size, steps) or (
+            target_duration_ms.shape != (batch_size, steps)
+        ):
+            raise ValueError("feedforward sequence durations must have shape [B,T]")
+        expected_mask_shape = (batch_size, steps, self.num_patches)
+        if context_mask.shape != expected_mask_shape or target_mask.shape != expected_mask_shape:
+            raise ValueError("feedforward sequence patch masks must have shape [B,T,N]")
+        if loss_mask.dtype != torch.bool or loss_mask.shape != (batch_size, steps):
+            raise ValueError("sequence_loss_mask must be boolean with shape [B,T]")
+        if not bool((loss_mask == loss_mask[:1]).all()):
+            raise ValueError("all clips in a batch must share sequence_loss_mask")
+        supervised_indices = torch.nonzero(
+            loss_mask[0], as_tuple=False
+        ).flatten()
+        supervised_steps = int(supervised_indices.numel())
+        if supervised_steps == 0:
+            raise ValueError("sequence clip has no loss-bearing timesteps")
+
+        # Select before flattening so burn-in windows never enter the encoder. The
+        # resulting order is batch-major and reshapes losslessly back to [B,T,N,D].
+        def flatten_frames(value: torch.Tensor) -> torch.Tensor:
+            selected = value.index_select(1, supervised_indices)
+            return selected.flatten(0, 1)
+
+        arguments = {
+            "x_context": flatten_frames(x_context),
+            "x_target": flatten_frames(x_target),
+            "dt_context_ms": flatten_frames(context_duration_ms),
+            "dt_target_ms": flatten_frames(target_duration_ms),
+            "context_mask": flatten_frames(context_mask),
+            "target_mask": flatten_frames(target_mask),
+        }
+        output = (
+            self.dense_window_jepa(**arguments)
+            if dense
+            else self.forward(**arguments, objective="window_jepa")
+        )
+        sequence_shape = (
+            batch_size,
+            supervised_steps,
+            self.num_patches,
+            output.prediction.shape[-1],
+        )
+        return replace(
+            output,
+            prediction_sequence=output.prediction.reshape(sequence_shape),
+            target_sequence=output.target.reshape(sequence_shape),
         )
 
     def _recurrent_encoders(

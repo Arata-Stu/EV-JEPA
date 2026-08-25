@@ -77,6 +77,7 @@ def make_dataset(
     samples_per_epoch: int = 2,
     tbptt_steps: int | None = 2,
     stride_ms: float = 10,
+    return_patch_event_activity: bool = False,
 ) -> tuple[RecurrentWindowDataset, RecordingStore, RecordingTransform]:
     store = RecordingStore()
     sampler = UniformSequenceClipSampler(
@@ -102,6 +103,7 @@ def make_dataset(
         ),
         spatial_transform=transform,
         tbptt_steps=tbptt_steps,
+        return_patch_event_activity=return_patch_event_activity,
         seed=13,
     )
     return dataset, store, transform
@@ -142,6 +144,7 @@ def test_dataset_returns_temporal_tensors_masks_and_shared_geometry() -> None:
     assert torch.diff(sample["t_end_us"]).tolist() == [10_000] * 5
     assert sample["loss_mask"].tolist() == [False, False, True, True, True, True]
     assert sample["detach_mask"].tolist() == [False, False, True, False, True, False]
+    assert "patch_event_activity" not in sample
 
     assert transform.sample_calls == 1
     assert len(transform.applied) == 6
@@ -160,6 +163,22 @@ def test_dataset_returns_temporal_tensors_masks_and_shared_geometry() -> None:
     assert {sequence_id for sequence_id, _, _ in store.calls} == {"sequence"}
     assert store.calls[0][1] == debug.clip.t_end_us[-1]
     assert store.calls[0][2] == 100_000
+
+
+def test_optional_patch_event_activity_matches_transformed_raw_windows() -> None:
+    dataset, _, _ = make_dataset(
+        samples_per_epoch=1,
+        return_patch_event_activity=True,
+    )
+    sample, debug = dataset.sample_with_debug(0)
+
+    activity = sample["patch_event_activity"]
+    assert activity.shape == sample["target_mask"].shape == (6, 4)
+    assert activity.dtype == torch.int64
+    assert torch.all(activity >= 0)
+    assert activity.sum(dim=1).tolist() == [
+        window.event_count for window in debug.windows
+    ]
 
 
 def test_default_collation_produces_batch_time_channel_height_width() -> None:

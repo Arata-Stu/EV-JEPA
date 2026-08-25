@@ -205,7 +205,7 @@ def build_dataset(
         activity_selection_strategy=config.mask.activity_selection_strategy,
         activity_topk_fraction=config.mask.activity_topk_fraction,
     )
-    if config.recurrent.enabled:
+    if config.recurrent.sequence_loader:
         clip_sampler = UniformSequenceClipSampler(
             sequences,
             base_window_ms=config.recurrent.window_ms,
@@ -223,6 +223,9 @@ def build_dataset(
             mask_generator=mask,
             spatial_transform=transform,
             tbptt_steps=config.recurrent.tbptt_steps,
+            return_patch_event_activity=(
+                config.recurrent.return_patch_event_activity
+            ),
             seed=config.runtime.seed,
         )
 
@@ -261,8 +264,11 @@ def build_recurrent_batch_sampler(
 ) -> MixedRecurrentBatchSampler:
     """Build the RVT-style stream/random sampler for one DDP rank."""
 
-    if not config.recurrent.enabled or config.recurrent.sampling != "mixed":
-        raise ValueError("mixed recurrent batch sampling is not enabled")
+    if (
+        not config.recurrent.sequence_loader
+        or config.recurrent.sampling != "mixed"
+    ):
+        raise ValueError("mixed sequence batch sampling is not enabled")
     stream_batch_size = round(
         config.data.batch_size * config.recurrent.stream_ratio
     )
@@ -601,6 +607,50 @@ def _recurrent_backward(
     )
 
 
+def _feedforward_sequence_backward(
+    *,
+    model: WindowJEPA | DistributedDataParallel,
+    batch: dict[str, Any],
+    config: ExperimentConfig,
+    device: torch.device,
+    world_size: int,
+) -> torch.Tensor:
+    """Train independent clip frames with one DDP forward/backward operation."""
+
+    loss_mask = batch.get("loss_mask")
+    if (
+        not isinstance(loss_mask, torch.Tensor)
+        or loss_mask.dtype != torch.bool
+        or loss_mask.ndim != 2
+    ):
+        raise ValueError("feedforward sequence batches require loss_mask [B,T]")
+    supervised_counts = loss_mask.sum(dim=1)
+    if not bool((supervised_counts == config.recurrent.sequence_length).all()):
+        raise ValueError(
+            "dataset supervised length differs from recurrent.sequence_length"
+        )
+    with _autocast_context(device, config.optimization.precision):
+        output = model(
+            x_context=batch["x"],
+            x_target=batch["x"],
+            dt_context_ms=batch["dt_ms"],
+            dt_target_ms=batch["dt_ms"],
+            context_mask=batch["context_mask"],
+            target_mask=batch["target_mask"],
+            objective=config.optimization.objective,
+            sequence_loss_mask=loss_mask,
+        )
+    finite_flag = torch.isfinite(output.loss).to(dtype=torch.int32)
+    if world_size > 1:
+        distributed.all_reduce(finite_flag, op=distributed.ReduceOp.MIN)
+    if not bool(finite_flag):
+        raise FloatingPointError("non-finite loss in feedforward sequence batch")
+    if output.prediction_sequence is None or output.target_sequence is None:
+        raise RuntimeError("feedforward sequence objective did not retain latent sequences")
+    output.loss.backward()
+    return _output_metric_tensor(output)
+
+
 def train(
     config: ExperimentConfig,
     resume_override: Path | None = None,
@@ -626,7 +676,7 @@ def train(
         "persistent_workers": False,
     }
     if (
-        config.recurrent.enabled
+        config.recurrent.sequence_loader
         and config.recurrent.sampling == "mixed"
         and isinstance(dataset, RecurrentWindowDataset)
     ):
@@ -715,7 +765,7 @@ def train(
             f"tensorboard={output_dir / 'tensorboard'}",
             flush=True,
         )
-        if config.recurrent.enabled:
+        if config.recurrent.sequence_loader:
             chunks = (
                 config.recurrent.sequence_length + config.recurrent.tbptt_steps - 1
             ) // config.recurrent.tbptt_steps
@@ -733,13 +783,19 @@ def train(
                     f", stream_per_rank={mixed_batch_sampler.stream_batch_size}, "
                     f"random_per_rank={mixed_batch_sampler.random_batch_size}"
                 )
+            temporal_execution = (
+                f"tbptt_chunks_per_update={chunks}, "
+                if config.recurrent.enabled
+                else "independent_frame_forward=true, "
+            )
             print(
-                "[window-jepa] recurrent R0: "
+                "[window-jepa] temporal sequence: "
+                f"model={config.recurrent.temporal_model}, "
                 f"sampling={config.recurrent.sampling}{mixture}, "
                 f"window={config.recurrent.window_ms:g}ms, "
                 f"burn_in={config.recurrent.burn_in_steps}, "
                 f"supervised_steps={config.recurrent.sequence_length}, "
-                f"tbptt_chunks_per_update={chunks}, "
+                f"{temporal_execution}"
                 f"effective_clips_per_epoch={effective_clips}, "
                 f"input_frames_per_epoch={input_frames}, "
                 f"supervised_frames_per_epoch={processed_frames}",
@@ -823,6 +879,14 @@ def train(
                             if config.recurrent.sampling == "mixed"
                             else None
                         )
+                    elif config.recurrent.sequence_loader:
+                        output_metrics = _feedforward_sequence_backward(
+                            model=model,
+                            batch=batch,
+                            config=config,
+                            device=device,
+                            world_size=world_size,
+                        )
                     else:
                         with _autocast_context(device, config.optimization.precision):
                             output = model(
@@ -870,7 +934,9 @@ def train(
                     )
                     if should_log:
                         temporal_selection = (
-                            batch["loss_mask"] if config.recurrent.enabled else None
+                            batch["loss_mask"]
+                            if config.recurrent.sequence_loader
+                            else None
                         )
 
                         def mask_mean(name: str) -> torch.Tensor:

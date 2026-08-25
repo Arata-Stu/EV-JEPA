@@ -310,16 +310,25 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class RecurrentConfig:
-    """Causal clip and recurrent-state settings for the R0 pretraining path.
+    """Causal sequence-loader and optional recurrent-state settings.
 
     ``sequence_length`` counts loss-bearing steps.  The dataset prepends
     ``burn_in_steps`` additional windows, so each returned clip contains
     ``burn_in_steps + sequence_length`` windows in total.  Gradients span at
     most ``tbptt_steps`` loss-bearing windows before the state is detached.
+
+    ``enabled`` and ``cell`` are kept as backward-compatible aliases for the
+    original R0 configuration.  New configurations should select the two
+    independent axes explicitly with ``sequence_loader`` and
+    ``temporal_model``.  Missing values are resolved in ``__post_init__`` so
+    consumers always observe a concrete boolean and model name at runtime.
     """
 
-    enabled: bool = False
-    cell: str = "conv_lstm"
+    enabled: bool | None = None
+    cell: str | None = None
+    sequence_loader: bool | None = None
+    temporal_model: str | None = None
+    return_patch_event_activity: bool = False
     kernel_size: int = 3
     sampling: str = "clip"
     stream_ratio: float = 0.5
@@ -336,6 +345,9 @@ class RecurrentConfig:
             {
                 "enabled",
                 "cell",
+                "sequence_loader",
+                "temporal_model",
+                "return_patch_event_activity",
                 "kernel_size",
                 "sampling",
                 "stream_ratio",
@@ -347,9 +359,27 @@ class RecurrentConfig:
             },
             "recurrent",
         )
+        enabled = values.get("enabled")
+        cell = values.get("cell")
+        sequence_loader = values.get("sequence_loader")
+        temporal_model = values.get("temporal_model")
         return cls(
-            enabled=_boolean(values.get("enabled", False), "recurrent.enabled"),
-            cell=str(values.get("cell", "conv_lstm")),
+            enabled=(
+                None if enabled is None else _boolean(enabled, "recurrent.enabled")
+            ),
+            cell=None if cell is None else str(cell),
+            sequence_loader=(
+                None
+                if sequence_loader is None
+                else _boolean(sequence_loader, "recurrent.sequence_loader")
+            ),
+            temporal_model=(
+                None if temporal_model is None else str(temporal_model)
+            ),
+            return_patch_event_activity=_boolean(
+                values.get("return_patch_event_activity", False),
+                "recurrent.return_patch_event_activity",
+            ),
             kernel_size=int(values.get("kernel_size", 3)),
             sampling=str(values.get("sampling", "clip")),
             stream_ratio=float(values.get("stream_ratio", 0.5)),
@@ -361,8 +391,52 @@ class RecurrentConfig:
         )
 
     def __post_init__(self) -> None:
-        if self.cell not in {"conv_lstm", "conv_gru"}:
+        if self.cell is not None and self.cell not in {"conv_lstm", "conv_gru"}:
             raise ValueError("recurrent.cell must be conv_lstm or conv_gru")
+        legacy_enabled = False if self.enabled is None else self.enabled
+        legacy_cell = "conv_lstm" if self.cell is None else self.cell
+        temporal_model = (
+            legacy_cell if legacy_enabled else "feedforward"
+        ) if self.temporal_model is None else self.temporal_model
+        if temporal_model not in {"feedforward", "conv_lstm", "conv_gru"}:
+            raise ValueError(
+                "recurrent.temporal_model must be feedforward, conv_lstm, or conv_gru"
+            )
+        recurrent_enabled = temporal_model != "feedforward"
+        if self.enabled is not None and self.enabled != recurrent_enabled:
+            raise ValueError(
+                "recurrent.enabled contradicts recurrent.temporal_model"
+            )
+        if (
+            recurrent_enabled
+            and self.cell is not None
+            and self.cell != temporal_model
+        ):
+            raise ValueError("recurrent.cell contradicts recurrent.temporal_model")
+        sequence_loader = (
+            recurrent_enabled
+            if self.sequence_loader is None
+            else self.sequence_loader
+        )
+        if recurrent_enabled and not sequence_loader:
+            raise ValueError(
+                "a ConvLSTM/ConvGRU temporal_model requires "
+                "recurrent.sequence_loader=true"
+            )
+        if self.return_patch_event_activity and not sequence_loader:
+            raise ValueError(
+                "return_patch_event_activity requires "
+                "recurrent.sequence_loader=true"
+            )
+
+        # Resolve legacy aliases as well as the new explicit switches. Frozen
+        # dataclasses still permit normalization during construction.
+        object.__setattr__(self, "temporal_model", temporal_model)
+        object.__setattr__(self, "sequence_loader", sequence_loader)
+        object.__setattr__(self, "enabled", recurrent_enabled)
+        object.__setattr__(
+            self, "cell", temporal_model if recurrent_enabled else legacy_cell
+        )
         if self.sampling not in {"clip", "mixed"}:
             raise ValueError("recurrent.sampling must be clip or mixed")
         if not 0.0 < self.stream_ratio < 1.0:
@@ -516,12 +590,14 @@ class OptimizationConfig:
         if self.objective not in {
             "window_jepa",
             "dense_window_jepa",
+            "sequence_window_jepa",
+            "sequence_dense_window_jepa",
             "recurrent_window_jepa",
             "recurrent_dense_window_jepa",
             "feature_consistency",
         }:
             raise ValueError(
-                "objective must be a feedforward/recurrent Window-JEPA objective "
+                "objective must be a paired/sequence/recurrent Window-JEPA objective "
                 "or feature_consistency"
             )
         if self.epochs <= 0 or self.warmup_epochs < 0:
@@ -599,6 +675,8 @@ class ExperimentConfig:
         if self.optimization.objective in {
             "window_jepa",
             "dense_window_jepa",
+            "sequence_window_jepa",
+            "sequence_dense_window_jepa",
             "recurrent_window_jepa",
             "recurrent_dense_window_jepa",
         }:
@@ -622,39 +700,63 @@ class ExperimentConfig:
                     "feature_consistency requires variance or covariance anti-collapse loss"
                 )
         if (
-            self.optimization.objective == "dense_window_jepa"
+            self.optimization.objective in {
+                "dense_window_jepa",
+                "sequence_dense_window_jepa",
+            }
             and self.model.architecture != "vjepa2_1"
         ):
             raise ValueError(
-                "dense_window_jepa requires model.architecture=vjepa2_1"
+                "dense Window-JEPA objectives require model.architecture=vjepa2_1"
             )
+        if (
+            self.model.architecture == "vjepa2_1"
+            and self.model.deep_supervision_layers
+            and self.model.encoder_depth - 1
+            not in self.model.deep_supervision_layers
+        ):
+            raise ValueError(
+                "explicit V-JEPA 2.1 supervision must include the final "
+                "encoder block so DDP has no unused trailing blocks"
+            )
+        sequence_objectives = {
+            "sequence_window_jepa",
+            "sequence_dense_window_jepa",
+        }
         recurrent_objectives = {
             "recurrent_window_jepa",
             "recurrent_dense_window_jepa",
         }
+        paired_objectives = {
+            "window_jepa",
+            "dense_window_jepa",
+            "feature_consistency",
+        }
+        objective = self.optimization.objective
+        is_sequence_objective = objective in sequence_objectives
         is_recurrent_objective = self.optimization.objective in recurrent_objectives
-        if self.recurrent.enabled != is_recurrent_objective:
+        if objective in paired_objectives and self.recurrent.sequence_loader:
             raise ValueError(
-                "recurrent.enabled must be true exactly for recurrent objectives"
+                "paired objectives require recurrent.sequence_loader=false"
+            )
+        if is_sequence_objective and (
+            not self.recurrent.sequence_loader or self.recurrent.enabled
+        ):
+            raise ValueError(
+                "sequence objectives require recurrent.sequence_loader=true and "
+                "recurrent.temporal_model=feedforward"
+            )
+        if is_recurrent_objective and (
+            not self.recurrent.sequence_loader or not self.recurrent.enabled
+        ):
+            raise ValueError(
+                "recurrent objectives require recurrent.sequence_loader=true and "
+                "a ConvLSTM/ConvGRU temporal_model"
             )
         if self.recurrent.enabled:
             if self.model.architecture != "vjepa2_1":
                 raise ValueError("R0 recurrent pretraining requires model.architecture=vjepa2_1")
-            if self.optimization.objective == "recurrent_dense_window_jepa" and not (
-                self.model.deep_supervision_layers
-            ):
-                raise ValueError(
-                    "recurrent_dense_window_jepa requires deep_supervision_layers"
-                )
-            if (
-                self.model.deep_supervision_layers
-                and self.model.encoder_depth - 1
-                not in self.model.deep_supervision_layers
-            ):
-                raise ValueError(
-                    "recurrent objectives require supervision at the final encoder "
-                    "block so DDP has no unused trailing blocks"
-                )
+        if self.recurrent.sequence_loader:
             expected_windows = (self.recurrent.window_ms,)
             if (
                 self.windows.train_ms != expected_windows
@@ -662,19 +764,21 @@ class ExperimentConfig:
                 or not self.windows.allow_equal
             ):
                 raise ValueError(
-                    "R0 requires train_ms and target_ms to contain only "
+                    "the sequence loader requires train_ms and target_ms to contain only "
                     "recurrent.window_ms, with windows.allow_equal=true"
                 )
             if self.windows.canonical_ms != self.recurrent.window_ms:
                 raise ValueError(
-                    "R0 requires windows.canonical_ms == recurrent.window_ms"
+                    "the sequence loader requires windows.canonical_ms == "
+                    "recurrent.window_ms"
                 )
             if self.recurrent.stride_ms != self.recurrent.window_ms:
                 raise ValueError(
-                    "R0 requires stride_ms == window_ms so consecutive event bins "
+                    "the sequence loader requires stride_ms == window_ms so "
+                    "consecutive event bins "
                     "neither overlap nor leave temporal gaps"
                 )
-            if self.optimization.canonical_query_weight:
+            if self.recurrent.enabled and self.optimization.canonical_query_weight:
                 raise ValueError(
                     "R0 requires canonical_query_weight=0 because a second full-context "
                     "online pass would leak the current masked input into recurrent state"
@@ -685,14 +789,18 @@ class ExperimentConfig:
                 )
                 if not 0 < stream_batch < self.data.batch_size:
                     raise ValueError(
-                        "mixed recurrent sampling requires at least one stream and one "
+                        "mixed sequence sampling requires at least one stream and one "
                         "random sample per rank"
                     )
-                if self.recurrent.tbptt_steps != self.recurrent.sequence_length:
+                if (
+                    self.recurrent.enabled
+                    and self.recurrent.tbptt_steps
+                    != self.recurrent.sequence_length
+                ):
                     raise ValueError(
-                        "mixed recurrent sampling requires tbptt_steps == "
-                        "sequence_length: random clips use full BPTT within one batch, "
-                        "while stream state is detached and carried between batches"
+                        "mixed recurrent sequence sampling requires tbptt_steps == "
+                        "sequence_length: random clips use full BPTT while stream "
+                        "state is detached and carried between batches"
                     )
 
     @classmethod

@@ -230,6 +230,32 @@ def test_recurrent_report_saves_each_timestep_and_machine_checks(tmp_path) -> No
     assert "step-00-mask-overlay.png" in output.read_text(encoding="utf-8")
 
 
+def test_sequence_report_accepts_feedforward_temporal_model(tmp_path) -> None:
+    config = _config()
+    feedforward_config = replace(
+        config,
+        recurrent=replace(
+            config.recurrent,
+            enabled=False,
+            sequence_loader=True,
+            temporal_model="feedforward",
+        ),
+        optimization=replace(
+            config.optimization,
+            objective="sequence_dense_window_jepa",
+        ),
+    )
+
+    report = write_recurrent_inspection_report(
+        _dataset(),
+        feedforward_config,
+        tmp_path / "feedforward-sequence.html",
+        expected_dataset="gen1",
+    )
+
+    assert report["passed"] is True
+
+
 def test_assertions_detect_timestamp_damage_and_validate_future_sampler_metadata() -> None:
     dataset = _dataset()
     sample, debug = dataset.sample_with_debug(0)

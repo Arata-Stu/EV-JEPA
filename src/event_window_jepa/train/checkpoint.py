@@ -21,10 +21,28 @@ SCHEMA_VERSION = 2
 
 def config_hash(config: ExperimentConfig) -> str:
     resolved = config.to_dict()
-    # Recurrent settings were added after checkpoint schema v2.  Their disabled
-    # defaults must not invalidate older feedforward checkpoints.
-    if not resolved.get("recurrent", {}).get("enabled", False):
+    # Recurrent settings were added after checkpoint schema v2. Their disabled
+    # defaults must not invalidate older feedforward checkpoints. Sequence
+    # loading is now independent from recurrent encoding, so a feedforward
+    # temporal experiment must retain the section even though ``enabled`` is
+    # false.
+    recurrent = resolved.get("recurrent", {})
+    if (
+        not recurrent.get("sequence_loader", recurrent.get("enabled", False))
+        and recurrent.get("temporal_model", "feedforward") == "feedforward"
+        and not recurrent.get("return_patch_event_activity", False)
+    ):
         resolved.pop("recurrent", None)
+    else:
+        # Preserve hashes made by the original R0 schema when the new switches
+        # merely spell out the same legacy ConvLSTM/ConvGRU configuration.
+        if recurrent.get("enabled", False):
+            if recurrent.get("sequence_loader") is True:
+                recurrent.pop("sequence_loader", None)
+            if recurrent.get("temporal_model") == recurrent.get("cell"):
+                recurrent.pop("temporal_model", None)
+        if recurrent.get("return_patch_event_activity") is False:
+            recurrent.pop("return_patch_event_activity", None)
     # Keep schema-v2 checkpoints created before the optional V-JEPA 2.1
     # architecture fields loadable. Their implicit architecture is v1.
     model = resolved["model"]

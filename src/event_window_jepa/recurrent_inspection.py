@@ -682,8 +682,10 @@ def write_recurrent_inspection_report(
 ) -> dict[str, Any]:
     """Save clip images plus optional adjacent mixed-batch diagnostics."""
 
-    if not config.recurrent.enabled:
-        raise ValueError("recurrent inspection requires recurrent.enabled=true")
+    if not config.recurrent.sequence_loader:
+        raise ValueError(
+            "sequence inspection requires recurrent.sequence_loader=true"
+        )
     if output.suffix.lower() != ".html":
         raise ValueError("recurrent inspection output must use an .html suffix")
     if epoch < 0:

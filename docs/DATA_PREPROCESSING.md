@@ -115,6 +115,23 @@ DSEC入力自体がZSTD圧縮済みなので、再packで必ず小さくなる�
 DSECはラベル座標との対応を守るため、converterでは`--spatial-downsample 1`だけを
 許可します。
 
+通常はnative 640×480と論理splitを固定する専用wrapperを使います。directory入力では
+`configs/datasets/dsec_detection_{train,val,test}.txt`から対象splitの公式listを自動で
+選びます。pilotなど別subsetを処理するときだけ`--sequence-list`で上書きします。
+
+```bash
+bash scripts/preprocess/preprocess_dsec.sh \
+  --python-bin env/bin/python \
+  --input /datasets/downloads/dsec/raw \
+  --bundle-root /datasets/evjepa/dsec_640x480 \
+  --split train \
+  --plan-only
+```
+
+実変換は同じcommandから`--plan-only`を外します。wrapperはfactor 1、座標保持、Zstd
+level 5、完了済みfileの検証付きskip、互換性のある`.partial`からの再開を固定します。
+DSECのDetection labelやcalibrationは書き換えず、download root側で別途保持します。
+
 ## M3ED
 
 M3ED processed HDF5の`/prophesee/{left,right}/{x,y,t,p}`をstreamingで読みます。
@@ -272,6 +289,24 @@ HDF5内に`/events/width,height`があれば公式解像度と照合し、無け
 Gen1は304×240のままです。bboxはnative座標のまま別に保存し、manifestへ倍率を
 記録します。
 既存データroot内の`_excluded_failed_validation`は再帰探索から明示的に除外します。
+
+通常はnative 304×240を固定する専用wrapperを使えます。directory入力では、事故防止の
+ため`--sequence-list`または明示的な`--all`が必要です。train/valのbboxがない純粋な
+self-supervised事前学習に限り`--self-supervised`を指定します。
+
+```bash
+bash scripts/preprocess/preprocess_gen1.sh \
+  --python-bin env/bin/python \
+  --input /datasets/downloads/gen1/raw \
+  --bundle-root /datasets/evjepa/gen1_304x240 \
+  --split train \
+  --all \
+  --plan-only
+```
+
+実変換は`--plan-only`を外します。wrapperはfactor 1と`coordinate`方式を固定するため、
+DAGR式area accumulationは適用しません。eventはnative座標のまま保存し、bboxも座標と
+timestampを書き換えずportable bundleへcopyします。
 
 ## Prophesee DAT（代替入力）
 

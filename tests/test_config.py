@@ -82,6 +82,48 @@ def test_recurrent_config_validates_bptt_geometry() -> None:
         RecurrentConfig(sequence_length=2, tbptt_steps=3)
 
 
+def test_temporal_loader_and_model_switches_resolve_legacy_and_explicit_forms() -> None:
+    legacy = RecurrentConfig.from_mapping(
+        {"enabled": True, "cell": "conv_gru"}
+    )
+    assert legacy.sequence_loader is True
+    assert legacy.temporal_model == "conv_gru"
+    assert legacy.enabled is True
+    assert legacy.cell == "conv_gru"
+
+    feedforward = RecurrentConfig.from_mapping(
+        {
+            "sequence_loader": True,
+            "temporal_model": "feedforward",
+            "return_patch_event_activity": True,
+        }
+    )
+    assert feedforward.sequence_loader is True
+    assert feedforward.temporal_model == "feedforward"
+    assert feedforward.enabled is False
+    assert feedforward.return_patch_event_activity is True
+
+    conv_gru = RecurrentConfig.from_mapping({"temporal_model": "conv_gru"})
+    assert conv_gru.sequence_loader is True
+    assert conv_gru.enabled is True
+    assert conv_gru.cell == "conv_gru"
+
+
+def test_temporal_loader_and_legacy_alias_contradictions_are_rejected() -> None:
+    with pytest.raises(ValueError, match="enabled contradicts"):
+        RecurrentConfig(enabled=False, temporal_model="conv_lstm")
+    with pytest.raises(ValueError, match="enabled contradicts"):
+        RecurrentConfig(enabled=True, temporal_model="feedforward")
+    with pytest.raises(ValueError, match="cell contradicts"):
+        RecurrentConfig(cell="conv_lstm", temporal_model="conv_gru")
+    with pytest.raises(ValueError, match="sequence_loader=true"):
+        RecurrentConfig(sequence_loader=False, temporal_model="conv_gru")
+    with pytest.raises(ValueError, match="return_patch_event_activity"):
+        RecurrentConfig(return_patch_event_activity=True)
+    with pytest.raises(TypeError, match="YAML boolean"):
+        RecurrentConfig.from_mapping({"sequence_loader": "true"})
+
+
 def test_r0_requires_equal_non_overlapping_fifty_ms_windows() -> None:
     base = {
         "data": {
@@ -126,6 +168,108 @@ def test_r0_requires_equal_non_overlapping_fifty_ms_windows() -> None:
         },
     }
     assert ExperimentConfig.from_mapping(base).recurrent.enabled
+
+    feedforward_sequence = {
+        **base,
+        "recurrent": {
+            key: value
+            for key, value in base["recurrent"].items()
+            if key != "enabled"
+        }
+        | {
+            "sequence_loader": True,
+            "temporal_model": "feedforward",
+            "return_patch_event_activity": True,
+        },
+        "optimization": {
+            **base["optimization"],
+            "objective": "sequence_dense_window_jepa",
+        },
+    }
+    resolved_feedforward = ExperimentConfig.from_mapping(feedforward_sequence)
+    assert resolved_feedforward.recurrent.sequence_loader is True
+    assert resolved_feedforward.recurrent.enabled is False
+    assert resolved_feedforward.recurrent.temporal_model == "feedforward"
+    assert resolved_feedforward.recurrent.return_patch_event_activity is True
+
+    sequence_default_supervision = {
+        **feedforward_sequence,
+        "model": {
+            key: value
+            for key, value in feedforward_sequence["model"].items()
+            if key != "deep_supervision_layers"
+        },
+    }
+    assert (
+        ExperimentConfig.from_mapping(
+            sequence_default_supervision
+        ).model.deep_supervision_layers
+        == ()
+    )
+
+    paired_default_supervision = {
+        key: value for key, value in base.items() if key != "recurrent"
+    }
+    paired_default_supervision["model"] = {
+        key: value
+        for key, value in base["model"].items()
+        if key != "deep_supervision_layers"
+    }
+    paired_default_supervision["optimization"] = {
+        **base["optimization"],
+        "objective": "dense_window_jepa",
+    }
+    assert (
+        ExperimentConfig.from_mapping(
+            paired_default_supervision
+        ).model.deep_supervision_layers
+        == ()
+    )
+
+    feedforward_chunk_metadata = {
+        **feedforward_sequence,
+        "recurrent": {
+            **feedforward_sequence["recurrent"],
+            "tbptt_steps": 2,
+        },
+    }
+    assert (
+        ExperimentConfig.from_mapping(
+            feedforward_chunk_metadata
+        ).recurrent.tbptt_steps
+        == 2
+    )
+
+    feedforward_missing_final = {
+        **feedforward_sequence,
+        "model": {
+            **feedforward_sequence["model"],
+            "deep_supervision_layers": [0],
+        },
+    }
+    with pytest.raises(ValueError, match="final encoder block"):
+        ExperimentConfig.from_mapping(feedforward_missing_final)
+
+    feedforward_plain_missing_final = {
+        **feedforward_missing_final,
+        "optimization": {
+            **feedforward_missing_final["optimization"],
+            "objective": "sequence_window_jepa",
+        },
+    }
+    with pytest.raises(ValueError, match="final encoder block"):
+        ExperimentConfig.from_mapping(feedforward_plain_missing_final)
+
+    paired_missing_final = {
+        **paired_default_supervision,
+        "model": {**base["model"], "deep_supervision_layers": [0]},
+        "optimization": {
+            **base["optimization"],
+            "objective": "window_jepa",
+        },
+    }
+    with pytest.raises(ValueError, match="final encoder block"):
+        ExperimentConfig.from_mapping(paired_missing_final)
 
     overlapping = {**base, "recurrent": {**base["recurrent"], "stride_ms": 25}}
     with pytest.raises(ValueError, match="stride_ms == window_ms"):

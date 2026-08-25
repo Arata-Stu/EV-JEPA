@@ -1,0 +1,94 @@
+data:
+  manifest: /media/noah-22/AT_SSD/dataset/evjepa/gen1_304x240/manifests/train.jsonl
+  store: hdf5
+  split: train
+  # Sequence mode counts clips. 6250 clips x 8 supervised steps keeps the
+  # nominal signal near 50k windows per epoch, matching recurrent R0.
+  samples_per_epoch: 6250
+  batch_size: 4
+  workers: 4
+  sequence_sampling: sequence_balanced
+  crop_size: [240, 304]
+  horizontal_flip_probability: 0.5
+
+representation:
+  type: voxel_grid
+  temporal_bins: 5
+  split_polarity: true
+  normalization: log1p
+
+windows:
+  train_ms: [50]
+  eval_ms: [25, 50, 75, 100]
+  unseen_eval_ms: [25, 75, 100]
+  target_ms: [50]
+  canonical_ms: 50
+  minimum_ratio: 1.0
+  direction: any
+  allow_equal: true
+
+model:
+  architecture: vjepa2_1
+  image_size: [240, 304]
+  patch_size: 16
+  embed_dim: 384
+  encoder_depth: 12
+  encoder_heads: 6
+  deep_supervision_layers: [2, 5, 8, 11]
+  predictor_dim: 256
+  predictor_depth: 4
+  predictor_heads: 8
+  scale_dim: 128
+  scale_fourier_bands: 16
+  condition_on_scale: true
+
+recurrent:
+  # The section name is retained for configuration compatibility. These two
+  # switches independently select the temporal loader and temporal model.
+  sequence_loader: true
+  temporal_model: feedforward
+  # Enable only for a future event-support SIGReg loss. The EMA baseline does
+  # not consume patch activity counts.
+  return_patch_event_activity: false
+  sampling: mixed
+  stream_ratio: 0.5
+  window_ms: 50
+  stride_ms: 50
+  # Keep the same clip layout as recurrent R0. Feedforward training selects the
+  # eight loss-bearing steps and intentionally ignores burn-in/state metadata.
+  sequence_length: 8
+  burn_in_steps: 2
+  tbptt_steps: 8
+
+mask:
+  target_blocks: 4
+  target_area_range: [0.15, 0.25]
+  target_aspect_range: [0.5, 2.0]
+  context_keep_ratio: 0.60
+  activity_aware_probability: 0.0
+  activity_candidates: 32
+  minimum_active_target_ratio: 0.25
+
+optimization:
+  # This remains the current online/EMA Window-JEPA baseline. SIGReg is a
+  # separate objective to be added and compared later.
+  objective: sequence_dense_window_jepa
+  epochs: 100
+  learning_rate: 0.0003
+  minimum_learning_rate: 0.000001
+  warmup_epochs: 10
+  weight_decay: 0.05
+  target_ema_start: 0.99925
+  target_ema_end: 0.99925
+  precision: bf16
+  gradient_clip: 1.0
+  variance_weight: 0.0
+  covariance_weight: 0.0
+  canonical_query_weight: 0.0
+
+runtime:
+  seed: 0
+  output_dir: outputs/pretrain/sequence_r0_feedforward_vits_gen1_seed0
+  log_every_steps: 20
+  checkpoint_every_epochs: 1
+  resume: null
