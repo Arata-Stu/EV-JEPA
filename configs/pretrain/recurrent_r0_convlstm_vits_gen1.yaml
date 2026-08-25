@@ -5,8 +5,9 @@ data:
   # Recurrent mode counts clips, not individual windows. 6250 clips × 8
   # supervised steps keeps the nominal signal near 50k windows per epoch.
   samples_per_epoch: 6250
-  batch_size: 4
-  workers: 4
+  # Measured on V100 32 GB x3: ConvLSTM 10ch uses about 24 GB/rank.
+  batch_size: 24
+  workers: 8
   sequence_sampling: sequence_balanced
   crop_size: [240, 304]
   horizontal_flip_probability: 0.5
@@ -48,7 +49,7 @@ recurrent:
   enabled: true
   cell: conv_lstm
   kernel_size: 3
-  # RVT-style mixed batching: per-rank batch 4 = 2 stream + 2 random clips.
+  # RVT-style mixed batching: per-rank batch 24 = 12 stream + 12 random clips.
   sampling: mixed
   stream_ratio: 0.5
   window_ms: 50
@@ -79,7 +80,8 @@ optimization:
   weight_decay: 0.05
   target_ema_start: 0.99925
   target_ema_end: 0.99925
-  precision: bf16
+  # V100 baseline. Use the runner's auto mode on other GPU generations.
+  precision: fp16
   gradient_clip: 1.0
   variance_weight: 0.0
   covariance_weight: 0.0

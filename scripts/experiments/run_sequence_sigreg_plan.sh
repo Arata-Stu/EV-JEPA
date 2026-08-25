@@ -17,10 +17,10 @@ SAMPLE_INDEX=0
 DATA_ROOT=/home/iASL/Arata_repo/dataset/gen1_304x240
 OUTPUT_ROOT="$PROJECT_ROOT/outputs/pretrain/sequence_sigreg"
 PYTHON_BIN=${PYTHON_BIN:-python}
-PRECISION=fp32
+PRECISION=auto
 REQUESTED_PRECISION=$PRECISION
-BATCH_SIZE=4
-WORKERS=4
+BATCH_SIZE=24
+WORKERS=8
 KEEP_EVERY_EPOCHS=5
 SMOKE=0
 RESUME=0
@@ -35,9 +35,9 @@ usage() {
     '  --selected-input INPUT   2ch or 10ch; required to execute Stage 2' \
     '  --selected-model MODEL   ff, cgru, or clstm for the Stage 3 plan' \
     '  --nproc-per-node N|auto  GPUs/processes for training (default: 3)' \
-    '  --precision MODE         auto, fp32, fp16, or bf16 (default: fp32)' \
-    '  --batch-size N           Per-rank batch; even and >=2 (default: 4)' \
-    '  --workers N              DataLoader workers per rank (default: 4)' \
+    '  --precision MODE         auto, fp32, fp16, or bf16 (default: auto)' \
+    '  --batch-size N           Per-rank batch; even and >=2 (default: 24)' \
+    '  --workers N              DataLoader workers per rank (default: 8)' \
     '  --keep-every-epochs N    Preserve a named checkpoint every N epochs (default: 5)' \
     '  --smoke                  Isolated 1-epoch, 2-global-batch hardware check' \
     '  --sample-index N         Dataset sample used by inspect (default: 0)' \
@@ -804,7 +804,7 @@ prepare_one() {
     perl -0pi -e 's/conv_lstm/conv_gru/g; s/ConvLSTM/ConvGRU/g' "$temporary"
   fi
   perl -0pi -e '
-    s{# RVT-style mixed batching: per-rank batch 4 = 2 stream \+ 2 random clips\.}
+    s{# RVT-style mixed batching:[^\n]*}
      {# RVT-style mixed batching: half stream and half random clips per rank.};
   ' "$temporary"
   validate_config_content "$temporary" "$stage" "$run_id" "$input" "$model"
