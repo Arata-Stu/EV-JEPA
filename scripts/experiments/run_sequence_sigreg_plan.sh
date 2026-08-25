@@ -356,6 +356,56 @@ require_file() {
   fi
 }
 
+preflight_cuda_environment() {
+  "$PYTHON_BIN" - "$NPROC_PER_NODE" "$PRECISION" <<'PY'
+from __future__ import annotations
+
+import sys
+
+import torch
+
+
+required_devices = int(sys.argv[1])
+precision = sys.argv[2]
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA is unavailable in the selected Python environment")
+visible_devices = torch.cuda.device_count()
+if visible_devices < required_devices:
+    raise SystemExit(
+        f"requested {required_devices} processes but only {visible_devices} CUDA devices are visible"
+    )
+if precision == "bf16" and not torch.cuda.is_bf16_supported():
+    raise SystemExit(
+        "precision=bf16 is unsupported by the visible GPU/PyTorch combination; use fp32"
+    )
+
+print(
+    "[cuda-preflight] "
+    f"torch={torch.__version__} cuda_runtime={torch.version.cuda} "
+    f"compiled_arches={torch.cuda.get_arch_list()}"
+)
+for index in range(required_devices):
+    properties = torch.cuda.get_device_properties(index)
+    try:
+        with torch.cuda.device(index):
+            value = torch.ones((16, 16), device=f"cuda:{index}")
+            result = value @ value
+            torch.cuda.synchronize()
+        if float(result[0, 0]) != 16.0:
+            raise RuntimeError("unexpected CUDA matmul result")
+    except Exception as error:
+        raise SystemExit(
+            f"CUDA kernel check failed on device {index} "
+            f"({properties.name}, capability={properties.major}.{properties.minor}): {error}"
+        ) from error
+    print(
+        "[cuda-preflight] "
+        f"device={index} name={properties.name} "
+        f"capability={properties.major}.{properties.minor} ok"
+    )
+PY
+}
+
 run_dir() {
   printf '%s/stage%s/%s\n' "$OUTPUT_ROOT" "$1" "$2"
 }
@@ -834,6 +884,7 @@ case "$ACTION" in
   run)
     require_file "$TRAIN_MANIFEST"
     require_command "$PYTHON_BIN"
+    preflight_cuda_environment
     run_for_all_specs preflight_run_one
     run_for_all_specs run_one
     ;;
@@ -841,6 +892,7 @@ case "$ACTION" in
     require_file "$TRAIN_MANIFEST"
     require_command "$PYTHON_BIN"
     require_command perl
+    preflight_cuda_environment
     run_for_all_specs preflight_prepare_one
     run_for_all_specs prepare_one
     run_for_all_specs preflight_inspect_one
