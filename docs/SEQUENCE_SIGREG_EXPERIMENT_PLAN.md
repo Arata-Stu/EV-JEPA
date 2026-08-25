@@ -393,6 +393,11 @@ FP16では動的gradient scalingを用いる。TBPTTの途中ではscaleを変�
 checkpointへ含める。`attempt_step`はbatch試行数、`global_step`は成功したoptimizer更新数とする。
 FP32はautocastを使わない基準経路として常に残す。
 
+再開用`checkpoint-latest.pt`は`checkpoint_every_epochs: 1`により毎epoch更新する。最良の
+pretrain重みを後から下流評価できるよう、runnerは既定で5 epochごとと最終epochを
+`checkpoint-epochNNNN.pt`として保持する。保持間隔は`--keep-every-epochs`で明示し、異なる条件間で
+揃える。これらはoptimizer等を含む完全checkpointなので必要容量も実験開始前に確認する。
+
 例えばV100 1台のportable smokeは次のように開始する。実行時には`auto`が
 `--nproc-per-node 1 --precision fp16`相当へ解決され、run IDも具体値を使う。
 

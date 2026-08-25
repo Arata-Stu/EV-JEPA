@@ -21,6 +21,7 @@ PRECISION=fp32
 REQUESTED_PRECISION=$PRECISION
 BATCH_SIZE=4
 WORKERS=4
+KEEP_EVERY_EPOCHS=5
 SMOKE=0
 RESUME=0
 
@@ -37,6 +38,7 @@ usage() {
     '  --precision MODE         auto, fp32, fp16, or bf16 (default: fp32)' \
     '  --batch-size N           Per-rank batch; even and >=2 (default: 4)' \
     '  --workers N              DataLoader workers per rank (default: 4)' \
+    '  --keep-every-epochs N    Preserve a named checkpoint every N epochs (default: 5)' \
     '  --smoke                  Isolated 1-epoch, 2-global-batch hardware check' \
     '  --sample-index N         Dataset sample used by inspect (default: 0)' \
     '  --data-root DIR          Processed Gen1 dataset root' \
@@ -247,6 +249,11 @@ while (($#)); do
       WORKERS=$2
       shift 2
       ;;
+    --keep-every-epochs)
+      require_option_value "$@"
+      KEEP_EVERY_EPOCHS=$2
+      shift 2
+      ;;
     --smoke)
       SMOKE=1
       shift
@@ -355,6 +362,13 @@ case "$WORKERS" in
   ''|*[!0-9]*)
     printf 'workers must be a non-negative integer per rank: %s\n' \
       "$WORKERS" >&2
+    exit 2
+    ;;
+esac
+case "$KEEP_EVERY_EPOCHS" in
+  ''|*[!0-9]*|0)
+    printf 'keep-every-epochs must be a positive integer: %s\n' \
+      "$KEEP_EVERY_EPOCHS" >&2
     exit 2
     ;;
 esac
@@ -512,7 +526,25 @@ from __future__ import annotations
 import sys
 from contextlib import nullcontext
 
+missing_python_apis = [
+    name
+    for name in ("get_int_max_str_digits", "set_int_max_str_digits")
+    if not hasattr(sys, name)
+]
+if missing_python_apis:
+    raise SystemExit(
+        "Python runtime is incompatible with this PyTorch build: "
+        f"version={sys.version.split()[0]} executable={sys.executable} "
+        f"missing sys APIs={missing_python_apis}. Use a current CPython 3.11/3.12 "
+        "environment before launching DDP"
+    )
+
 import torch
+
+try:
+    import torch._dynamo  # noqa: F401
+except Exception as error:
+    raise SystemExit(f"PyTorch Dynamo import preflight failed: {error}") from error
 
 
 required_devices = int(sys.argv[1])
@@ -797,6 +829,7 @@ prepare_one() {
     printf 'batch_size_per_rank=%s\n' "$BATCH_SIZE"
     printf 'global_batch_size=%s\n' "$GLOBAL_BATCH_SIZE"
     printf 'workers_per_rank=%s\n' "$WORKERS"
+    printf 'keep_every_epochs=%s\n' "$KEEP_EVERY_EPOCHS"
     printf 'precision_request=%s\n' "$REQUESTED_PRECISION"
     printf 'precision=%s\n' "$PRECISION"
     printf 'smoke=%s\n' "$SMOKE"
@@ -841,6 +874,10 @@ require_prepared() {
   grep -Fqx "batch_size_per_rank=$BATCH_SIZE" "$directory/launch_metadata.txt"
   grep -Fqx "global_batch_size=$GLOBAL_BATCH_SIZE" "$directory/launch_metadata.txt"
   grep -Fqx "workers_per_rank=$WORKERS" "$directory/launch_metadata.txt"
+  if grep -q '^keep_every_epochs=' "$directory/launch_metadata.txt"; then
+    grep -Fqx "keep_every_epochs=$KEEP_EVERY_EPOCHS" \
+      "$directory/launch_metadata.txt"
+  fi
   grep -Fqx "precision=$PRECISION" "$directory/launch_metadata.txt"
   grep -Fqx "smoke=$SMOKE" "$directory/launch_metadata.txt"
   grep -Fqx "samples_per_epoch=$CONFIG_SAMPLES_PER_EPOCH" \
@@ -867,6 +904,8 @@ build_inspect_command() {
 build_train_command() {
   local config=$1
   local checkpoint=$2
+  local epoch
+  local milestones=()
   if [[ "$NPROC_PER_NODE" == 1 ]]; then
     COMMAND=(
       "$PYTHON_BIN"
@@ -885,6 +924,16 @@ build_train_command() {
   fi
   if [[ "$RESUME" == 1 ]]; then
     COMMAND+=(--resume "$checkpoint")
+  fi
+  if [[ "$SMOKE" != 1 ]]; then
+    for ((epoch = KEEP_EVERY_EPOCHS; epoch <= CONFIG_EPOCHS; epoch += KEEP_EVERY_EPOCHS)); do
+      milestones+=("$epoch")
+    done
+    if ((${#milestones[@]} == 0)) || \
+       [[ "${milestones[${#milestones[@]} - 1]}" != "$CONFIG_EPOCHS" ]]; then
+      milestones+=("$CONFIG_EPOCHS")
+    fi
+    COMMAND+=(--milestone-epochs "${milestones[@]}")
   fi
 }
 
@@ -1035,6 +1084,7 @@ print_plan() {
     "  nproc_per_node=$NPROC_PER_NODE precision=$PRECISION" \
     "  batch_size_per_rank=$BATCH_SIZE global_batch_size=$GLOBAL_BATCH_SIZE" \
     "  workers_per_rank=$WORKERS total_worker_processes=$((10#$NPROC_PER_NODE * 10#$WORKERS))" \
+    "  keep_every_epochs=$KEEP_EVERY_EPOCHS" \
     "  smoke=$SMOKE samples_per_epoch=$CONFIG_SAMPLES_PER_EPOCH epochs=$CONFIG_EPOCHS warmup_epochs=$CONFIG_WARMUP_EPOCHS" \
     "  manifest=$TRAIN_MANIFEST" \
     "  output_root=$OUTPUT_ROOT"
