@@ -137,6 +137,13 @@ PYTHONUNBUFFERED=1 window-jepa-pretrain \
 | `true` | `feedforward` | `sequence_window_jepa` / `sequence_dense_window_jepa` | 同じ時系列sampleを状態なしencoderで処理する比較 |
 | `true` | `conv_gru` / `conv_lstm` | `recurrent_window_jepa` / `recurrent_dense_window_jepa` | BPTT/TBPTTを使うrecurrent比較 |
 
+50 msの2/10 channel入力、Feedforward/ConvGRU/ConvLSTM、3種類のSIGRegを順番に
+切り分ける実験protocolは
+[Gen1 Sequence / SIGReg R0 実験計画](docs/SEQUENCE_SIGREG_EXPERIMENT_PLAN.md)にまとめています。
+実行入口は[scripts/experiments/run_sequence_sigreg_plan.sh](scripts/experiments/run_sequence_sigreg_plan.sh)
+です。Stage 1と2の事前学習経路は実装済みですが、Stage 3のSIGReg lossは未実装のため、
+runnerも現時点ではStage 3の実行を明示的に拒否します。
+
 feedforwardの時系列設定例は
 [sequence_r0_feedforward_vits_gen1.yaml](configs/pretrain/sequence_r0_feedforward_vits_gen1.yaml)
 です。
