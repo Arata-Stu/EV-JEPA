@@ -616,8 +616,8 @@ class OptimizationConfig:
             raise ValueError("optimization regularizers are invalid")
         if not 0 <= self.target_ema_start <= self.target_ema_end <= 1:
             raise ValueError("EMA momentum must increase within [0, 1]")
-        if self.precision not in {"fp32", "bf16"}:
-            raise ValueError("precision must be fp32 or bf16")
+        if self.precision not in {"fp32", "fp16", "bf16"}:
+            raise ValueError("precision must be fp32, fp16, or bf16")
 
 
 @dataclass(frozen=True)

@@ -12,11 +12,13 @@ SELECTED_INPUT=10ch
 SELECTED_INPUT_EXPLICIT=0
 SELECTED_MODEL=clstm
 NPROC_PER_NODE=3
+REQUESTED_NPROC_PER_NODE=$NPROC_PER_NODE
 SAMPLE_INDEX=0
 DATA_ROOT=/home/iASL/Arata_repo/dataset/gen1_304x240
 OUTPUT_ROOT="$PROJECT_ROOT/outputs/pretrain/sequence_sigreg"
 PYTHON_BIN=${PYTHON_BIN:-python}
 PRECISION=fp32
+REQUESTED_PRECISION=$PRECISION
 BATCH_SIZE=4
 WORKERS=4
 SMOKE=0
@@ -31,8 +33,8 @@ usage() {
     '  --seed N                 Non-negative training seed (default: 0)' \
     '  --selected-input INPUT   2ch or 10ch; required to execute Stage 2' \
     '  --selected-model MODEL   ff, cgru, or clstm for the Stage 3 plan' \
-    '  --nproc-per-node N       GPUs/processes for training (default: 3)' \
-    '  --precision MODE         fp32 or bf16 (default: fp32 for V100)' \
+    '  --nproc-per-node N|auto  GPUs/processes for training (default: 3)' \
+    '  --precision MODE         auto, fp32, fp16, or bf16 (default: fp32)' \
     '  --batch-size N           Per-rank batch; even and >=2 (default: 4)' \
     '  --workers N              DataLoader workers per rank (default: 4)' \
     '  --smoke                  Isolated 1-epoch, 2-global-batch hardware check' \
@@ -51,6 +53,8 @@ usage() {
     '  * executing Stage 2 requires an explicit --selected-input.' \
     '  * Stage 3 can only be planned until SIGReg is implemented.' \
     '  * smoke runs use a distinct run ID and cannot be resumed.' \
+    '  * nproc=auto uses all visible GPUs; precision=auto uses their common mode.' \
+    '  * resume requires concrete GPU count and precision, not auto.' \
     '  * --resume is accepted only with --action plan or --action run.'
 }
 
@@ -59,6 +63,138 @@ require_option_value() {
     printf 'Missing value for %s\n' "$1" >&2
     exit 2
   fi
+}
+
+resolve_auto_runtime() {
+  local resolution
+  local resolved_nproc
+  local resolved_precision
+  local extra
+
+  if [[ "$REQUESTED_NPROC_PER_NODE" != auto && \
+        "$REQUESTED_PRECISION" != auto ]]; then
+    return
+  fi
+  if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    printf 'Python is required to resolve automatic GPU settings: %s\n' \
+      "$PYTHON_BIN" >&2
+    exit 1
+  fi
+  if ! resolution=$("$PYTHON_BIN" - \
+      "$REQUESTED_NPROC_PER_NODE" "$REQUESTED_PRECISION" <<'PY'
+from __future__ import annotations
+
+import sys
+
+try:
+    import torch
+except Exception as error:
+    raise SystemExit(
+        f"could not import PyTorch to resolve automatic GPU settings: {error}"
+    ) from error
+
+
+requested_nproc = sys.argv[1]
+requested_precision = sys.argv[2]
+if not torch.cuda.is_available():
+    raise SystemExit(
+        "CUDA is unavailable; pass concrete values for offline planning, or run "
+        "automatic detection on the training server"
+    )
+visible_devices = torch.cuda.device_count()
+if visible_devices < 1:
+    raise SystemExit("no CUDA devices are visible")
+nproc = visible_devices if requested_nproc == "auto" else int(requested_nproc)
+if nproc > visible_devices:
+    raise SystemExit(
+        f"requested {nproc} processes but only {visible_devices} CUDA devices are visible"
+    )
+
+
+def has_native_bf16(index: int) -> bool:
+    properties = torch.cuda.get_device_properties(index)
+    if properties.major < 8:
+        return False
+    checker = getattr(torch.cuda, "is_bf16_supported", None)
+    if checker is None:
+        return False
+    with torch.cuda.device(index):
+        try:
+            return bool(checker(including_emulation=False))
+        except TypeError:
+            # Older PyTorch releases do not expose including_emulation. The
+            # compute-capability guard above still excludes emulated V100 BF16.
+            return bool(checker())
+
+
+properties = [torch.cuda.get_device_properties(index) for index in range(nproc)]
+for index, item in enumerate(properties):
+    print(
+        "[runtime-auto] "
+        f"device={index} name={item.name} capability={item.major}.{item.minor}",
+        file=sys.stderr,
+    )
+all_native_bf16 = all(has_native_bf16(index) for index in range(nproc))
+all_native_fp16 = all(item.major >= 7 for item in properties)
+if requested_precision == "auto":
+    if all_native_bf16:
+        precision = "bf16"
+    elif all_native_fp16:
+        precision = "fp16"
+    else:
+        precision = "fp32"
+else:
+    precision = requested_precision
+
+if precision == "bf16" and not all_native_bf16:
+    details = ", ".join(
+        f"device {index} ({item.name}, capability={item.major}.{item.minor})"
+        for index, item in enumerate(properties)
+        if not has_native_bf16(index)
+    )
+    raise SystemExit(
+        "precision=bf16 requires native BF16 on every selected GPU; " + details
+    )
+if precision == "fp16" and not all_native_fp16:
+    details = ", ".join(
+        f"device {index} ({item.name}, capability={item.major}.{item.minor})"
+        for index, item in enumerate(properties)
+        if item.major < 7
+    )
+    raise SystemExit(
+        "precision=fp16 requires Volta-or-newer GPUs in this runner; " + details
+    )
+
+print(f"{nproc}\t{precision}")
+PY
+  ); then
+    printf '%s\n' 'Failed to resolve automatic GPU settings.' >&2
+    exit 1
+  fi
+  resolution=${resolution##*$'\n'}
+  IFS=$'\t' read -r resolved_nproc resolved_precision extra <<< "$resolution"
+  case "$resolved_nproc" in
+    ''|*[!0-9]*|0)
+      printf 'Invalid automatically resolved GPU count: %s\n' "$resolved_nproc" >&2
+      exit 1
+      ;;
+  esac
+  case "$resolved_precision" in
+    fp32|fp16|bf16) ;;
+    *)
+      printf 'Invalid automatically resolved precision: %s\n' \
+        "$resolved_precision" >&2
+      exit 1
+      ;;
+  esac
+  if [[ -n "${extra:-}" ]]; then
+    printf 'Unexpected automatic runtime result: %s\n' "$resolution" >&2
+    exit 1
+  fi
+  NPROC_PER_NODE=$resolved_nproc
+  PRECISION=$resolved_precision
+  printf '[runtime-auto] nproc_per_node=%s precision=%s\n' \
+    "$NPROC_PER_NODE" "$PRECISION" >&2
 }
 
 while (($#)); do
@@ -92,11 +228,13 @@ while (($#)); do
     --nproc-per-node)
       require_option_value "$@"
       NPROC_PER_NODE=$2
+      REQUESTED_NPROC_PER_NODE=$2
       shift 2
       ;;
     --precision)
       require_option_value "$@"
       PRECISION=$2
+      REQUESTED_PRECISION=$2
       shift 2
       ;;
     --batch-size)
@@ -186,15 +324,17 @@ case "$SEED" in
     ;;
 esac
 case "$NPROC_PER_NODE" in
+  auto) ;;
   ''|*[!0-9]*|0)
-    printf 'nproc-per-node must be a positive integer: %s\n' "$NPROC_PER_NODE" >&2
+    printf 'nproc-per-node must be auto or a positive integer: %s\n' \
+      "$NPROC_PER_NODE" >&2
     exit 2
     ;;
 esac
 case "$PRECISION" in
-  fp32|bf16) ;;
+  auto|fp32|fp16|bf16) ;;
   *)
-    printf 'Unsupported precision: %s (expected fp32 or bf16)\n' \
+    printf 'Unsupported precision: %s (expected auto, fp32, fp16, or bf16)\n' \
       "$PRECISION" >&2
     exit 2
     ;;
@@ -232,6 +372,13 @@ if [[ "$RESUME" == 1 && "$SMOKE" == 1 ]]; then
   printf '%s\n' '--smoke cannot be combined with --resume.' >&2
   exit 2
 fi
+if [[ "$RESUME" == 1 && \
+      ("$REQUESTED_NPROC_PER_NODE" == auto || "$REQUESTED_PRECISION" == auto) ]]; then
+  printf '%s\n' \
+    '--resume requires concrete --nproc-per-node and --precision values.' \
+    'Read them from the original run ID or launch_metadata.txt.' >&2
+  exit 2
+fi
 if [[ "$STAGE" == ready && "$ACTION" != plan ]]; then
   printf '%s\n' \
     'stage=ready is plan-only. Run Stage 1 first, then pass its selected input' \
@@ -263,6 +410,8 @@ if [[ "$DATA_ROOT" == *$'\n'* || "$OUTPUT_ROOT" == *$'\n'* ]]; then
   printf '%s\n' 'Paths containing newlines are unsupported.' >&2
   exit 2
 fi
+
+resolve_auto_runtime
 
 TRAIN_MANIFEST="$DATA_ROOT/manifests/train.jsonl"
 GLOBAL_BATCH_SIZE=$((10#$NPROC_PER_NODE * 10#$BATCH_SIZE))
@@ -361,6 +510,7 @@ preflight_cuda_environment() {
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 
 import torch
 
@@ -374,21 +524,57 @@ if visible_devices < required_devices:
     raise SystemExit(
         f"requested {required_devices} processes but only {visible_devices} CUDA devices are visible"
     )
+
+
+def has_native_bf16(index: int) -> bool:
+    properties = torch.cuda.get_device_properties(index)
+    if properties.major < 8:
+        return False
+    checker = getattr(torch.cuda, "is_bf16_supported", None)
+    if checker is None:
+        return False
+    with torch.cuda.device(index):
+        try:
+            return bool(checker(including_emulation=False))
+        except TypeError:
+            return bool(checker())
+
+
 if precision == "bf16":
     non_native_bf16 = []
     for index in range(required_devices):
         properties = torch.cuda.get_device_properties(index)
-        if properties.major < 8:
+        if not has_native_bf16(index):
             non_native_bf16.append(
                 f"device {index} ({properties.name}, capability="
                 f"{properties.major}.{properties.minor})"
             )
-    if non_native_bf16 or not torch.cuda.is_bf16_supported():
-        details = ", ".join(non_native_bf16) or "PyTorch BF16 capability check failed"
+    if non_native_bf16:
+        details = ", ".join(non_native_bf16)
         raise SystemExit(
             "precision=bf16 requires native Ampere-or-newer BF16 support; "
+            f"{details}. Use fp16 on Volta/Turing or fp32"
+        )
+elif precision == "fp16":
+    non_native_fp16 = []
+    for index in range(required_devices):
+        properties = torch.cuda.get_device_properties(index)
+        if properties.major < 7:
+            non_native_fp16.append(
+                f"device {index} ({properties.name}, capability="
+                f"{properties.major}.{properties.minor})"
+            )
+    if non_native_fp16:
+        details = ", ".join(non_native_fp16)
+        raise SystemExit(
+            "precision=fp16 requires Volta-or-newer GPUs in this runner; "
             f"{details}. Use fp32"
         )
+
+autocast_dtype = {
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}.get(precision)
 
 print(
     "[cuda-preflight] "
@@ -400,7 +586,13 @@ for index in range(required_devices):
     try:
         with torch.cuda.device(index):
             value = torch.ones((16, 16), device=f"cuda:{index}")
-            result = value @ value
+            context = (
+                torch.autocast(device_type="cuda", dtype=autocast_dtype)
+                if autocast_dtype is not None
+                else nullcontext()
+            )
+            with context:
+                result = value @ value
             torch.cuda.synchronize()
         if float(result[0, 0]) != 16.0:
             raise RuntimeError("unexpected CUDA matmul result")
@@ -600,10 +792,12 @@ prepare_one() {
     printf 'seed=%s\n' "$SEED"
     printf 'input=%s\n' "$input"
     printf 'model=%s\n' "$model"
+    printf 'nproc_per_node_request=%s\n' "$REQUESTED_NPROC_PER_NODE"
     printf 'nproc_per_node=%s\n' "$NPROC_PER_NODE"
     printf 'batch_size_per_rank=%s\n' "$BATCH_SIZE"
     printf 'global_batch_size=%s\n' "$GLOBAL_BATCH_SIZE"
     printf 'workers_per_rank=%s\n' "$WORKERS"
+    printf 'precision_request=%s\n' "$REQUESTED_PRECISION"
     printf 'precision=%s\n' "$PRECISION"
     printf 'smoke=%s\n' "$SMOKE"
     printf 'samples_per_epoch=%s\n' "$CONFIG_SAMPLES_PER_EPOCH"
@@ -844,6 +1038,11 @@ print_plan() {
     "  smoke=$SMOKE samples_per_epoch=$CONFIG_SAMPLES_PER_EPOCH epochs=$CONFIG_EPOCHS warmup_epochs=$CONFIG_WARMUP_EPOCHS" \
     "  manifest=$TRAIN_MANIFEST" \
     "  output_root=$OUTPUT_ROOT"
+  if [[ "$REQUESTED_NPROC_PER_NODE" != "$NPROC_PER_NODE" || \
+        "$REQUESTED_PRECISION" != "$PRECISION" ]]; then
+    printf '  auto_request: nproc_per_node=%s precision=%s\n' \
+      "$REQUESTED_NPROC_PER_NODE" "$REQUESTED_PRECISION"
+  fi
   for ((index = 0; index < ${#SPEC_RUN_IDS[@]}; index++)); do
     stage=${SPEC_STAGES[$index]}
     run_id=${SPEC_RUN_IDS[$index]}

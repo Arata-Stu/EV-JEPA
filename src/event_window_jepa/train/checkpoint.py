@@ -109,9 +109,12 @@ def save_checkpoint_atomic(
     world_size: int,
     steps_per_epoch: int,
     rng_states: list[dict[str, Any]] | None = None,
+    grad_scaler: Any | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if config.optimization.precision == "fp16" and grad_scaler is None:
+        raise ValueError("FP16 checkpoint saving requires a GradScaler instance")
     rank_rng_states = rng_states or [_rng_state()]
     if len(rank_rng_states) != world_size:
         raise ValueError("checkpoint must contain exactly one RNG state per rank")
@@ -125,6 +128,9 @@ def save_checkpoint_atomic(
         "scale_embedding": model.scale_embedding.state_dict(),
         "target_scale_embedding": model.target_scale_embedding.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "grad_scaler": (
+            grad_scaler.state_dict() if grad_scaler is not None else None
+        ),
         "epoch": epoch,
         "global_step": global_step,
         "world_size": world_size,
@@ -154,6 +160,7 @@ def load_training_checkpoint(
     world_size: int,
     steps_per_epoch: int,
     rank: int = 0,
+    grad_scaler: Any | None = None,
 ) -> tuple[int, int]:
     # Training resume accepts only checkpoints produced by this project.
     checkpoint = torch.load(Path(path), map_location="cpu", weights_only=False)
@@ -175,6 +182,14 @@ def load_training_checkpoint(
         checkpoint["target_scale_embedding"], strict=True
     )
     optimizer.load_state_dict(checkpoint["optimizer"])
+    grad_scaler_state = checkpoint.get("grad_scaler")
+    if config.optimization.precision == "fp16":
+        if grad_scaler_state is None:
+            raise ValueError("FP16 checkpoint is missing GradScaler state")
+        if grad_scaler is None:
+            raise ValueError("FP16 resume requires a GradScaler instance")
+    if grad_scaler is not None and grad_scaler_state is not None:
+        grad_scaler.load_state_dict(grad_scaler_state)
     rank_states = checkpoint.get("rng_state_by_rank")
     if rank_states is not None:
         if len(rank_states) != world_size:

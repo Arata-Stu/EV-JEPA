@@ -413,6 +413,15 @@ def test_dense_r0_backward_weights_an_uneven_tail_by_timestep_count() -> None:
     expected_metric_loss = expected_loss.detach()
     expected_loss.backward()
 
+    class RecordingScaler:
+        def __init__(self) -> None:
+            self.scale_calls = 0
+
+        def scale(self, loss: torch.Tensor) -> torch.Tensor:
+            self.scale_calls += 1
+            return loss
+
+    scaler = RecordingScaler()
     metrics, state_rms, final_state = _recurrent_backward(
         model=model,
         core_model=model,
@@ -420,7 +429,9 @@ def test_dense_r0_backward_weights_an_uneven_tail_by_timestep_count() -> None:
         config=config,
         device=torch.device("cpu"),
         world_size=1,
+        grad_scaler=scaler,
     )
+    assert scaler.scale_calls == 2
     assert torch.allclose(metrics[0], expected_metric_loss)
     assert state_rms > 0
     assert final_state is not None

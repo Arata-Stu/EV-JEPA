@@ -400,10 +400,102 @@ def _unwrap(model: WindowJEPA | DistributedDataParallel) -> WindowJEPA:
     return model.module if isinstance(model, DistributedDataParallel) else model
 
 
+def _precision_support_error(device: torch.device, precision: str) -> str | None:
+    if precision == "fp32":
+        return None
+    if device.type != "cuda":
+        return f"precision={precision} requires a CUDA device"
+    if precision == "fp16":
+        return None
+    if precision != "bf16":
+        return f"unsupported precision: {precision}"
+    properties = torch.cuda.get_device_properties(device)
+    if properties.major < 8:
+        return (
+            "precision=bf16 requires native Ampere-or-newer support; "
+            f"found {properties.name} capability={properties.major}.{properties.minor}"
+        )
+    checker = getattr(torch.cuda, "is_bf16_supported", None)
+    if checker is None:
+        return "precision=bf16 is unsupported by this PyTorch build"
+    try:
+        supported = bool(checker(including_emulation=False))
+    except TypeError:
+        supported = bool(checker())
+    if not supported:
+        return "precision=bf16 is not natively supported by this CUDA/PyTorch device"
+    return None
+
+
+def _validate_precision_support(
+    device: torch.device, precision: str, world_size: int
+) -> None:
+    local_error = _precision_support_error(device, precision)
+    errors: list[str | None] = [local_error]
+    if world_size > 1:
+        errors = [None] * world_size
+        distributed.all_gather_object(errors, local_error)
+    failures = [
+        f"rank {rank}: {error}"
+        for rank, error in enumerate(errors)
+        if error is not None
+    ]
+    if failures:
+        raise RuntimeError("; ".join(failures))
+
+
+def _make_grad_scaler(device: torch.device, precision: str) -> Any:
+    enabled = device.type == "cuda" and precision == "fp16"
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        # torch>=2.2 compatibility; newer releases prefer torch.amp.GradScaler.
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def _autocast_context(device: torch.device, precision: str) -> Any:
-    if precision == "bf16" and device.type == "cuda":
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    if device.type == "cuda" and precision in {"fp16", "bf16"}:
+        dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+        return torch.autocast(device_type="cuda", dtype=dtype)
     return nullcontext()
+
+
+def _backward(loss: torch.Tensor, grad_scaler: Any | None) -> None:
+    if grad_scaler is None:
+        loss.backward()
+    else:
+        grad_scaler.scale(loss).backward()
+
+
+def _step_optimizer(
+    *,
+    model: WindowJEPA | DistributedDataParallel,
+    optimizer: torch.optim.Optimizer,
+    grad_scaler: Any,
+    precision: str,
+    gradient_clip: float,
+    world_size: int,
+) -> tuple[torch.Tensor, bool]:
+    """Unscale once, clip, and synchronously step or skip every DDP rank."""
+
+    grad_scaler.unscale_(optimizer)
+    gradient_norm = torch.nn.utils.clip_grad_norm_(
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        gradient_clip,
+        error_if_nonfinite=(precision != "fp16"),
+    )
+    gradient_finite = torch.isfinite(gradient_norm).to(dtype=torch.int32)
+    if world_size > 1:
+        distributed.all_reduce(gradient_finite, op=distributed.ReduceOp.MIN)
+    optimizer_step_skipped = not bool(gradient_finite)
+    if optimizer_step_skipped and precision != "fp16":
+        raise FloatingPointError("non-finite gradient")
+    # Enabled GradScaler skips optimizer.step and resets its growth tracker when
+    # unscale_ observed a non-finite gradient. DDP-reduced gradients make that
+    # decision identical on every rank; the explicit flag controls EMA/step logs.
+    grad_scaler.step(optimizer)
+    grad_scaler.update()
+    return gradient_norm, optimizer_step_skipped
 
 
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -462,6 +554,11 @@ def _write_tensorboard_metrics(writer: Any, record: dict[str, Any]) -> None:
         ),
         ("mask/empty_target_fraction", record["mask_empty_target_fraction"]),
         ("optimization/learning_rate", record["learning_rate"]),
+        ("optimization/loss_scale", record["loss_scale"]),
+        (
+            "optimization/optimizer_step_skipped",
+            float(record["optimizer_step_skipped"]),
+        ),
     ):
         writer.add_scalar(name, value, step)
     if "recurrent_state_rms" in record:
@@ -546,6 +643,7 @@ def _recurrent_backward(
     device: torch.device,
     world_size: int,
     initial_state: RecurrentState | None = None,
+    grad_scaler: Any | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, RecurrentState]:
     """Run BPTT inside a batch and return state for optional cross-batch TBPTT."""
 
@@ -594,15 +692,21 @@ def _recurrent_backward(
                 raise FloatingPointError("non-finite loss in recurrent BPTT chunk")
             chunk_steps = end - start
             weight = chunk_steps / total_supervised
-            (output.loss * weight).backward()
+            _backward(output.loss * weight, grad_scaler)
         state = output.online_state
         accumulated_metrics += _output_metric_tensor(output) * chunk_steps
 
     if state is None:
         raise RuntimeError("recurrent training did not produce online state")
+    state_rms = _recurrent_state_rms(state)
+    state_finite = torch.isfinite(state_rms).to(dtype=torch.int32)
+    if world_size > 1:
+        distributed.all_reduce(state_finite, op=distributed.ReduceOp.MIN)
+    if not bool(state_finite):
+        raise FloatingPointError("non-finite recurrent state after TBPTT")
     return (
         accumulated_metrics / total_supervised,
-        _recurrent_state_rms(state),
+        state_rms,
         state,
     )
 
@@ -614,6 +718,7 @@ def _feedforward_sequence_backward(
     config: ExperimentConfig,
     device: torch.device,
     world_size: int,
+    grad_scaler: Any | None = None,
 ) -> torch.Tensor:
     """Train independent clip frames with one DDP forward/backward operation."""
 
@@ -647,7 +752,7 @@ def _feedforward_sequence_backward(
         raise FloatingPointError("non-finite loss in feedforward sequence batch")
     if output.prediction_sequence is None or output.target_sequence is None:
         raise RuntimeError("feedforward sequence objective did not retain latent sequences")
-    output.loss.backward()
+    _backward(output.loss, grad_scaler)
     return _output_metric_tensor(output)
 
 
@@ -658,6 +763,7 @@ def train(
 ) -> None:
     world_size, rank, local_rank, device = _distributed_context()
     _seed_everything(config.runtime.seed, rank)
+    _validate_precision_support(device, config.optimization.precision, world_size)
     milestones = tuple(sorted(set(milestone_epochs)))
     if any(epoch <= 0 or epoch > config.optimization.epochs for epoch in milestones):
         raise ValueError("milestone epochs must lie inside the configured training run")
@@ -720,6 +826,7 @@ def train(
         lr=config.optimization.learning_rate,
         weight_decay=config.optimization.weight_decay,
     )
+    grad_scaler = _make_grad_scaler(device, config.optimization.precision)
 
     output_dir = _project_output_path(config.runtime.output_dir)
     if rank == 0:
@@ -744,9 +851,13 @@ def train(
             world_size=world_size,
             steps_per_epoch=len(loader),
             rank=rank,
+            grad_scaler=grad_scaler,
         )
-        if global_step != start_epoch * len(loader):
-            raise ValueError("checkpoint is not aligned to a completed epoch boundary")
+        completed_attempts = start_epoch * len(loader)
+        if not 0 <= global_step <= completed_attempts:
+            raise ValueError(
+                "checkpoint optimizer-update count is incompatible with its epoch"
+            )
 
     total_steps = config.optimization.epochs * len(loader)
     warmup_steps = config.optimization.warmup_epochs * len(loader)
@@ -760,7 +871,8 @@ def train(
         )
         print(
             "[window-jepa] training ready: "
-            f"device={device}, epochs={config.optimization.epochs}, "
+            f"device={device}, precision={config.optimization.precision}, "
+            f"epochs={config.optimization.epochs}, "
             f"steps_per_epoch={len(loader)}, trainable_parameters={trainable_parameters:,}, "
             f"tensorboard={output_dir / 'tensorboard'}",
             flush=True,
@@ -822,6 +934,7 @@ def train(
             previous_stream_contract: MixedStreamContract | None = None
             try:
                 for step_in_epoch, raw_batch in enumerate(progress):
+                    attempt_step = epoch * len(loader) + step_in_epoch + 1
                     if mixed_batch_sampler is not None:
                         previous_stream_contract = _validate_mixed_recurrent_batch(
                             raw_batch,
@@ -873,6 +986,7 @@ def train(
                             device=device,
                             world_size=world_size,
                             initial_state=initial_state,
+                            grad_scaler=grad_scaler,
                         )
                         carried_recurrent_state = (
                             detach_recurrent_state(final_recurrent_state)
@@ -886,6 +1000,7 @@ def train(
                             config=config,
                             device=device,
                             world_size=world_size,
+                            grad_scaler=grad_scaler,
                         )
                     else:
                         with _autocast_context(device, config.optimization.precision):
@@ -907,30 +1022,30 @@ def train(
                             raise FloatingPointError(
                                 f"non-finite loss at global step {global_step}"
                             )
-                        output.loss.backward()
+                        _backward(output.loss, grad_scaler)
                         output_metrics = _output_metric_tensor(output)
-                    gradient_norm = torch.nn.utils.clip_grad_norm_(
-                        (
-                            parameter
-                            for parameter in model.parameters()
-                            if parameter.requires_grad
-                        ),
-                        config.optimization.gradient_clip,
-                        error_if_nonfinite=True,
+                    gradient_norm, optimizer_step_skipped = _step_optimizer(
+                        model=model,
+                        optimizer=optimizer,
+                        grad_scaler=grad_scaler,
+                        precision=config.optimization.precision,
+                        gradient_clip=config.optimization.gradient_clip,
+                        world_size=world_size,
                     )
-                    optimizer.step()
                     momentum = ema_momentum_at_step(
                         global_step,
                         total_steps,
                         config.optimization.target_ema_start,
                         config.optimization.target_ema_end,
                     )
-                    _unwrap(model).update_target_encoder(momentum)
-                    global_step += 1
+                    if not optimizer_step_skipped:
+                        _unwrap(model).update_target_encoder(momentum)
+                        global_step += 1
 
                     should_log = (
                         global_step % config.runtime.log_every_steps == 0
                         or step_in_epoch + 1 == len(loader)
+                        or optimizer_step_skipped
                     )
                     if should_log:
                         temporal_selection = (
@@ -973,6 +1088,7 @@ def train(
                             record = {
                                 "epoch": epoch,
                                 "step_in_epoch": step_in_epoch,
+                                "attempt_step": attempt_step,
                                 "global_step": global_step,
                                 "loss": float(metric_values[0]),
                                 "masked_loss": float(metric_values[1]),
@@ -1006,6 +1122,8 @@ def train(
                                 ),
                                 "learning_rate": learning_rate,
                                 "ema_momentum": momentum,
+                                "loss_scale": float(grad_scaler.get_scale()),
+                                "optimizer_step_skipped": optimizer_step_skipped,
                             }
                             if config.recurrent.enabled:
                                 record["recurrent_state_rms"] = float(metric_values[16])
@@ -1045,6 +1163,7 @@ def train(
                         world_size=world_size,
                         steps_per_epoch=len(loader),
                         rng_states=rng_states,
+                        grad_scaler=grad_scaler,
                     )
                     if epoch + 1 in milestones:
                         save_checkpoint_atomic(
@@ -1057,6 +1176,7 @@ def train(
                             world_size=world_size,
                             steps_per_epoch=len(loader),
                             rng_states=rng_states,
+                            grad_scaler=grad_scaler,
                         )
                 if world_size > 1:
                     distributed.barrier()

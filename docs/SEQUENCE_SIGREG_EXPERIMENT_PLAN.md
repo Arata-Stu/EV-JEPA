@@ -52,6 +52,11 @@ project rootはcode checkoutが`/home/iASL/Arata_repo/EV-JEPA`にある前提の
 checkout名が異なる場合は`cd`先だけを変更すればよく、runner自身は配置場所からproject rootを
 自動解決する。
 
+runner自体はserver構成を固定せず、`--nproc-per-node 1`では単一process、2以上では
+single-node DDPを使う。`--nproc-per-node auto`は`CUDA_VISIBLE_DEVICES`で見えているGPUを
+すべて使うため、共有serverでは必ず先に利用対象を絞る。GPU数やGPU種類を変えた結果は
+R0基準とは別条件であり、同じStage内の比較途中では変更しない。
+
 ## 全段階で固定する条件
 
 比較対象以外は次を固定する。
@@ -88,12 +93,21 @@ mask、tube mask、augmentation追加、teacherless化はこの3段階では変�
 - gradient accumulationはSIGRegの同時標本数を増やさないため、Stage 3では
   `global_batch = per_rank_batch × world_size`を明記する。
 
-V100はnative BF16を前提にしないため、runnerの基準precisionは`fp32`とする。FP16等を将来
-試す場合は独立したscaling実験とし、Stage内の一部の条件だけprecisionを変更しない。
+runnerの既定precisionは既存手順と再現性を保つため`fp32`とする。V100では高速化用に
+`fp16`を明示でき、Ampere以降でnative BF16を使える場合は`bf16`を明示できる。さらに
+`--precision auto`は選択した全rankの共通能力を調べ、全台native BF16なら`bf16`、全台
+Volta以降なら`fp16`、それ以外なら`fp32`へ解決する。異種GPUでは最も低い共通precisionへ
+落とす。解決後の具体値はconfig、run ID、metadataへ記録され、`auto`自体は学習configへ
+渡さない。
 
-checkpoint resumeでは、作成時と同じworld size 3、per-rank batch、precision、resolved configを
-要求する。`--nproc-per-node`だけを1や2へ変えたresume、またはGPUを1台だけ減らしたresumeは
-行わず、新しいrunとして最初から実行する。
+`auto`はserver移行時の安全な初期選択であり、実験条件を自動的に同一にする機能ではない。
+新しいGPU構成では最初に独立したsmokeを行い、lossの有限性、checkpoint保存、速度、VRAMを
+確認する。その後の正式比較では解決されたworld sizeとprecisionを全条件で固定する。
+
+checkpoint resumeでは、作成時と同じworld size（R0基準では3）、per-rank batch、precision、
+resolved configを要求する。runnerはresume時の`auto`を拒否するため、元のrun IDまたは
+`launch_metadata.txt`にある具体値を指定する。`--nproc-per-node`だけを1や2へ変えたresume、
+またはGPUを1台だけ減らしたresumeは行わず、新しいrunとして最初から実行する。
 
 ## 命名規則
 
@@ -361,6 +375,35 @@ scriptはconfig準備、run一覧表示、inspection、事前学習をStage別�
 上書きを拒否する。Stage 3は実装gateが満たされるまで、未対応configを生成したふりをせず
 明示的に停止しなければならない。
 
+対応する実行指定は次のとおりである。
+
+| 指定 | 動作 |
+| --- | --- |
+| `--nproc-per-node 1` | launcherを介さない単一GPU実行 |
+| `--nproc-per-node N`（`N >= 2`） | `N` processのsingle-node DDP |
+| `--nproc-per-node auto` | 可視GPU数を使用。事前に`CUDA_VISIBLE_DEVICES`で対象を限定 |
+| `--precision fp32` | autocastなしの基準経路 |
+| `--precision fp16` | FP16 autocastとgradient scaling。V100/Volta以降向け |
+| `--precision bf16` | BF16 autocast。選択した全GPUのnative BF16を必須化 |
+| `--precision auto` | 全rank共通で`bf16`、`fp16`、`fp32`の順に安全な候補を選択 |
+
+FP16では動的gradient scalingを用いる。TBPTTの途中ではscaleを変更せず、全chunkのbackward後に
+一度だけunscaleとgradient clipを行う。非有限gradientが検出された更新ではoptimizerとEMAを全rankで
+同時にskipし、loss scaleを下げる。`loss_scale`と`optimizer_step_skipped`を記録し、GradScaler状態を
+checkpointへ含める。`attempt_step`はbatch試行数、`global_step`は成功したoptimizer更新数とする。
+FP32はautocastを使わない基準経路として常に残す。
+
+例えばV100 1台のportable smokeは次のように開始する。実行時には`auto`が
+`--nproc-per-node 1 --precision fp16`相当へ解決され、run IDも具体値を使う。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage 1 --action all --seed 0 --smoke \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --nproc-per-node auto --precision auto --batch-size 4
+```
+
 `sig-gpu5`では、最初に実行予定の全体像だけを表示する。以下の例はV100 3台、FP32、
 per-rank batch 4（global batch 12）を明示している。
 
@@ -452,8 +495,10 @@ resume時は、checkpoint作成時の`CUDA_VISIBLE_DEVICES`、`--nproc-per-node 
 実行する。`stage=ready`は計画表示専用であり、Stage 1の結果を見ずにStage 2まで一括実行する
 ことは許可しない。
 
-macOSは実行環境にせず、config生成・shell構文確認・差分確認までとする。GPU学習、PyTorchへ
-依存するcheckpoint確認、下流評価はserver PCのproject rootで行う。
+macOSは実行環境にせず、config生成・shell構文確認・差分確認までとする。`auto`はCUDA対応
+PyTorchを使ってGPUを調べるため、macOSでplan/prepareする場合はGPU数とprecisionを具体的に
+指定する。GPU学習、PyTorchへ依存するcheckpoint確認、下流評価はserver PCのproject rootで
+行う。
 
 ## 今回は固定・延期する軸
 

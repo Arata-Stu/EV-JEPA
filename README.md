@@ -148,8 +148,10 @@ PYTHONUNBUFFERED=1 window-jepa-pretrain \
 runnerも現時点ではStage 3の実行を明示的に拒否します。
 
 現在の基準serverは`/home/iASL/Arata_repo/EV-JEPA`、Gen1 datasetは
-`/home/iASL/Arata_repo/dataset/gen1_304x240`です。V100 3台ではnative BF16を前提にせず、
-FP32・3-process DDPを基準にします。per-rank batch 4ならglobal batchは12です。
+`/home/iASL/Arata_repo/dataset/gen1_304x240`です。再現用の既定値は従来どおり
+FP32・3-process DDPで、per-rank batch 4ならglobal batchは12です。runnerは単一GPUと
+複数GPUの両方に対応し、`--precision`には`auto|fp32|fp16|bf16`、
+`--nproc-per-node`には正の整数または`auto`を指定できます。
 
 ```bash
 cd /home/iASL/Arata_repo/EV-JEPA
@@ -174,6 +176,32 @@ smokeは1 epoch・2 global batchesで、通常runとは別IDになります。sm
 resumeではworld size、per-rank batch、precisionをcheckpoint作成時から変更しません。OOMで
 batchを下げる場合は一条件だけを変更せず、そのStageの全比較条件を同じbatchで最初から
 実行します。詳細とStage 1/2の3-GPU実行例は上記実験計画を参照してください。
+
+実行serverに合わせる場合は、先に利用対象だけを`CUDA_VISIBLE_DEVICES`で絞ってから
+`auto`を使います。選択した全GPUがAmpere以降でnative BF16対応ならBF16、全GPUが
+Volta/Turing以降ならFP16、それ以外はFP32へ解決されます。V100 1台なら次のsmokeは
+`np1`・`fp16`のrun IDとなり、`torchrun`を介さず単一processで実行されます。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage 1 --action all --seed 0 --smoke \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision auto --batch-size 4 --nproc-per-node auto
+```
+
+`auto`の解決にはCUDAが有効なPyTorch環境が必要なので、macOSで計画だけ表示する場合は
+`--precision fp32|fp16|bf16`と`--nproc-per-node N`を具体的に指定します。正式比較では
+smokeに表示された解決値を全条件で固定してください。resumeにも`auto`は使わず、run IDまたは
+`launch_metadata.txt`に記録された具体的なGPU数とprecisionを指定します。
+
+FP16経路はCUDA autocastに加えて動的gradient scalingを使います。TBPTTでは全chunkを同じ
+scaleでbackwardした後に一度だけunscale・gradient clip・optimizer stepを行います。overflow時は
+optimizerとEMAを両方skipし、`train.jsonl`とTensorBoardへ`loss_scale`および
+`optimizer_step_skipped`を記録します。GradScalerの状態もcheckpointへ保存されるため、同じ
+world size・batch・precisionで厳密resumeできます。`attempt_step`は処理したbatch数、
+`global_step`は成功したoptimizer更新数として区別します。FP32経路はautocastなしで従来どおり
+動作します。
 
 feedforwardの時系列設定例は
 [sequence_r0_feedforward_vits_gen1.yaml](configs/pretrain/sequence_r0_feedforward_vits_gen1.yaml)
@@ -353,9 +381,10 @@ CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc-per-node=3 \
   --config configs/pretrain/window_jepa_vits.yaml
 ```
 
-V100でこの低水準commandを直接使う場合、configの`optimization.precision`を`fp32`へ
-設定してください。Stage比較ではprecisionやbatchの取り違えを防ぐため、実験runnerを
-使用します。
+V100でこの低水準commandを直接使う場合、安全な基準は
+`optimization.precision: fp32`です。FP16を使う場合は`fp16`を明示し、先にsmokeで
+gradient scalingを含む学習経路を確認します。Stage比較ではprecisionやbatchの取り違えを
+防ぐため、実験runnerを使用します。
 
 比較用設定は以下です。
 
