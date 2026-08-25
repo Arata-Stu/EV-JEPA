@@ -374,10 +374,21 @@ if visible_devices < required_devices:
     raise SystemExit(
         f"requested {required_devices} processes but only {visible_devices} CUDA devices are visible"
     )
-if precision == "bf16" and not torch.cuda.is_bf16_supported():
-    raise SystemExit(
-        "precision=bf16 is unsupported by the visible GPU/PyTorch combination; use fp32"
-    )
+if precision == "bf16":
+    non_native_bf16 = []
+    for index in range(required_devices):
+        properties = torch.cuda.get_device_properties(index)
+        if properties.major < 8:
+            non_native_bf16.append(
+                f"device {index} ({properties.name}, capability="
+                f"{properties.major}.{properties.minor})"
+            )
+    if non_native_bf16 or not torch.cuda.is_bf16_supported():
+        details = ", ".join(non_native_bf16) or "PyTorch BF16 capability check failed"
+        raise SystemExit(
+            "precision=bf16 requires native Ampere-or-newer BF16 support; "
+            f"{details}. Use fp32"
+        )
 
 print(
     "[cuda-preflight] "
