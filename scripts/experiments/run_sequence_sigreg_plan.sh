@@ -11,11 +11,15 @@ SEED=0
 SELECTED_INPUT=10ch
 SELECTED_INPUT_EXPLICIT=0
 SELECTED_MODEL=clstm
-NPROC_PER_NODE=1
+NPROC_PER_NODE=3
 SAMPLE_INDEX=0
-DATA_ROOT=/media/noah-22/AT_SSD/dataset/evjepa/gen1_304x240
+DATA_ROOT=/home/iASL/Arata_repo/dataset/gen1_304x240
 OUTPUT_ROOT="$PROJECT_ROOT/outputs/pretrain/sequence_sigreg"
 PYTHON_BIN=${PYTHON_BIN:-python}
+PRECISION=fp32
+BATCH_SIZE=4
+WORKERS=4
+SMOKE=0
 RESUME=0
 
 usage() {
@@ -27,7 +31,11 @@ usage() {
     '  --seed N                 Non-negative training seed (default: 0)' \
     '  --selected-input INPUT   2ch or 10ch; required to execute Stage 2' \
     '  --selected-model MODEL   ff, cgru, or clstm for the Stage 3 plan' \
-    '  --nproc-per-node N       GPUs/processes for training (default: 1)' \
+    '  --nproc-per-node N       GPUs/processes for training (default: 3)' \
+    '  --precision MODE         fp32 or bf16 (default: fp32 for V100)' \
+    '  --batch-size N           Per-rank batch; even and >=2 (default: 4)' \
+    '  --workers N              DataLoader workers per rank (default: 4)' \
+    '  --smoke                  Isolated 1-epoch, 2-global-batch hardware check' \
     '  --sample-index N         Dataset sample used by inspect (default: 0)' \
     '  --data-root DIR          Processed Gen1 dataset root' \
     '  --output-root DIR        Experiment artifact root' \
@@ -42,6 +50,7 @@ usage() {
     '  * ready is plan-only: Stage 2 must wait for the selected Stage 1 input.' \
     '  * executing Stage 2 requires an explicit --selected-input.' \
     '  * Stage 3 can only be planned until SIGReg is implemented.' \
+    '  * smoke runs use a distinct run ID and cannot be resumed.' \
     '  * --resume is accepted only with --action plan or --action run.'
 }
 
@@ -84,6 +93,25 @@ while (($#)); do
       require_option_value "$@"
       NPROC_PER_NODE=$2
       shift 2
+      ;;
+    --precision)
+      require_option_value "$@"
+      PRECISION=$2
+      shift 2
+      ;;
+    --batch-size)
+      require_option_value "$@"
+      BATCH_SIZE=$2
+      shift 2
+      ;;
+    --workers)
+      require_option_value "$@"
+      WORKERS=$2
+      shift 2
+      ;;
+    --smoke)
+      SMOKE=1
+      shift
       ;;
     --sample-index)
       require_option_value "$@"
@@ -163,6 +191,33 @@ case "$NPROC_PER_NODE" in
     exit 2
     ;;
 esac
+case "$PRECISION" in
+  fp32|bf16) ;;
+  *)
+    printf 'Unsupported precision: %s (expected fp32 or bf16)\n' \
+      "$PRECISION" >&2
+    exit 2
+    ;;
+esac
+case "$BATCH_SIZE" in
+  ''|*[!0-9]*|0|1)
+    printf 'batch-size must be an even per-rank integer >=2: %s\n' \
+      "$BATCH_SIZE" >&2
+    exit 2
+    ;;
+esac
+if ((10#$BATCH_SIZE % 2 != 0)); then
+  printf '%s\n' \
+    'batch-size must be even because mixed sampling uses a 0.5 stream ratio.' >&2
+  exit 2
+fi
+case "$WORKERS" in
+  ''|*[!0-9]*)
+    printf 'workers must be a non-negative integer per rank: %s\n' \
+      "$WORKERS" >&2
+    exit 2
+    ;;
+esac
 case "$SAMPLE_INDEX" in
   ''|*[!0-9]*)
     printf 'sample-index must be a non-negative integer: %s\n' "$SAMPLE_INDEX" >&2
@@ -171,6 +226,10 @@ case "$SAMPLE_INDEX" in
 esac
 if [[ "$RESUME" == 1 && "$ACTION" != plan && "$ACTION" != run ]]; then
   printf '%s\n' '--resume is accepted only with --action plan or --action run.' >&2
+  exit 2
+fi
+if [[ "$RESUME" == 1 && "$SMOKE" == 1 ]]; then
+  printf '%s\n' '--smoke cannot be combined with --resume.' >&2
   exit 2
 fi
 if [[ "$STAGE" == ready && "$ACTION" != plan ]]; then
@@ -206,6 +265,18 @@ if [[ "$DATA_ROOT" == *$'\n'* || "$OUTPUT_ROOT" == *$'\n'* ]]; then
 fi
 
 TRAIN_MANIFEST="$DATA_ROOT/manifests/train.jsonl"
+GLOBAL_BATCH_SIZE=$((10#$NPROC_PER_NODE * 10#$BATCH_SIZE))
+RUN_SUFFIX="np${NPROC_PER_NODE}_bs${BATCH_SIZE}_${PRECISION}_seed${SEED}"
+if [[ "$SMOKE" == 1 ]]; then
+  RUN_SUFFIX="${RUN_SUFFIX}_smoke"
+  CONFIG_SAMPLES_PER_EPOCH=$((2 * GLOBAL_BATCH_SIZE))
+  CONFIG_EPOCHS=1
+  CONFIG_WARMUP_EPOCHS=0
+else
+  CONFIG_SAMPLES_PER_EPOCH=6250
+  CONFIG_EPOCHS=100
+  CONFIG_WARMUP_EPOCHS=10
+fi
 SPEC_STAGES=()
 SPEC_RUN_IDS=()
 SPEC_INPUTS=()
@@ -219,16 +290,16 @@ add_spec() {
 }
 
 add_stage1_specs() {
-  add_spec 1 "s1_input_2ch_ff_nosig_seed${SEED}" 2ch ff
-  add_spec 1 "s1_input_10ch_ff_nosig_seed${SEED}" 10ch ff
+  add_spec 1 "s1_input_2ch_ff_nosig_${RUN_SUFFIX}" 2ch ff
+  add_spec 1 "s1_input_10ch_ff_nosig_${RUN_SUFFIX}" 10ch ff
 }
 
 add_stage2_specs() {
-  add_spec 2 "s2_input_${SELECTED_INPUT}_ff_nosig_seed${SEED}" \
+  add_spec 2 "s2_input_${SELECTED_INPUT}_ff_nosig_${RUN_SUFFIX}" \
     "$SELECTED_INPUT" ff
-  add_spec 2 "s2_input_${SELECTED_INPUT}_cgru_nosig_seed${SEED}" \
+  add_spec 2 "s2_input_${SELECTED_INPUT}_cgru_nosig_${RUN_SUFFIX}" \
     "$SELECTED_INPUT" cgru
-  add_spec 2 "s2_input_${SELECTED_INPUT}_clstm_nosig_seed${SEED}" \
+  add_spec 2 "s2_input_${SELECTED_INPUT}_clstm_nosig_${RUN_SUFFIX}" \
     "$SELECTED_INPUT" clstm
 }
 
@@ -255,10 +326,10 @@ print_stage3_plan() {
   printf '%s\n' \
     '' \
     'Stage 3 (planned, BLOCKED):' \
-    "  ${prefix}_nosig_seed${SEED}" \
-    "  ${prefix}_sigreg_global_seed${SEED}" \
-    "  ${prefix}_sigreg_tc_seed${SEED}" \
-    "  ${prefix}_sigreg_event_tc_seed${SEED}" \
+    "  ${prefix}_nosig_${RUN_SUFFIX}" \
+    "  ${prefix}_sigreg_global_${RUN_SUFFIX}" \
+    "  ${prefix}_sigreg_tc_${RUN_SUFFIX}" \
+    "  ${prefix}_sigreg_event_tc_${RUN_SUFFIX}" \
     '  BLOCKED: the SIGReg loss/projector/objective is not implemented yet.' \
     '  No placeholder config is generated, so these conditions cannot silently' \
     '  run as the current EMA-JEPA baseline.'
@@ -366,11 +437,17 @@ validate_config_content() {
   model_setting=$(expected_model_setting "$model")
 
   grep -Fqx "  manifest: $TRAIN_MANIFEST" "$config"
+  grep -Fqx "  samples_per_epoch: $CONFIG_SAMPLES_PER_EPOCH" "$config"
+  grep -Fqx "  batch_size: $BATCH_SIZE" "$config"
+  grep -Fqx "  workers: $WORKERS" "$config"
   grep -Fqx "  temporal_bins: $bins" "$config"
   grep -Fqx '  split_polarity: true' "$config"
   grep -Fqx "  objective: $objective" "$config"
+  grep -Fqx "  epochs: $CONFIG_EPOCHS" "$config"
+  grep -Fqx "  warmup_epochs: $CONFIG_WARMUP_EPOCHS" "$config"
   grep -Fqx "  seed: $SEED" "$config"
   grep -Fqx "  output_dir: $output_path" "$config"
+  grep -Fqx "  precision: $PRECISION" "$config"
   grep -Fqx "$model_setting" "$config"
   grep -Fqx '  variance_weight: 0.0' "$config"
   grep -Fqx '  covariance_weight: 0.0' "$config"
@@ -413,18 +490,38 @@ prepare_one() {
   temporary=$(mktemp "${TMPDIR:-/tmp}/evjepa-sequence-plan.XXXXXX")
   cp "$template" "$temporary"
   CONFIG_MANIFEST="$TRAIN_MANIFEST" \
+  CONFIG_SAMPLES="$CONFIG_SAMPLES_PER_EPOCH" \
   CONFIG_BINS="$bins" \
+  CONFIG_BATCH_SIZE="$BATCH_SIZE" \
+  CONFIG_WORKERS="$WORKERS" \
+  CONFIG_PRECISION="$PRECISION" \
+  CONFIG_EPOCHS_VALUE="$CONFIG_EPOCHS" \
+  CONFIG_WARMUP="$CONFIG_WARMUP_EPOCHS" \
   CONFIG_SEED="$SEED" \
   CONFIG_OUTPUT="$output_path" \
     perl -0pi -e '
       s{(?m)^  manifest:.*$}{  manifest: $ENV{CONFIG_MANIFEST}};
+      s{(?m)^  samples_per_epoch:.*$}{  samples_per_epoch: $ENV{CONFIG_SAMPLES}};
+      s{(?m)^  batch_size:.*$}{  batch_size: $ENV{CONFIG_BATCH_SIZE}};
+      s{(?m)^  workers:.*$}{  workers: $ENV{CONFIG_WORKERS}};
       s{(?m)^  temporal_bins:.*$}{  temporal_bins: $ENV{CONFIG_BINS}};
+      s{(?m)^  epochs:.*$}{  epochs: $ENV{CONFIG_EPOCHS_VALUE}};
+      s{(?m)^  warmup_epochs:.*$}{  warmup_epochs: $ENV{CONFIG_WARMUP}};
+      s{(?m)^  precision:.*$}{  precision: $ENV{CONFIG_PRECISION}};
       s{(?m)^  seed:.*$}{  seed: $ENV{CONFIG_SEED}};
       s{(?m)^  output_dir:.*$}{  output_dir: $ENV{CONFIG_OUTPUT}};
+      s{(?m)^  # Sequence mode counts clips\.[^\n]*\n  # nominal signal[^\n]*}
+       {  # Sequence mode counts clips; samples_per_epoch is global across ranks.\n  # Each clip contains eight supervised steps.};
+      s{(?m)^  # Recurrent mode counts clips, not individual windows\.[^\n]*\n  # supervised steps[^\n]*}
+       {  # Recurrent mode counts clips; samples_per_epoch is global across ranks.\n  # Each clip contains eight supervised steps.};
     ' "$temporary"
   if [[ "$model" == cgru ]]; then
     perl -0pi -e 's/conv_lstm/conv_gru/g; s/ConvLSTM/ConvGRU/g' "$temporary"
   fi
+  perl -0pi -e '
+    s{# RVT-style mixed batching: per-rank batch 4 = 2 stream \+ 2 random clips\.}
+     {# RVT-style mixed batching: half stream and half random clips per rank.};
+  ' "$temporary"
   validate_config_content "$temporary" "$stage" "$run_id" "$input" "$model"
 
   mkdir -p "$(dirname "$directory")"
@@ -436,13 +533,21 @@ prepare_one() {
   checksum=$(sha256_file "$config")
   printf '%s  %s\n' "$checksum" "$(basename "$config")" > "$directory/launch_config.sha256"
   {
-    printf 'format=1\n'
+    printf 'format=2\n'
     printf 'stage=%s\n' "$stage"
     printf 'run_id=%s\n' "$run_id"
     printf 'seed=%s\n' "$SEED"
     printf 'input=%s\n' "$input"
     printf 'model=%s\n' "$model"
     printf 'nproc_per_node=%s\n' "$NPROC_PER_NODE"
+    printf 'batch_size_per_rank=%s\n' "$BATCH_SIZE"
+    printf 'global_batch_size=%s\n' "$GLOBAL_BATCH_SIZE"
+    printf 'workers_per_rank=%s\n' "$WORKERS"
+    printf 'precision=%s\n' "$PRECISION"
+    printf 'smoke=%s\n' "$SMOKE"
+    printf 'samples_per_epoch=%s\n' "$CONFIG_SAMPLES_PER_EPOCH"
+    printf 'epochs=%s\n' "$CONFIG_EPOCHS"
+    printf 'warmup_epochs=%s\n' "$CONFIG_WARMUP_EPOCHS"
     printf 'train_manifest=%s\n' "$TRAIN_MANIFEST"
   } > "$directory/launch_metadata.txt"
   printf 'Prepared: %s\n' "$config"
@@ -471,12 +576,23 @@ require_prepared() {
     exit 1
   fi
   validate_config_content "$config" "$stage" "$run_id" "$input" "$model"
+  grep -Fqx 'format=2' "$directory/launch_metadata.txt"
   grep -Fqx "stage=$stage" "$directory/launch_metadata.txt"
   grep -Fqx "run_id=$run_id" "$directory/launch_metadata.txt"
   grep -Fqx "seed=$SEED" "$directory/launch_metadata.txt"
   grep -Fqx "input=$input" "$directory/launch_metadata.txt"
   grep -Fqx "model=$model" "$directory/launch_metadata.txt"
   grep -Fqx "nproc_per_node=$NPROC_PER_NODE" "$directory/launch_metadata.txt"
+  grep -Fqx "batch_size_per_rank=$BATCH_SIZE" "$directory/launch_metadata.txt"
+  grep -Fqx "global_batch_size=$GLOBAL_BATCH_SIZE" "$directory/launch_metadata.txt"
+  grep -Fqx "workers_per_rank=$WORKERS" "$directory/launch_metadata.txt"
+  grep -Fqx "precision=$PRECISION" "$directory/launch_metadata.txt"
+  grep -Fqx "smoke=$SMOKE" "$directory/launch_metadata.txt"
+  grep -Fqx "samples_per_epoch=$CONFIG_SAMPLES_PER_EPOCH" \
+    "$directory/launch_metadata.txt"
+  grep -Fqx "epochs=$CONFIG_EPOCHS" "$directory/launch_metadata.txt"
+  grep -Fqx "warmup_epochs=$CONFIG_WARMUP_EPOCHS" \
+    "$directory/launch_metadata.txt"
   grep -Fqx "train_manifest=$TRAIN_MANIFEST" "$directory/launch_metadata.txt"
 }
 
@@ -661,7 +777,10 @@ print_plan() {
   printf '%s\n' \
     'Sequence/SIGReg staged experiment plan' \
     "  seed=$SEED selected_input=$SELECTED_INPUT selected_model=$SELECTED_MODEL" \
-    "  nproc_per_node=$NPROC_PER_NODE" \
+    "  nproc_per_node=$NPROC_PER_NODE precision=$PRECISION" \
+    "  batch_size_per_rank=$BATCH_SIZE global_batch_size=$GLOBAL_BATCH_SIZE" \
+    "  workers_per_rank=$WORKERS total_worker_processes=$((10#$NPROC_PER_NODE * 10#$WORKERS))" \
+    "  smoke=$SMOKE samples_per_epoch=$CONFIG_SAMPLES_PER_EPOCH epochs=$CONFIG_EPOCHS warmup_epochs=$CONFIG_WARMUP_EPOCHS" \
     "  manifest=$TRAIN_MANIFEST" \
     "  output_root=$OUTPUT_ROOT"
   for ((index = 0; index < ${#SPEC_RUN_IDS[@]}; index++)); do

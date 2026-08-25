@@ -120,10 +120,13 @@ feature pyramidや階層型ViTではありません。保持context patchから�
 visible/maskedの両方を含むdense lossを4深度で平均します。
 
 ```bash
-cd ~/Arata_ws/EV-JEPA
+cd /home/iASL/Arata_repo/EV-JEPA
 PYTHONUNBUFFERED=1 window-jepa-pretrain \
   --config configs/pretrain/window_jepa21_vits_gen1.yaml
 ```
+
+この単体設定は既存のBF16設定を直接読む例です。V100 3台でのStage 1〜3比較には、後述の
+実験runnerでFP32へ解決したconfigを使用します。
 
 ### 時系列loaderと時間モデルの切り替え
 
@@ -143,6 +146,34 @@ PYTHONUNBUFFERED=1 window-jepa-pretrain \
 実行入口は[scripts/experiments/run_sequence_sigreg_plan.sh](scripts/experiments/run_sequence_sigreg_plan.sh)
 です。Stage 1と2の事前学習経路は実装済みですが、Stage 3のSIGReg lossは未実装のため、
 runnerも現時点ではStage 3の実行を明示的に拒否します。
+
+現在の基準serverは`/home/iASL/Arata_repo/EV-JEPA`、Gen1 datasetは
+`/home/iASL/Arata_repo/dataset/gen1_304x240`です。V100 3台ではnative BF16を前提にせず、
+FP32・3-process DDPを基準にします。per-rank batch 4ならglobal batchは12です。
+
+```bash
+cd /home/iASL/Arata_repo/EV-JEPA
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage ready --action plan \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision fp32 --batch-size 4 --nproc-per-node 3
+```
+
+計画表示の次は、正式学習より先に同じ3 GPUで独立したhardware smokeを実行します。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage 1 --action all --seed 0 --smoke \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision fp32 --batch-size 4 --nproc-per-node 3
+```
+
+smokeは1 epoch・2 global batchesで、通常runとは別IDになります。smokeからはresumeしません。
+resumeではworld size、per-rank batch、precisionをcheckpoint作成時から変更しません。OOMで
+batchを下げる場合は一条件だけを変更せず、そのStageの全比較条件を同じbatchで最初から
+実行します。詳細とStage 1/2の3-GPU実行例は上記実験計画を参照してください。
 
 feedforwardの時系列設定例は
 [sequence_r0_feedforward_vits_gen1.yaml](configs/pretrain/sequence_r0_feedforward_vits_gen1.yaml)
@@ -230,7 +261,8 @@ JEPAのcontext/target maskは空間augmentationとは別で、現在はstepご�
 recurrent設定での`data.samples_per_epoch`はwindow数ではなく**clip数**です。標準設定の
 6250 clips × 8 supervised stepsは、1 epochあたり約50,000 supervised windowsの
 公称値です。実際は全rankで完全なglobal batchだけを使うため端数を切り捨てます
-（1 GPU・batch 4なら6248 clips、49,984 supervised windows）。
+（V100 3台・per-rank batch 4ならglobal batch 12となり、6240 clips、49,920 supervised
+windows）。
 時系列tensorは大きいため、feedforward設定のbatch size 64をそのまま流用せず、まず
 標準設定のbatch size 4からGPU memoryに合わせて調整してください。
 
@@ -316,10 +348,14 @@ tensorboard --logdir outputs/window_jepa_vits/tensorboard --port 6006
 複数GPUでは次の形です。
 
 ```bash
-torchrun --standalone --nproc-per-node=4 \
+CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc-per-node=3 \
   -m event_window_jepa.train.pretrain \
   --config configs/pretrain/window_jepa_vits.yaml
 ```
+
+V100でこの低水準commandを直接使う場合、configの`optimization.precision`を`fp32`へ
+設定してください。Stage比較ではprecisionやbatchの取り違えを防ぐため、実験runnerを
+使用します。
 
 比較用設定は以下です。
 

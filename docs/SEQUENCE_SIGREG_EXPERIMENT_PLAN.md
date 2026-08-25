@@ -32,6 +32,26 @@ Stage 2では、既存のGen1 ROI probeとYOLOX Detectionがrecurrent checkpoint
 Stage 3で使用予定の`patch_event_activity: [B,T,P]`はloaderに実装済みだが、
 `return_patch_event_activity: true`へ変更しただけではSIGRegは有効にならない。
 
+## 実行server
+
+R0の基準実行環境は`sig-gpu5`に固定する。
+
+| 項目 | 値 |
+| --- | --- |
+| project root | `/home/iASL/Arata_repo/EV-JEPA` |
+| dataset root | `/home/iASL/Arata_repo/dataset` |
+| Gen1 root | `/home/iASL/Arata_repo/dataset/gen1_304x240` |
+| GPU | NVIDIA V100 × 3 |
+| DDP | single-node、3 processes |
+| visible devicesの基準 | `CUDA_VISIBLE_DEVICES=0,1,2` |
+
+学習前に`nvidia-smi`で3台が空いていることとGPU indexを確認する。別のindexを使う場合も、
+同じ比較とresumeの間は`CUDA_VISIBLE_DEVICES`の順序を固定する。runnerはproject内の相対pathから
+起動できるが、datasetは必ず上記Gen1 rootを`--data-root`へ明示する。
+project rootはcode checkoutが`/home/iASL/Arata_repo/EV-JEPA`にある前提の例である。実際の
+checkout名が異なる場合は`cd`先だけを変更すればよく、runner自身は配置場所からproject rootを
+自動解決する。
+
 ## 全段階で固定する条件
 
 比較対象以外は次を固定する。
@@ -51,7 +71,7 @@ Stage 3で使用予定の`patch_event_activity: [B,T,P]`はloaderに実装済み
 | geometry augmentation | horizontal flipのみ。clip内で共有し、streamではrecording内で共有 |
 | optimizer schedule | 100 epochs、10 epochs warmup、同じLR・weight decay |
 | supervised signal / epoch | 約50,000 windows |
-| precision | bf16（SIGReg統計だけは将来FP32） |
+| precision | FP32（V100用のR0基準。SIGReg統計もFP32） |
 
 入力解像度とcropがともに240×304なので、現在のrandom cropは恒等変換である。
 mask、tube mask、augmentation追加、teacherless化はこの3段階では変更しない。
@@ -63,16 +83,30 @@ mask、tube mask、augmentation追加、teacherless化はこの3段階では変�
 - dataset manifest、world size、per-rank batch、GPU種類、commit、resolved configを
   runごとに記録する。
 - GPU数またはbatch sizeを変更したrunは、同じseedでも別条件として扱う。
+- V100 3台では`global_batch = per_rank_batch × 3`である。基準のper-rank batch 4では
+  global batchは12となる。
 - gradient accumulationはSIGRegの同時標本数を増やさないため、Stage 3では
   `global_batch = per_rank_batch × world_size`を明記する。
+
+V100はnative BF16を前提にしないため、runnerの基準precisionは`fp32`とする。FP16等を将来
+試す場合は独立したscaling実験とし、Stage内の一部の条件だけprecisionを変更しない。
+
+checkpoint resumeでは、作成時と同じworld size 3、per-rank batch、precision、resolved configを
+要求する。`--nproc-per-node`だけを1や2へ変えたresume、またはGPUを1台だけ減らしたresumeは
+行わず、新しいrunとして最初から実行する。
 
 ## 命名規則
 
 run IDは比較軸が名前から分かるようにする。
 
 ```text
-s{stage}_{input}_{model}_{regularizer}_seed{seed}
+s{stage}_{input}_{model}_{regularizer}_np{world_size}_bs{per_rank_batch}_{precision}_seed{seed}[_smoke]
 ```
+
+例えばV100 3台の基準条件は
+`s1_input_2ch_ff_nosig_np3_bs4_fp32_seed0`となる。`_smoke`は1 epoch・2 global batchesの
+hardware確認専用で、正式runとは別artifactとして保持する。world size、per-rank batch、
+precisionをrun IDへ含めることで、互換性のないcheckpointを誤ってresumeしない。
 
 短縮名は次に固定する。
 
@@ -108,8 +142,8 @@ channelとして残す方が有効かを調べる。この段階ではどちら�
 
 | run | `temporal_bins` | encoder入力 | 時系列処理 |
 | --- | ---: | --- | --- |
-| `s1_input_2ch_ff_nosig_seedN` | 1 | `[B,T,2,H,W]` | 各50 msを独立に空間処理 |
-| `s1_input_10ch_ff_nosig_seedN` | 5 | `[B,T,10,H,W]` | 各50 msを独立に空間処理 |
+| `s1_input_2ch_ff_nosig_np3_bs4_fp32_seedN` | 1 | `[B,T,2,H,W]` | 各50 msを独立に空間処理 |
+| `s1_input_10ch_ff_nosig_np3_bs4_fp32_seedN` | 5 | `[B,T,10,H,W]` | 各50 msを独立に空間処理 |
 
 `input_10ch`の各binは10 ms相当だが、5回のrecurrent updateではない。5 bin×2 polarityを
 10 channelとして一度にpatch projectionへ渡す。総window長、event集合、sequence sample、
@@ -136,9 +170,9 @@ Stage 1で固定した50 ms入力に対し、過去stateを持たないencoder�
 
 | run | `temporal_model` | objective | state |
 | --- | --- | --- | --- |
-| `s2_input_{2ch,10ch}_ff_nosig_seedN` | `feedforward` | `sequence_dense_window_jepa` | なし |
-| `s2_input_{2ch,10ch}_cgru_nosig_seedN` | `conv_gru` | `recurrent_dense_window_jepa` | hidden |
-| `s2_input_{2ch,10ch}_clstm_nosig_seedN` | `conv_lstm` | `recurrent_dense_window_jepa` | hidden + cell |
+| `s2_input_{2ch,10ch}_ff_nosig_np3_bs4_fp32_seedN` | `feedforward` | `sequence_dense_window_jepa` | なし |
+| `s2_input_{2ch,10ch}_cgru_nosig_np3_bs4_fp32_seedN` | `conv_gru` | `recurrent_dense_window_jepa` | hidden |
+| `s2_input_{2ch,10ch}_clstm_nosig_np3_bs4_fp32_seedN` | `conv_lstm` | `recurrent_dense_window_jepa` | hidden + cell |
 
 全条件で同じsequence loaderとloss-bearing 8 stepsを使う。ConvGRU/ConvLSTMは2 stepsの
 burn-inでstateを作り、stream laneはbatch境界を越えてdetach済みstateを継承する。
@@ -182,10 +216,14 @@ SIGRegなしを対照に含めるため、実験条件は3種類ではなく4条
 
 | run | regularizer | 対象 |
 | --- | --- | --- |
-| `s3_bestmodel_nosig_seedN` | なし | EMA-JEPA baseline |
-| `s3_bestmodel_sigreg_global_seedN` | Global SIGReg | 各時刻のframe latent |
-| `s3_bestmodel_sigreg_tc_seedN` | TC-SIGReg | clip内時間中心を引いたframe residual |
-| `s3_bestmodel_sigreg_event_tc_seedN` | Event-Support TC-SIGReg | active patchの時間residual |
+| `s3_input_X_MODEL_nosig_np3_bs4_fp32_seedN` | なし | EMA-JEPA baseline |
+| `s3_input_X_MODEL_sigreg_global_np3_bs4_fp32_seedN` | Global SIGReg | 各時刻のframe latent |
+| `s3_input_X_MODEL_sigreg_tc_np3_bs4_fp32_seedN` | TC-SIGReg | clip内時間中心を引いたframe residual |
+| `s3_input_X_MODEL_sigreg_event_tc_np3_bs4_fp32_seedN` | Event-Support TC-SIGReg | active patchの時間residual |
+
+ここで`X`はStage 1で選んだ`2ch`または`10ch`、`MODEL`はStage 2で選んだ
+`ff`、`cgru`、`clstm`のいずれかである。Stage 3でbatchを6へ増やした場合はrun IDも
+`bs6`となる。
 
 ### Stage 3で固定する仕様
 
@@ -240,6 +278,11 @@ SIGRegのglobal batchが小さ過ぎると統計が不安定になる。gradient
 同じforward内のglobal batchを使い、最初のscaling確認では少なくとも16、可能なら32以上を
 確保する。正式値は全Stage 3条件で固定して結果表へ記載する。
 
+基準のper-rank batch 4・V100 3台ではglobal batchは12なので、Stage 3の統計確認では不足する
+可能性がある。メモリに収まることをsmokeで確認した上で、例えばper-rank batch 6
+（global batch 18）へ増やす場合は、`nosig`を含むStage 3の全4条件を同じbatchで最初から
+実行する。Stage 1/2の途中で一条件だけbatchを変えて比較しない。
+
 ## 記録する指標
 
 ### 全段階
@@ -274,11 +317,14 @@ test splitを方式選択に使わない。
 1. configを生成し、比較軸以外のresolved差分がないことを確認する。
 2. 時系列inspection HTMLを保存し、窓の連続性、`loss_mask`、state reset、augmentation共有を
    目視確認する。
-3. `seed=0`で短いsmoke runを行い、forward/backward/checkpoint/resumeだけを確認する。
+3. `seed=0`で独立したsmoke runを行い、3-rankのforward/backward/checkpoint保存を確認する。
 4. `seed=0`の100-epoch R0を全条件で完走させ、崩壊・資源量を確認する。
 5. 正式比較では`seed=1,2`も同じ100 epochsで実行する。
 6. 同一sample集合で下流評価し、平均・標準偏差をまとめる。
 7. 選択規則を満たした条件名とcheckpoint hashを`selected_*.txt`へ固定して次Stageへ進む。
+
+`--smoke`は通常runと別IDであり、resume対象にしない。通常runが中断した場合だけ、同じ
+world size・per-rank batch・precision・resolved configでresume契約を確認する。
 
 100 epochs時点でもlossが改善している可能性があるため、相対lossの停滞を理由に早期終了しない。
 全条件を同じepoch数で比較し、100 epochs後の延長学習は選択後の別runとする。
@@ -299,7 +345,9 @@ test splitを方式選択に使わない。
 理由に途中で条件を打ち切らない。
 
 OOMで条件を変える場合は、その条件だけ再開せず、比較する全runを新しい共通条件で最初から
-やり直す。既存runは別IDで保持する。
+やり直す。例えばper-rank batch 4から2へ下げるなら、そのStageの全比較条件をbatch 2・
+global batch 6で新しいrunとして実行する。既存runは別IDで保持し、OOMしたcheckpointから
+batch sizeを変えてresumeしない。
 
 ## 実験script
 
@@ -313,36 +361,92 @@ scriptはconfig準備、run一覧表示、inspection、事前学習をStage別�
 上書きを拒否する。Stage 3は実装gateが満たされるまで、未対応configを生成したふりをせず
 明示的に停止しなければならない。
 
-server PCでは、最初に実行予定の全体像だけを表示する。
+`sig-gpu5`では、最初に実行予定の全体像だけを表示する。以下の例はV100 3台、FP32、
+per-rank batch 4（global batch 12）を明示している。
 
 ```bash
-cd /home/noah-22/Arata_ws/EV-JEPA
-bash scripts/experiments/run_sequence_sigreg_plan.sh --stage ready --action plan
+cd /home/iASL/Arata_repo/EV-JEPA
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage ready --action plan \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision fp32 --batch-size 4 --nproc-per-node 3
 ```
+
+次に、正式runを作る前の必須手順として、同じ3 GPUでStage 1のhardware smokeを実行する。
+`--smoke`は各条件を1 epoch・2 global batchesだけ実行し、通常runとは別の`_smoke`付きrun IDを
+使う。smokeはresumeせず、失敗時は原因を修正して新しい出力先でやり直す。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage 1 --action all --seed 0 --smoke \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision fp32 --batch-size 4 --nproc-per-node 3
+```
+
+smokeでは、3 rankが起動すること、各GPUへmodelが配置されること、forward/backward、
+checkpoint保存、時系列inspectionが成功することを確認する。smokeのloss値は方式選択には
+使用しない。Stage 2へ進んだ際も、選択したinputで3 modelの`--smoke`を先に完走させてから
+100-epoch runを開始する。
 
 Stage 1は、config生成、時系列inspection、2条件の事前学習を別々のactionで実行する。
 `--action all`を指定すれば、この3操作を順番にまとめて実行できる。
 
 ```bash
-bash scripts/experiments/run_sequence_sigreg_plan.sh --stage 1 --action prepare --seed 0 --nproc-per-node 2
-bash scripts/experiments/run_sequence_sigreg_plan.sh --stage 1 --action inspect --seed 0 --nproc-per-node 2
-bash scripts/experiments/run_sequence_sigreg_plan.sh --stage 1 --action run --seed 0 --nproc-per-node 2
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage 1 --action prepare --seed 0 \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision fp32 --batch-size 4 --nproc-per-node 3
+
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage 1 --action inspect --seed 0 \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision fp32 --batch-size 4 --nproc-per-node 3
+
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage 1 --action run --seed 0 \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision fp32 --batch-size 4 --nproc-per-node 3
 ```
 
 Stage 1で10 chを選んだ例では、Stage 2を次のように開始する。2 chを選んだ場合は
-`--selected-input 2ch`へ変更する。
+`--selected-input 2ch`へ変更する。まず3 modelのsmokeを完走させる。
 
 ```bash
-bash scripts/experiments/run_sequence_sigreg_plan.sh \
-  --stage 2 --action all --selected-input 10ch --seed 0 --nproc-per-node 2
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage 2 --action all --selected-input 10ch --seed 0 --smoke \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision fp32 --batch-size 4 --nproc-per-node 3
+```
+
+その後、同じ条件で正式runを開始する。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage 2 --action all --selected-input 10ch --seed 0 \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision fp32 --batch-size 4 --nproc-per-node 3
 ```
 
 中断後に同じworld size・configで再開する場合だけ、明示的に`--resume`を付ける。
 
 ```bash
-bash scripts/experiments/run_sequence_sigreg_plan.sh \
-  --stage 2 --action run --selected-input 10ch --seed 0 --nproc-per-node 2 --resume
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_sequence_sigreg_plan.sh \
+  --stage 2 --action run --selected-input 10ch --seed 0 \
+  --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+  --precision fp32 --batch-size 4 --nproc-per-node 3 --resume
 ```
+
+resume時は、checkpoint作成時の`CUDA_VISIBLE_DEVICES`、`--nproc-per-node 3`、
+`--precision fp32`、`--batch-size 4`を変更しない。world sizeやbatchを変えたい場合は
+`--resume`を付けず、新しいrun IDと共通条件でそのStage全体をやり直す。
 
 正式な3 seed比較では、各Stageの選択条件を固定した後に`--seed 0`、`1`、`2`を個別に
 実行する。`stage=ready`は計画表示専用であり、Stage 1の結果を見ずにStage 2まで一括実行する
