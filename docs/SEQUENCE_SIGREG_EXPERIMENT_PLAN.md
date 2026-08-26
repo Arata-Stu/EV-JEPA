@@ -22,12 +22,12 @@ Event Cameraの50 ms表現について、次の3段階を一度に混ぜず、�
 | 段階 | 比較軸 | 現在の状態 | 実行判定 |
 | --- | --- | --- | --- |
 | Stage 1 | 50 ms・2 ch / 50 ms・10 ch | `temporal_bins`切替とfeedforward sequence loaderは実装済み | 実行可能 |
-| Stage 2 | Feedforward / ConvGRU / ConvLSTM | 3 model、mixed BPTT/TBPTT loader、共有augmentationは実装済み | 事前学習は実行可能 |
+| Stage 2 | Feedforward / ConvGRU / ConvLSTM | 3 model、mixed BPTT/TBPTT loader、共有augmentation、stateful Detectionを実装済み | 実行・主評価可能 |
 | Stage 3 | SIGReg 3方式 | patch activityの返却だけ実装済み。SIGReg loss、projector、DDP統計は未実装 | まだ実行不可 |
 
-Stage 2では、既存のGen1 ROI probeとYOLOX Detectionがrecurrent checkpointを拒否する。
-したがって事前学習lossによる動作確認はできるが、Feedforward / ConvGRU / ConvLSTMの
-勝者を決める前に、sequence順を保ってstateを更新する下流評価経路が必要である。
+Stage 2では`gen1_detection --stateful`がrecurrent checkpointを受け取り、recording順に
+ラベルなし窓を含めてstateを更新する。既存ROI probeは引き続きrecurrent checkpointを拒否する
+ため補助分類評価は未実装だが、主指標のstateful Detection APでmodel選択できる。
 
 Stage 3で使用予定の`patch_event_activity: [B,T,P]`はloaderに実装済みだが、
 `return_patch_event_activity: true`へ変更しただけではSIGRegは有効にならない。
@@ -196,10 +196,10 @@ metadataをmodel計算に使わない。
 実運用上の比較である。parameter数、peak VRAM、supervised windows/sも併記する。
 必要なら全モデル`burn_in_steps=0`の計算量寄り感度分析を後から行うが、R0の主表には混ぜない。
 
-### Stage 2の評価gate
+### Stage 2の評価protocol
 
 事前学習lossはarchitecture間で表現尺度が異なり得るため、loss最小だけで勝者を選ばない。
-正式な選択前に次を満たすstateful評価器を用意する。
+正式な選択には、実装済みstateful Detectionが次を満たすことを各runで確認する。
 
 - recording内のtimestamp順で全50 ms窓を入力する。
 - labelのない窓でもstateを更新する。
@@ -208,8 +208,9 @@ metadataをmodel計算に使わない。
 - Feedforwardにも同一timestamp/sample集合を使う。
 - 凍結headとfine-tuneの結果を分ける。
 
-主指標はstateful Gen1 Detection AP、補助指標は凍結分類macro-F1とする。評価器が未実装の
-間は「学習成立の確認」までとし、Stage 3へ送るmodelを確定しない。
+主指標はstateful Gen1 Detection APとする。凍結分類macro-F1はrecurrent版が未実装なので
+現時点では補助表から外す。stateful Detectionはbatch 1・凍結backboneで実行し、validation AP
+最大時の`checkpoint-best.pt`と最新再開用`checkpoint-latest.pt`を分けて保存する。
 
 ### 選択規則
 

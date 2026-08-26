@@ -498,7 +498,28 @@ python -m event_window_jepa.downstream.gen1_detection \
   --max-val-frames 1000
 ```
 
-smoke test完走後はframe上限を外します。`train.jsonl`にYOLOX lossと`AP/AP_50/AP_75/AP_S/AP_M/AP_L`、`checkpoint-latest.pt`に再開可能なhead・optimizer状態を保存します。
+smoke test完走後はframe上限を外します。`train.jsonl`にYOLOX lossと`AP/AP_50/AP_75/AP_S/AP_M/AP_L`、`checkpoint-latest.pt`に再開可能なhead・optimizer状態を保存します。validation APが更新された時点のheadは`checkpoint-best.pt`にも保存されます。
+
+Stage 2のFeedforward / ConvGRU / ConvLSTMを同じ因果streamで比較する場合は
+`--stateful --batch-size 1`を指定します。recording先頭からtimestamp順に50 ms窓を読み、
+ラベルのない窓でもrecurrent stateを更新し、sequence境界だけでresetします。Feedforwardも
+同じtimestamp列とラベル集合を使います。過去weightで作ったstateと更新後weightの混在を
+避けるため、stateful評価は凍結backbone専用で、`--unfreeze-backbone`との併用を拒否します。
+
+```bash
+python -m event_window_jepa.downstream.gen1_detection \
+  --checkpoint /path/to/stage2-recurrent-checkpoint.pt \
+  --train-manifest /path/to/gen1_304x240/manifests/train.jsonl \
+  --val-manifest /path/to/gen1_304x240/manifests/val.jsonl \
+  --output-dir /path/to/runs/gen1_stateful_detection \
+  --window-ms 50 \
+  --stateful \
+  --batch-size 1 \
+  --workers 4 \
+  --precision fp32 \
+  --epochs 30 \
+  --eval-every 5
+```
 
 ## Window sweepの集計
 

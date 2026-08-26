@@ -27,6 +27,9 @@ from event_window_jepa.downstream.gen1_roi_probe import (
     _representation,
 )
 from event_window_jepa.train.checkpoint import load_pretrained_model
+from event_window_jepa.models.recurrent_vjepa21_event_vit import (
+    RecurrentVJEPA21EventVisionTransformer,
+)
 
 
 BBOX_DTYPE = np.dtype(
@@ -51,6 +54,16 @@ class RVTComponents:
     head_type: type[nn.Module]
     postprocess: Callable[..., list[torch.Tensor | None]]
     evaluate_list: Callable[..., dict[str, float]]
+
+
+@dataclass(frozen=True)
+class StreamFrameReference:
+    source_index: int
+    start: int
+    stop: int
+    t_end_us: int
+    has_labels: bool
+    state_reset: bool
 
 
 def _parse_args() -> argparse.Namespace:
@@ -85,6 +98,15 @@ def _parse_args() -> argparse.Namespace:
         "--unfreeze-backbone",
         action="store_true",
         help="Fine-tune the encoder; the default is a frozen-backbone detector",
+    )
+    parser.add_argument(
+        "--stateful",
+        action="store_true",
+        help=(
+            "Process each recording in timestamp order, carry recurrent state, and "
+            "update state on unlabeled 50 ms windows. Requires batch-size 1 and a "
+            "frozen backbone; use this for fair FF/ConvGRU/ConvLSTM comparison."
+        ),
     )
     parser.add_argument("--resume", type=Path, default=None)
     return parser.parse_args()
@@ -194,6 +216,102 @@ class Gen1DetectionDataset(
         return image, torch.from_numpy(targets), ground_truth, reference.t_end_us
 
 
+def _stream_references(
+    sources: Sequence[LabelSource],
+    labeled_references: Sequence[FrameReference],
+    *,
+    duration_us: int,
+    maximum_labeled_frames: int,
+) -> tuple[StreamFrameReference, ...]:
+    """Expand labeled timestamps into an ordered causal stream.
+
+    Every gap larger than one window receives label-free state-update steps.  A
+    label timestamp is always retained exactly, even when it is not aligned to
+    the recording start. Frame limits keep an ordered prefix instead of random
+    sampling because random subsampling would invalidate recurrent state.
+    """
+
+    by_source: dict[int, list[FrameReference]] = {
+        index: [] for index in range(len(sources))
+    }
+    for reference in labeled_references:
+        by_source[reference.source_index].append(reference)
+    output: list[StreamFrameReference] = []
+    labeled_count = 0
+    for source_index, source in enumerate(sources):
+        references = sorted(by_source[source_index], key=lambda value: value.t_end_us)
+        if not references:
+            continue
+        next_end = source.t_start_us + duration_us
+        first = True
+        for reference in references:
+            if maximum_labeled_frames > 0 and labeled_count >= maximum_labeled_frames:
+                return tuple(output)
+            while next_end < reference.t_end_us:
+                output.append(
+                    StreamFrameReference(
+                        source_index=source_index,
+                        start=0,
+                        stop=0,
+                        t_end_us=next_end,
+                        has_labels=False,
+                        state_reset=first,
+                    )
+                )
+                first = False
+                next_end += duration_us
+            output.append(
+                StreamFrameReference(
+                    source_index=source_index,
+                    start=reference.start,
+                    stop=reference.stop,
+                    t_end_us=reference.t_end_us,
+                    has_labels=True,
+                    state_reset=first,
+                )
+            )
+            labeled_count += 1
+            first = False
+            next_end = reference.t_end_us + duration_us
+    return tuple(output)
+
+
+class Gen1StreamDetectionDataset(Gen1DetectionDataset):
+    references: tuple[StreamFrameReference, ...]
+
+    def __init__(
+        self,
+        manifest: Path,
+        sources: Sequence[LabelSource],
+        references: Sequence[StreamFrameReference],
+        *,
+        duration_ms: float,
+        representation: Any,
+    ) -> None:
+        super().__init__(
+            manifest,
+            sources,
+            references,  # type: ignore[arg-type]
+            duration_ms=duration_ms,
+            representation=representation,
+        )
+        self.references = tuple(references)
+
+    def __getitem__(
+        self, index: int
+    ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray, int, bool, bool]:
+        reference = self.references[index]
+        image, targets, ground_truth, timestamp = super().__getitem__(index)
+        return (
+            image,
+            targets,
+            ground_truth,
+            timestamp,
+            reference.has_labels,
+            reference.state_reset,
+        )
+
+
 def _collate_detection(
     batch: Sequence[tuple[torch.Tensor, torch.Tensor, np.ndarray, int]],
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[np.ndarray, ...], tuple[int, ...]]:
@@ -203,6 +321,24 @@ def _collate_detection(
     for index, value in enumerate(labels):
         padded[index, : len(value)] = value
     return torch.stack(images), padded, tuple(ground_truth), tuple(timestamps)
+
+
+def _collate_stream_detection(
+    batch: Sequence[
+        tuple[torch.Tensor, torch.Tensor, np.ndarray, int, bool, bool]
+    ],
+) -> tuple[torch.Tensor, torch.Tensor, tuple[np.ndarray, ...], tuple[int, ...], bool, bool]:
+    if len(batch) != 1:
+        raise ValueError("stateful detection currently requires batch-size 1")
+    image, labels, ground_truth, timestamp, has_labels, state_reset = batch[0]
+    return (
+        image.unsqueeze(0),
+        labels.unsqueeze(0),
+        (ground_truth,),
+        (timestamp,),
+        has_labels,
+        state_reset,
+    )
 
 
 def _interpolated_position_embedding(
@@ -249,6 +385,26 @@ def _dynamic_encoder_feature_map(
     )
 
 
+def _dynamic_encoder_feature_map_stateful(
+    model: Any,
+    images: torch.Tensor,
+    duration_ms: torch.Tensor,
+    state: Any,
+) -> tuple[torch.Tensor, Any]:
+    encoder = model.online_encoder
+    if not isinstance(encoder, RecurrentVJEPA21EventVisionTransformer):
+        return _dynamic_encoder_feature_map(model, images, duration_ms), None
+    scale = model.scale_embedding(duration_ms.reshape(len(images)))
+    if not model.condition_on_scale:
+        scale = torch.zeros_like(scale)
+    return encoder.forward_feature_map_recurrent(
+        images,
+        scale,
+        state=state,
+        detach_state=True,
+    )
+
+
 class WindowJEPAYOLOX(nn.Module):
     def __init__(
         self,
@@ -289,6 +445,13 @@ class WindowJEPAYOLOX(nn.Module):
             self.backbone.requires_grad_(False)
             self.backbone.eval()
 
+    @property
+    def recurrent(self) -> bool:
+        return isinstance(
+            self.backbone.online_encoder,
+            RecurrentVJEPA21EventVisionTransformer,
+        )
+
     def train(self, mode: bool = True) -> WindowJEPAYOLOX:
         super().train(mode)
         if self.freeze_backbone:
@@ -311,6 +474,31 @@ class WindowJEPAYOLOX(nn.Module):
             base = _dynamic_encoder_feature_map(self.backbone, images, duration_ms)
         features = (self.p3(base), self.p4(base), self.p5(base))
         return self.head(features, targets)
+
+    def forward_stateful(
+        self,
+        images: torch.Tensor,
+        duration_ms: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        *,
+        state: Any = None,
+        features_only: bool = False,
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None, Any]:
+        images = functional.pad(images, (0, 16, 0, 16))
+        if self.freeze_backbone:
+            with torch.no_grad():
+                base, next_state = _dynamic_encoder_feature_map_stateful(
+                    self.backbone, images, duration_ms, state
+                )
+        else:
+            base, next_state = _dynamic_encoder_feature_map_stateful(
+                self.backbone, images, duration_ms, state
+            )
+        if features_only:
+            return None, None, next_state
+        features = (self.p3(base), self.p4(base), self.p5(base))
+        decoded, losses = self.head(features, targets)
+        return decoded, losses, next_state
 
 
 def _predictions_to_prophesee(
@@ -394,6 +582,75 @@ def _evaluate(
     return {str(key): float(value) for key, value in metrics.items()}
 
 
+@torch.no_grad()
+def _evaluate_stateful(
+    model: WindowJEPAYOLOX,
+    loader: DataLoader[Any],
+    components: RVTComponents,
+    *,
+    duration_ms: float,
+    confidence_threshold: float,
+    nms_threshold: float,
+    device: torch.device,
+    precision: str,
+) -> dict[str, float]:
+    model.eval()
+    ground_truth: list[np.ndarray] = []
+    predictions: list[np.ndarray] = []
+    state: Any = None
+    for (
+        images,
+        _,
+        batch_ground_truth,
+        timestamps,
+        has_labels,
+        state_reset,
+    ) in tqdm(loader, desc="stateful detection val"):
+        if state_reset:
+            state = None
+        images = images.to(device, non_blocking=True)
+        duration = torch.full((len(images),), duration_ms, device=device)
+        context = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if precision == "bf16" and device.type == "cuda"
+            else nullcontext()
+        )
+        with context:
+            decoded, _, state = model.forward_stateful(
+                images,
+                duration,
+                state=state,
+                features_only=not has_labels,
+            )
+        if not has_labels:
+            continue
+        if decoded is None:
+            raise RuntimeError("stateful detector produced no labeled prediction")
+        processed = components.postprocess(
+            decoded.float().clone(),
+            num_classes=2,
+            conf_thre=confidence_threshold,
+            nms_thre=nms_threshold,
+        )
+        ground_truth.extend(batch_ground_truth)
+        predictions.extend(
+            _predictions_to_prophesee(
+                processed, timestamps, height=240, width=304
+            )
+        )
+    metrics = components.evaluate_list(
+        result_boxes_list=predictions,
+        gt_boxes_list=ground_truth,
+        height=240,
+        width=304,
+        camera="gen1",
+        apply_bbox_filters=True,
+        downsampled_by_2=False,
+        return_aps=True,
+    )
+    return {str(key): float(value) for key, value in metrics.items()}
+
+
 def _save_checkpoint(
     path: Path,
     model: WindowJEPAYOLOX,
@@ -402,6 +659,8 @@ def _save_checkpoint(
     epoch: int,
     args: argparse.Namespace,
     metrics: dict[str, float],
+    best_ap: float,
+    best_epoch: int,
 ) -> None:
     detector_state = {
         name: value
@@ -423,7 +682,10 @@ def _save_checkpoint(
         "backbone_init": args.backbone_init,
         "pretrain_checkpoint": str(args.checkpoint.resolve()),
         "window_ms": args.window_ms,
+        "stateful": args.stateful,
         "metrics": metrics,
+        "best_ap": best_ap,
+        "best_epoch": best_epoch,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_name: str | None = None
@@ -453,6 +715,13 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("workers and frame limits cannot be negative")
     if not 0 < args.confidence_threshold < 1 or not 0 < args.nms_threshold < 1:
         raise ValueError("confidence and NMS thresholds must lie inside (0, 1)")
+    if args.stateful and args.batch_size != 1:
+        raise ValueError("stateful detection requires --batch-size 1")
+    if args.stateful and args.unfreeze_backbone:
+        raise ValueError(
+            "stateful detection currently requires a frozen backbone; updating "
+            "recurrent weights while carrying old state would be inconsistent"
+        )
 
 
 def train(args: argparse.Namespace) -> None:
@@ -469,24 +738,48 @@ def train(args: argparse.Namespace) -> None:
 
         torch.manual_seed(args.seed)
         backbone = build_model(config).to(device)
-    require_feedforward_feature_model(backbone, caller="Gen1 detection")
+    recurrent_checkpoint = isinstance(
+        backbone.online_encoder, RecurrentVJEPA21EventVisionTransformer
+    )
+    if recurrent_checkpoint and not args.stateful:
+        require_feedforward_feature_model(backbone, caller="Gen1 detection")
     components = _load_rvt_components()
     representation = _representation(config)
     train_sources = _read_label_sources(args.train_manifest)
     val_sources = _read_label_sources(args.val_manifest)
     duration_us = round(args.window_ms * 1_000)
-    train_references = _frame_references(
+    train_labeled_references = _frame_references(
         train_sources,
         maximum_window_us=duration_us,
-        maximum_frames=args.max_train_frames,
+        maximum_frames=0 if args.stateful else args.max_train_frames,
         seed=args.seed,
     )
-    val_references = _frame_references(
+    val_labeled_references = _frame_references(
         val_sources,
         maximum_window_us=duration_us,
-        maximum_frames=args.max_val_frames,
+        maximum_frames=0 if args.stateful else args.max_val_frames,
         seed=args.seed + 1,
     )
+    if args.stateful:
+        train_references: Sequence[FrameReference | StreamFrameReference] = (
+            _stream_references(
+                train_sources,
+                train_labeled_references,
+                duration_us=duration_us,
+                maximum_labeled_frames=args.max_train_frames,
+            )
+        )
+        val_references: Sequence[FrameReference | StreamFrameReference] = (
+            _stream_references(
+                val_sources,
+                val_labeled_references,
+                duration_us=duration_us,
+                maximum_labeled_frames=args.max_val_frames,
+            )
+        )
+    else:
+        train_references = train_labeled_references
+        val_references = val_labeled_references
     if not train_references or not val_references:
         raise ValueError("no valid labeled frames remain")
     model = WindowJEPAYOLOX(
@@ -499,10 +792,14 @@ def train(args: argparse.Namespace) -> None:
         parameters, lr=args.learning_rate, weight_decay=args.weight_decay
     )
     start_epoch = 0
+    best_ap = float("-inf")
+    best_epoch = 0
     if args.resume is not None:
         resumed = torch.load(args.resume, map_location="cpu", weights_only=False)
         if resumed.get("schema") != "event-window-jepa-gen1-yolox-v1":
             raise ValueError("unsupported detection checkpoint")
+        if bool(resumed.get("stateful", False)) != args.stateful:
+            raise ValueError("detection resume stateful mode does not match checkpoint")
         incompatible = model.load_state_dict(resumed["model"], strict=False)
         unexpected = list(incompatible.unexpected_keys)
         missing = [
@@ -517,15 +814,18 @@ def train(args: argparse.Namespace) -> None:
             )
         optimizer.load_state_dict(resumed["optimizer"])
         start_epoch = int(resumed["epoch"])
+        best_ap = float(resumed.get("best_ap", float("-inf")))
+        best_epoch = int(resumed.get("best_epoch", 0))
 
-    train_dataset = Gen1DetectionDataset(
+    dataset_type = Gen1StreamDetectionDataset if args.stateful else Gen1DetectionDataset
+    train_dataset = dataset_type(
         args.train_manifest,
         train_sources,
         train_references,
         duration_ms=args.window_ms,
         representation=representation,
     )
-    val_dataset = Gen1DetectionDataset(
+    val_dataset = dataset_type(
         args.val_manifest,
         val_sources,
         val_references,
@@ -536,12 +836,14 @@ def train(args: argparse.Namespace) -> None:
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=not args.stateful,
         generator=train_generator,
         num_workers=args.workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.workers > 0,
-        collate_fn=_collate_detection,
+        collate_fn=(
+            _collate_stream_detection if args.stateful else _collate_detection
+        ),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -550,31 +852,59 @@ def train(args: argparse.Namespace) -> None:
         num_workers=args.workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.workers > 0,
-        collate_fn=_collate_detection,
+        collate_fn=(
+            _collate_stream_detection if args.stateful else _collate_detection
+        ),
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "train.jsonl"
     print(
         f"[gen1-detect] train={len(train_dataset)}, val={len(val_dataset)}, "
-        f"init={args.backbone_init}, frozen={not args.unfreeze_backbone}"
+        f"init={args.backbone_init}, frozen={not args.unfreeze_backbone}, "
+        f"stateful={args.stateful}, recurrent={recurrent_checkpoint}"
     )
     for epoch in range(start_epoch, args.epochs):
         model.train()
         running: dict[str, float] = {}
         samples = 0
         progress = tqdm(train_loader, desc=f"detection epoch {epoch + 1}/{args.epochs}")
-        for images, targets, _, _ in progress:
+        state: Any = None
+        for batch in progress:
+            if args.stateful:
+                images, targets, _, _, has_labels, state_reset = batch
+                if state_reset:
+                    state = None
+            else:
+                images, targets, _, _ = batch
+                has_labels = True
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             duration = torch.full((len(images),), args.window_ms, device=device)
-            optimizer.zero_grad(set_to_none=True)
             context = (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                 if args.precision == "bf16" and device.type == "cuda"
                 else nullcontext()
             )
+            if args.stateful and not has_labels:
+                with context:
+                    _, _, state = model.forward_stateful(
+                        images,
+                        duration,
+                        state=state,
+                        features_only=True,
+                    )
+                continue
+            optimizer.zero_grad(set_to_none=True)
             with context:
-                _, losses = model(images, duration, targets)
+                if args.stateful:
+                    _, losses, state = model.forward_stateful(
+                        images,
+                        duration,
+                        targets,
+                        state=state,
+                    )
+                else:
+                    _, losses = model(images, duration, targets)
             if losses is None:
                 raise RuntimeError("YOLOX returned no training losses")
             loss = losses["loss"]
@@ -591,7 +921,8 @@ def train(args: argparse.Namespace) -> None:
         should_evaluate = (epoch + 1) % args.eval_every == 0 or epoch + 1 == args.epochs
         validation_metrics: dict[str, float] = {}
         if should_evaluate:
-            validation_metrics = _evaluate(
+            evaluator = _evaluate_stateful if args.stateful else _evaluate
+            validation_metrics = evaluator(
                 model,
                 val_loader,
                 components,
@@ -609,6 +940,20 @@ def train(args: argparse.Namespace) -> None:
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
         print(f"[gen1-detect] {json.dumps(record, sort_keys=True)}")
+        current_ap = validation_metrics.get("AP")
+        if current_ap is not None and current_ap > best_ap:
+            best_ap = current_ap
+            best_epoch = epoch + 1
+            _save_checkpoint(
+                args.output_dir / "checkpoint-best.pt",
+                model,
+                optimizer,
+                epoch=epoch + 1,
+                args=args,
+                metrics=validation_metrics,
+                best_ap=best_ap,
+                best_epoch=best_epoch,
+            )
         _save_checkpoint(
             args.output_dir / "checkpoint-latest.pt",
             model,
@@ -616,6 +961,8 @@ def train(args: argparse.Namespace) -> None:
             epoch=epoch + 1,
             args=args,
             metrics=validation_metrics,
+            best_ap=best_ap,
+            best_epoch=best_epoch,
         )
 
 

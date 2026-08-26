@@ -7,8 +7,9 @@ import numpy as np
 from event_window_jepa.downstream.gen1_detection import (
     _ground_truth_array,
     _scaled_full_boxes,
+    _stream_references,
 )
-from event_window_jepa.downstream.gen1_roi_probe import LabelSource
+from event_window_jepa.downstream.gen1_roi_probe import FrameReference, LabelSource
 
 
 def _source(path: Path) -> LabelSource:
@@ -52,3 +53,72 @@ def test_ground_truth_uses_internal_timestamp() -> None:
     assert values["w"].tolist() == [10.0]
     assert values["h"].tolist() == [20.0]
     assert values["class_confidence"].tolist() == [1.0]
+
+
+def test_stream_references_fill_gaps_and_reset_only_at_sequence_start(
+    tmp_path: Path,
+) -> None:
+    first = _source(tmp_path / "first.npy")
+    second = LabelSource(
+        **{
+            **first.__dict__,
+            "sequence_id": "gen1__second",
+            "path": tmp_path / "second.npy",
+        }
+    )
+    labeled = (
+        FrameReference(0, 0, 1, 100_000),
+        FrameReference(0, 1, 2, 250_000),
+        FrameReference(1, 0, 1, 150_000),
+    )
+    references = _stream_references(
+        (first, second),
+        labeled,
+        duration_us=50_000,
+        maximum_labeled_frames=0,
+    )
+    assert [value.t_end_us for value in references] == [
+        50_000,
+        100_000,
+        150_000,
+        200_000,
+        250_000,
+        50_000,
+        100_000,
+        150_000,
+    ]
+    assert [value.has_labels for value in references] == [
+        False,
+        True,
+        False,
+        False,
+        True,
+        False,
+        False,
+        True,
+    ]
+    assert [value.state_reset for value in references] == [
+        True,
+        False,
+        False,
+        False,
+        False,
+        True,
+        False,
+        False,
+    ]
+
+
+def test_stream_reference_limit_keeps_ordered_labeled_prefix(tmp_path: Path) -> None:
+    source = _source(tmp_path / "labels.npy")
+    references = _stream_references(
+        (source,),
+        (
+            FrameReference(0, 0, 1, 100_000),
+            FrameReference(0, 1, 2, 250_000),
+        ),
+        duration_us=50_000,
+        maximum_labeled_frames=1,
+    )
+    assert [value.t_end_us for value in references] == [50_000, 100_000]
+    assert sum(value.has_labels for value in references) == 1
