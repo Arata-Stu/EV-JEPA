@@ -568,6 +568,28 @@ sequence loaderで事前学習したcheckpointでは、`--window-ms`がcheckpoin
 optimizer updateはframe単位経路より大幅に少なくなります。`train.jsonl`にはloader上の
 `train_batches`と実際に更新した`optimizer_updates`を分けて記録します。
 
+#### ConvLSTM scratch成立確認（1モデルを3 GPU DDP）
+
+凍結backbone評価とは別に、ConvLSTM encoderとYOLOX headをともにランダム初期化して
+end-to-end更新する成立確認経路があります。指定するpretrain checkpointは解像度・channel数・
+ConvLSTM構造を読むためだけに使い、weightは一切読み込みません。trainingは各rankで
+stream/randomを1:1に分けたT=21 mixed sampling、validationはrank 0でfull causal streamです。
+1 chunkをDDPの1 forward/1 backward/1 optimizer updateとして扱い、stream stateはchunk間で
+detachしてcarryします。V100ではFP16 GradScalerを既定にします。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  bash scripts/experiments/run_gen1_scratch_convlstm_ddp.sh \
+  --architecture-checkpoint /path/to/convlstm/checkpoint-latest.pt \
+  --batch-size 2 \
+  --workers 4 \
+  --smoke
+```
+
+smokeのVRAM・loss・full-stream評価が正常なら`--smoke`を外して別outputへformal runを開始します。
+これは本プロジェクトのConvLSTM pipelineが教師ありDetectionを学習できるかを切り分ける対照であり、
+RVT backboneそのものの再実装ではありません。
+
 ```bash
 python -m event_window_jepa.downstream.gen1_detection \
   --checkpoint /path/to/stage2-recurrent-checkpoint.pt \

@@ -56,6 +56,13 @@ SEQUENCE_STATEFUL_LANE_SCHEMA = "stable-lanes-sequence-v2"
 LEGACY_STATEFUL_LANE_SCHEMA = "stable-lanes-v1"
 
 
+def _autocast_context(device: torch.device, precision: str):  # type: ignore[no-untyped-def]
+    if device.type != "cuda" or precision == "fp32":
+        return nullcontext()
+    dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+    return torch.autocast(device_type="cuda", dtype=dtype)
+
+
 @dataclass(frozen=True)
 class RVTComponents:
     head_type: type[nn.Module]
@@ -611,6 +618,8 @@ class StreamLaneBatchSampler(Sampler[list[StreamLaneIndex]]):
         lane_offset: int = 0,
         reset_every_chunk: bool = False,
         shuffle: bool = False,
+        world_size: int = 1,
+        rank: int = 0,
         seed: int = 0,
     ) -> None:
         if batch_size <= 0:
@@ -619,6 +628,8 @@ class StreamLaneBatchSampler(Sampler[list[StreamLaneIndex]]):
             raise ValueError("stream sequence length must be positive")
         if lane_offset < 0:
             raise ValueError("stream lane offset cannot be negative")
+        if world_size <= 0 or not 0 <= rank < world_size:
+            raise ValueError("stream sampler rank must lie inside a positive world size")
         self.batch_size = int(batch_size)
         self.sequence_length = int(sequence_length)
         self.lane_offset = int(lane_offset)
@@ -628,7 +639,8 @@ class StreamLaneBatchSampler(Sampler[list[StreamLaneIndex]]):
             groups.setdefault(
                 (reference.source_index, reference.stream_segment_id), []
             ).append(index)
-        self.groups = tuple(tuple(indices) for indices in groups.values())
+        all_groups = tuple(tuple(indices) for indices in groups.values())
+        self.groups = all_groups[rank::world_size]
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.epoch = 0
@@ -785,18 +797,24 @@ class RandomLabelClipBatchSampler(Sampler[list[DirectStreamLaneIndex]]):
         lane_offset: int = 0,
         maximum_labeled_frames: int = 0,
         drop_last: bool = False,
+        world_size: int = 1,
+        rank: int = 0,
         seed: int = 0,
     ) -> None:
         if min(duration_us, sequence_length, batch_size) <= 0:
             raise ValueError("random clip cadence, length, and batch must be positive")
         if lane_offset < 0 or maximum_labeled_frames < 0:
             raise ValueError("random lane offset and frame limit cannot be negative")
+        if world_size <= 0 or not 0 <= rank < world_size:
+            raise ValueError("random sampler rank must lie inside a positive world size")
         self.sources = tuple(sources)
         self.duration_us = int(duration_us)
         self.sequence_length = int(sequence_length)
         self.batch_size = int(batch_size)
         self.lane_offset = int(lane_offset)
         self.drop_last = bool(drop_last)
+        self.world_size = int(world_size)
+        self.rank = int(rank)
         self.seed = int(seed)
         self.epoch = 0
 
@@ -826,6 +844,7 @@ class RandomLabelClipBatchSampler(Sampler[list[DirectStreamLaneIndex]]):
                 rng.sample(range(len(anchors)), maximum_labeled_frames)
             )
             anchors = [anchors[index] for index in selected]
+        anchors = anchors[self.rank :: self.world_size]
         if not anchors:
             raise ValueError(
                 "no labeled frame has enough history for a complete random clip"
@@ -1514,11 +1533,7 @@ def _forward_stateful_sequence(
         )
         images = images.to(device, non_blocking=True)
         duration = torch.full((len(images),), duration_ms, device=device)
-        context = (
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-            if precision == "bf16" and device.type == "cuda"
-            else nullcontext()
-        )
+        context = _autocast_context(device, precision)
         with context:
             base, next_state = model.forward_stateful_backbone(
                 images, duration, state=state, detach_state=False
@@ -1555,11 +1570,7 @@ def _forward_stateful_sequence(
     head_targets = (
         _concatenate_padded_targets(selected_targets) if compute_losses else None
     )
-    context = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if precision == "bf16" and device.type == "cuda"
-        else nullcontext()
-    )
+    context = _autocast_context(device, precision)
     with context:
         decoded, losses = model.forward_detection_features(
             torch.cat(selected_features, dim=0), head_targets
@@ -1651,11 +1662,7 @@ def _evaluate(
     for images, _, batch_ground_truth, timestamps in tqdm(loader, desc="detection val"):
         images = images.to(device, non_blocking=True)
         duration = torch.full((len(images),), duration_ms, device=device)
-        context = (
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-            if precision == "bf16" and device.type == "cuda"
-            else nullcontext()
-        )
+        context = _autocast_context(device, precision)
         with context:
             decoded, _ = model(images, duration)
         processed = components.postprocess(
@@ -2309,11 +2316,7 @@ def train(args: argparse.Namespace) -> None:
                 images = images.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
                 duration = torch.full((len(images),), args.window_ms, device=device)
-                context = (
-                    torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                    if args.precision == "bf16" and device.type == "cuda"
-                    else nullcontext()
-                )
+                context = _autocast_context(device, args.precision)
                 with context:
                     _, losses = model(images, duration, targets)
             if losses is None:
