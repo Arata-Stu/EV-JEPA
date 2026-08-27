@@ -201,7 +201,10 @@ def test_stream_references_reject_misaligned_label_timestamp(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="not aligned"):
         _stream_references(
             (_source(tmp_path / "labels.npy"),),
-            (FrameReference(0, 0, 1, 125_000),),
+            (
+                FrameReference(0, 0, 1, 125_000),
+                FrameReference(0, 1, 2, 160_000),
+            ),
             duration_us=50_000,
             maximum_labeled_frames=0,
         )
