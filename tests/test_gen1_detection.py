@@ -207,6 +207,26 @@ def test_stream_references_reject_misaligned_label_timestamp(tmp_path: Path) -> 
         )
 
 
+def test_stream_references_accept_gen1_inclusive_boundary_phase(
+    tmp_path: Path,
+) -> None:
+    references = _stream_references(
+        (_source(tmp_path / "labels.npy"),),
+        (
+            FrameReference(0, 0, 1, 99_999),
+            FrameReference(0, 1, 2, 199_999),
+        ),
+        duration_us=50_000,
+        maximum_labeled_frames=0,
+    )
+    assert [reference.t_end_us for reference in references] == [
+        99_999,
+        149_999,
+        199_999,
+    ]
+    assert [reference.has_labels for reference in references] == [True, False, True]
+
+
 def test_stateful_window_must_match_sequence_checkpoint_cadence() -> None:
     _validate_stateful_window_duration(
         50.0,

@@ -248,10 +248,12 @@ def _stream_references(
     """Expand labeled timestamps into an ordered causal stream.
 
     Every gap larger than one window receives label-free state-update steps.
-    Label timestamps must lie on the fixed window cadence; otherwise adjacent
-    input windows would overlap or leave a gap. Frame limits keep an ordered
-    prefix in up to ``stream_lanes`` recordings instead of random frame sampling
-    because random subsampling would invalidate recurrent state.
+    Label timestamps must share the fixed window cadence. Gen1 annotations can
+    use the inclusive ``...99999`` microsecond phase, so a one-microsecond phase
+    offset from the recording origin is accepted and preserved. Frame limits
+    keep an ordered prefix in up to ``stream_lanes`` recordings instead of
+    random frame sampling because random subsampling would invalidate recurrent
+    state.
     """
 
     if duration_us <= 0:
@@ -298,7 +300,18 @@ def _stream_references(
         references = sorted(by_source[source_index], key=lambda value: value.t_end_us)
         if not references:
             continue
-        next_end = source.t_start_us + duration_us
+        phase = (references[0].t_end_us - source.t_start_us) % duration_us
+        signed_phase = phase if phase <= duration_us // 2 else phase - duration_us
+        if abs(signed_phase) > 1:
+            raise ValueError(
+                f"stateful label timestamp {references[0].t_end_us} for "
+                f"{source.sequence_id} is not aligned to the {duration_us} us "
+                "window cadence (only the Gen1 inclusive-boundary +/-1 us "
+                "offset is accepted)"
+            )
+        next_end = source.t_start_us + duration_us + signed_phase
+        while next_end - duration_us < source.t_start_us:
+            next_end += duration_us
         first = True
         for reference in references:
             while next_end < reference.t_end_us:
