@@ -481,7 +481,11 @@ python -m event_window_jepa.downstream.gen1_roi_probe \
 
 実Detectionでは、全304x240画面を256x320へzero-padし、ViTの位置埋め込みを16x20 patch gridへ補間します。そのtokenからstride 8/16/32のfeature pyramidを作り、プロジェクトに同梱したRVT版YOLOX headを学習します。評価も同梱したProphesee COCO evaluatorを使い、小boxと各recording先頭0.5秒を公式protocolどおり除外します。必要部分はライセンス表示付きで固定しているため、外部RVT repositoryのcloneは不要です。
 
-これは正解bboxを推論入力に使わず、予測bboxからmAPを計算します。一方、RVTのrecurrent backboneや21-step sequenceは使わないため、RVTそのものの再現実験ではありません。まず凍結backboneで事前学習特徴を評価し、必要な場合だけ`--unfreeze-backbone`でfine-tuneします。
+これは正解bboxを推論入力に使わず、予測bboxからmAPを計算します。通常の呼び出しは
+frameごとに独立したbackbone評価で、`--stateful`時だけ本プロジェクトのConvGRU/ConvLSTM stateを
+recording間で引き継ぎます。RVTのbackbone構造や21-step学習をそのまま再現する実験ではありません。
+まず凍結backboneで事前学習特徴を評価し、必要な場合だけ非stateful経路の
+`--unfreeze-backbone`でfine-tuneします。
 
 ```bash
 python -m pip install -e '.[hdf5,detection]'
@@ -498,13 +502,29 @@ python -m event_window_jepa.downstream.gen1_detection \
   --max-val-frames 1000
 ```
 
-smoke test完走後はframe上限を外します。`train.jsonl`にYOLOX lossと`AP/AP_50/AP_75/AP_S/AP_M/AP_L`、`checkpoint-latest.pt`に再開可能なhead・optimizer状態を保存します。validation APが更新された時点のheadは`checkpoint-best.pt`にも保存されます。
+smoke test完走後はframe上限を外します。`train.jsonl`にYOLOX lossと`AP/AP_50/AP_75/AP_S/AP_M/AP_L`、`checkpoint-latest.pt`に再開可能なhead・optimizer状態を保存します。validation APが更新された時点のheadは`checkpoint-best.pt`にも保存されます。新しいv2 checkpointのresume時は、事前学習backboneのweight fingerprintとconfig、window幅、batch/lane方式、seed、precisionも照合し、異なる実験のheadを誤って混ぜません。legacy v1のstateful checkpointはpretrained backbone・同一path/window・batch 1だけ互換で、random backboneのresumeは拒否します。
 
 Stage 2のFeedforward / ConvGRU / ConvLSTMを同じ因果streamで比較する場合は
-`--stateful --batch-size 1`を指定します。recording先頭からtimestamp順に50 ms窓を読み、
-ラベルのない窓でもrecurrent stateを更新し、sequence境界だけでresetします。Feedforwardも
-同じtimestamp列とラベル集合を使います。過去weightで作ったstateと更新後weightの混在を
-避けるため、stateful評価は凍結backbone専用で、`--unfreeze-backbone`との併用を拒否します。
+`--stateful`を指定します。`--batch-size`は同時に処理するrecording lane数で、各lane内では
+recording先頭からtimestamp順に50 ms窓を読みます。ラベルのない窓でもrecurrent backboneの
+stateを更新し、recording交代時だけ該当laneをresetします。stateはlaneごとに保持し、各step後に
+detachします。複数laneのbackboneは1回のbatched forwardで処理し、YOLOX head/lossへ渡すのは
+そのstepでlabelを持つrowだけです。Feedforwardも同じloader、timestamp列、label集合を使いますが、
+stateは保持しません。`--batch-size 1`も従来どおり使用できます。
+
+ここでrecurrent updateの時間単位は50 ms frameです。50 ms内部のtemporal binは時間stepではなく
+channelとして空間encoderへ一括入力します。公式RVTのGen1設定は10 temporal bins × 2 polarity
+= 20 channelsを1回の50 ms updateへ入力します。本プロジェクトのStage 1/2比較は1 bin × 2 polarity
+= 2 ch、または5 bins × 2 polarity = 10 chですが、どちらも50 msごとに1回だけstateを更新します。
+したがって10 ch条件は10回（または5回）のrecurrent updateを行う設定ではありません。
+
+過去weightで作ったstateと更新後weightの混在を避けるため、stateful評価は凍結backbone専用で、
+`--unfreeze-backbone`との併用を拒否します。trainではrecording群だけをepochごとにseed付きで
+shuffleし、validationでは長いrecordingからlaneへ補充します。いずれもrecording内の順序は固定です。
+sequence loaderで事前学習したcheckpointでは、`--window-ms`がcheckpoint内の
+`recurrent.window_ms`と一致しない起動も拒否します。
+進捗barの総数は50 ms window数ではなくstream batch数になるため、例えば157万windowでも
+8 laneならforward回数は概ねその1/8です（recording長の偏りによる短い末尾batchを除く）。
 
 ```bash
 python -m event_window_jepa.downstream.gen1_detection \
@@ -514,7 +534,7 @@ python -m event_window_jepa.downstream.gen1_detection \
   --output-dir /path/to/runs/gen1_stateful_detection \
   --window-ms 50 \
   --stateful \
-  --batch-size 1 \
+  --batch-size 8 \
   --workers 4 \
   --precision fp32 \
   --epochs 30 \

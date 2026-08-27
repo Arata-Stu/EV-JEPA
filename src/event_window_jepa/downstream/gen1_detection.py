@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import tempfile
@@ -14,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as functional
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm.auto import tqdm
 
 from event_window_jepa.data.event_store import H5EventStore
@@ -26,10 +27,13 @@ from event_window_jepa.downstream.gen1_roi_probe import (
     _read_label_sources,
     _representation,
 )
-from event_window_jepa.train.checkpoint import load_pretrained_model
 from event_window_jepa.models.recurrent_vjepa21_event_vit import (
+    RecurrentState,
     RecurrentVJEPA21EventVisionTransformer,
+    detach_recurrent_state,
+    reset_recurrent_state,
 )
+from event_window_jepa.train.checkpoint import config_hash, load_pretrained_model
 
 
 BBOX_DTYPE = np.dtype(
@@ -64,6 +68,21 @@ class StreamFrameReference:
     t_end_us: int
     has_labels: bool
     state_reset: bool
+
+
+@dataclass(frozen=True)
+class StreamLaneIndex:
+    """Dataset index annotated with the stable recurrent lane that owns it."""
+
+    reference_index: int
+    lane_id: int
+
+
+@dataclass(frozen=True)
+class _StreamLaneState:
+    source_index: int
+    t_end_us: int
+    state: RecurrentState | None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -103,9 +122,11 @@ def _parse_args() -> argparse.Namespace:
         "--stateful",
         action="store_true",
         help=(
-            "Process each recording in timestamp order, carry recurrent state, and "
-            "update state on unlabeled 50 ms windows. Requires batch-size 1 and a "
-            "frozen backbone; use this for fair FF/ConvGRU/ConvLSTM comparison."
+            "Process recordings in parallel causal lanes, carry lane-local recurrent "
+            "state, and update it on unlabeled windows. Batch size is the maximum "
+            "number of concurrent recording lanes. Requires a frozen backbone; use "
+            "this for fair FF/ConvGRU/ConvLSTM comparison. Window duration must "
+            "match recurrent.window_ms in a sequence-loader checkpoint."
         ),
     )
     parser.add_argument("--resume", type=Path, default=None)
@@ -222,22 +243,57 @@ def _stream_references(
     *,
     duration_us: int,
     maximum_labeled_frames: int,
+    stream_lanes: int = 1,
 ) -> tuple[StreamFrameReference, ...]:
     """Expand labeled timestamps into an ordered causal stream.
 
-    Every gap larger than one window receives label-free state-update steps.  A
-    label timestamp is always retained exactly, even when it is not aligned to
-    the recording start. Frame limits keep an ordered prefix instead of random
-    sampling because random subsampling would invalidate recurrent state.
+    Every gap larger than one window receives label-free state-update steps.
+    Label timestamps must lie on the fixed window cadence; otherwise adjacent
+    input windows would overlap or leave a gap. Frame limits keep an ordered
+    prefix in up to ``stream_lanes`` recordings instead of random frame sampling
+    because random subsampling would invalidate recurrent state.
     """
+
+    if duration_us <= 0:
+        raise ValueError("stateful window duration must be at least one microsecond")
+    if stream_lanes <= 0:
+        raise ValueError("stateful stream_lanes must be positive")
 
     by_source: dict[int, list[FrameReference]] = {
         index: [] for index in range(len(sources))
     }
     for reference in labeled_references:
         by_source[reference.source_index].append(reference)
+    if maximum_labeled_frames > 0:
+        active_sources = [
+            source_index
+            for source_index, references in by_source.items()
+            if references
+        ]
+        selected_sources = active_sources[
+            : min(stream_lanes, maximum_labeled_frames, len(active_sources))
+        ]
+        if not selected_sources:
+            return ()
+        limits = {source_index: 0 for source_index in selected_sources}
+        remaining = maximum_labeled_frames
+        while remaining:
+            changed = False
+            for source_index in selected_sources:
+                if limits[source_index] >= len(by_source[source_index]):
+                    continue
+                limits[source_index] += 1
+                remaining -= 1
+                changed = True
+                if not remaining:
+                    break
+            if not changed:
+                break
+        by_source = {
+            source_index: references[: limits.get(source_index, 0)]
+            for source_index, references in by_source.items()
+        }
     output: list[StreamFrameReference] = []
-    labeled_count = 0
     for source_index, source in enumerate(sources):
         references = sorted(by_source[source_index], key=lambda value: value.t_end_us)
         if not references:
@@ -245,8 +301,6 @@ def _stream_references(
         next_end = source.t_start_us + duration_us
         first = True
         for reference in references:
-            if maximum_labeled_frames > 0 and labeled_count >= maximum_labeled_frames:
-                return tuple(output)
             while next_end < reference.t_end_us:
                 output.append(
                     StreamFrameReference(
@@ -260,6 +314,12 @@ def _stream_references(
                 )
                 first = False
                 next_end += duration_us
+            if next_end != reference.t_end_us:
+                raise ValueError(
+                    f"stateful label timestamp {reference.t_end_us} for "
+                    f"{source.sequence_id} is not aligned to the {duration_us} us "
+                    "window cadence; use the checkpoint and annotation cadence"
+                )
             output.append(
                 StreamFrameReference(
                     source_index=source_index,
@@ -270,9 +330,8 @@ def _stream_references(
                     state_reset=first,
                 )
             )
-            labeled_count += 1
             first = False
-            next_end = reference.t_end_us + duration_us
+            next_end += duration_us
     return tuple(output)
 
 
@@ -298,10 +357,21 @@ class Gen1StreamDetectionDataset(Gen1DetectionDataset):
         self.references = tuple(references)
 
     def __getitem__(
-        self, index: int
-    ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray, int, bool, bool]:
-        reference = self.references[index]
-        image, targets, ground_truth, timestamp = super().__getitem__(index)
+        self, index: int | StreamLaneIndex
+    ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray, int, bool, bool, int, int]:
+        if isinstance(index, StreamLaneIndex):
+            reference_index = index.reference_index
+            lane_id = index.lane_id
+        elif isinstance(index, int):
+            # Direct indexing remains useful for inspection and preserves the old
+            # single-stream behavior. Stateful DataLoaders always provide an
+            # explicit StreamLaneIndex through StreamLaneBatchSampler.
+            reference_index = index
+            lane_id = 0
+        else:
+            raise TypeError("stream dataset index must be int or StreamLaneIndex")
+        reference = self.references[reference_index]
+        image, targets, ground_truth, timestamp = super().__getitem__(reference_index)
         return (
             image,
             targets,
@@ -309,7 +379,268 @@ class Gen1StreamDetectionDataset(Gen1DetectionDataset):
             timestamp,
             reference.has_labels,
             reference.state_reset,
+            reference.source_index,
+            lane_id,
         )
+
+
+class StreamLaneBatchSampler(Sampler[list[StreamLaneIndex]]):
+    """Keep one causal recording per batch lane and refill completed lanes."""
+
+    def __init__(
+        self,
+        references: Sequence[StreamFrameReference],
+        batch_size: int,
+        *,
+        shuffle: bool = False,
+        seed: int = 0,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("stream lane batch size must be positive")
+        self.batch_size = int(batch_size)
+        groups: OrderedDict[int, list[int]] = OrderedDict()
+        for index, reference in enumerate(references):
+            groups.setdefault(reference.source_index, []).append(index)
+        self.groups = tuple(tuple(indices) for indices in groups.values())
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("stream sampler epoch cannot be negative")
+        self.epoch = int(epoch)
+
+    def _ordered_groups(self) -> tuple[tuple[int, ...], ...]:
+        groups = list(self.groups)
+        if self.shuffle:
+            # Recording order changes across epochs, while the references inside
+            # each recording remain untouched and causal. The explicit epoch also
+            # makes a resumed run reproduce the same ordering at epoch boundaries.
+            rng = random.Random(self.seed + self.epoch * 1_000_003)
+            rng.shuffle(groups)
+        else:
+            # Longest-processing-time-first refill is the same scheduling heuristic
+            # used by RVT's evaluation streams to reduce under-filled tail batches.
+            groups.sort(key=lambda indices: (-len(indices), indices[0]))
+        return tuple(groups)
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        pending = iter(self._ordered_groups())
+        active: list[tuple[int, tuple[int, ...], int]] = []
+        for lane_id in range(self.batch_size):
+            try:
+                active.append((lane_id, next(pending), 0))
+            except StopIteration:
+                break
+        while active:
+            yield [
+                StreamLaneIndex(reference_index=indices[position], lane_id=lane_id)
+                for lane_id, indices, position in active
+            ]
+            next_active: list[tuple[int, tuple[int, ...], int]] = []
+            for lane_id, indices, position in active:
+                next_position = position + 1
+                if next_position < len(indices):
+                    next_active.append((lane_id, indices, next_position))
+                    continue
+                try:
+                    next_active.append((lane_id, next(pending), 0))
+                except StopIteration:
+                    pass
+            active = next_active
+
+    def __len__(self) -> int:
+        # The iterator refills whichever lane finishes first. Computing the same
+        # list-scheduling makespan by recording lengths avoids walking every frame
+        # merely to size a million-window progress bar.
+        groups = self._ordered_groups()
+        lane_loads = [len(group) for group in groups[: self.batch_size]]
+        for group in groups[self.batch_size :]:
+            lane_id = min(
+                range(len(lane_loads)),
+                key=lambda index: (lane_loads[index], index),
+            )
+            lane_loads[lane_id] += len(group)
+        return max(lane_loads, default=0)
+
+
+class StreamStateManager:
+    """Own detached recurrent state for stable recording lanes.
+
+    DataLoader workers only construct CPU samples. State lives here, next to the
+    model, and is keyed by the explicit lane id emitted by StreamLaneBatchSampler.
+    The common fixed-lane path reuses one detached batched state directly; the
+    lane cache avoids state swaps when exhausted lanes disappear from a short tail.
+    """
+
+    def __init__(self, *, recurrent: bool, stride_us: int) -> None:
+        if stride_us <= 0:
+            raise ValueError("stream state stride must be positive")
+        self.recurrent = bool(recurrent)
+        self.stride_us = int(stride_us)
+        self._lanes: dict[int, _StreamLaneState] = {}
+        self._batched_lane_ids: tuple[int, ...] = ()
+        self._batched_state: RecurrentState | None = None
+
+    @staticmethod
+    def _validate_batch_metadata(
+        lane_ids: Sequence[int],
+        source_indices: Sequence[int],
+        timestamps: Sequence[int],
+        state_reset: torch.Tensor,
+    ) -> None:
+        batch_size = len(lane_ids)
+        if (
+            len(source_indices) != batch_size
+            or len(timestamps) != batch_size
+            or tuple(state_reset.shape) != (batch_size,)
+            or state_reset.dtype != torch.bool
+        ):
+            raise ValueError("stream metadata must contain one reset/source/time per lane")
+        if len(set(lane_ids)) != batch_size:
+            raise ValueError("a stream batch cannot contain a lane more than once")
+        if len(set(source_indices)) != batch_size:
+            raise ValueError("a recording cannot occupy multiple lanes in one batch")
+        if any(lane_id < 0 for lane_id in lane_ids):
+            raise ValueError("stream lane ids must be non-negative")
+
+    @staticmethod
+    def _zero_like(state: RecurrentState) -> RecurrentState:
+        if isinstance(state, torch.Tensor):
+            return torch.zeros_like(state)
+        return torch.zeros_like(state[0]), torch.zeros_like(state[1])
+
+    @staticmethod
+    def _concatenate(states: Sequence[RecurrentState]) -> RecurrentState:
+        first = states[0]
+        if isinstance(first, torch.Tensor):
+            if not all(isinstance(state, torch.Tensor) for state in states):
+                raise TypeError("stream lanes contain incompatible recurrent state types")
+            return torch.cat(list(states), dim=0)  # type: ignore[arg-type]
+        if not all(isinstance(state, tuple) and len(state) == 2 for state in states):
+            raise TypeError("stream lanes contain incompatible recurrent state types")
+        return (
+            torch.cat([state[0] for state in states], dim=0),  # type: ignore[index]
+            torch.cat([state[1] for state in states], dim=0),  # type: ignore[index]
+        )
+
+    @staticmethod
+    def _batch_size(state: RecurrentState) -> int:
+        if isinstance(state, torch.Tensor):
+            return int(state.shape[0])
+        if state[0].shape[0] != state[1].shape[0]:
+            raise ValueError("ConvLSTM hidden and cell states have different batch sizes")
+        return int(state[0].shape[0])
+
+    @staticmethod
+    def _row(state: RecurrentState, row: int) -> RecurrentState:
+        if isinstance(state, torch.Tensor):
+            return state[row : row + 1]
+        return state[0][row : row + 1], state[1][row : row + 1]
+
+    def prepare(
+        self,
+        *,
+        lane_ids: Sequence[int],
+        source_indices: Sequence[int],
+        timestamps: Sequence[int],
+        state_reset: torch.Tensor,
+    ) -> RecurrentState | None:
+        """Gather lane states into current batch-row order and apply resets."""
+
+        self._validate_batch_metadata(
+            lane_ids, source_indices, timestamps, state_reset
+        )
+        rows: list[RecurrentState | None] = []
+        for row, (lane_id, source_index, timestamp) in enumerate(
+            zip(lane_ids, source_indices, timestamps, strict=True)
+        ):
+            reset = bool(state_reset[row])
+            previous = self._lanes.get(lane_id)
+            if reset:
+                rows.append(None)
+                continue
+            if previous is None:
+                raise ValueError(
+                    f"stream lane {lane_id} continued without an initialized state"
+                )
+            if previous.source_index != source_index:
+                raise ValueError(
+                    f"stream lane {lane_id} changed recording without state reset"
+                )
+            expected_timestamp = previous.t_end_us + self.stride_us
+            if timestamp != expected_timestamp:
+                raise ValueError(
+                    f"stream lane {lane_id} is not causal at {timestamp}; "
+                    f"expected {expected_timestamp}"
+                )
+            if self.recurrent and previous.state is None:
+                raise RuntimeError(f"stream lane {lane_id} has no recurrent state")
+            rows.append(previous.state)
+
+        if not self.recurrent or all(state is None for state in rows):
+            return None
+        if tuple(lane_ids) == self._batched_lane_ids:
+            if self._batched_state is None:
+                raise RuntimeError("stream batch has no cached recurrent state")
+            if not bool(state_reset.any()):
+                return self._batched_state
+            reset_mask = state_reset.to(
+                device=(
+                    self._batched_state.device
+                    if isinstance(self._batched_state, torch.Tensor)
+                    else self._batched_state[0].device
+                )
+            )
+            return reset_recurrent_state(self._batched_state, reset_mask)
+        prototype = next(state for state in rows if state is not None)
+        gathered = [
+            self._zero_like(prototype) if state is None else state for state in rows
+        ]
+        return self._concatenate(gathered)
+
+    def update(
+        self,
+        *,
+        lane_ids: Sequence[int],
+        source_indices: Sequence[int],
+        timestamps: Sequence[int],
+        state: RecurrentState | None,
+    ) -> None:
+        """Split a model state into lane-owned detached rows after one stream step."""
+
+        batch_size = len(lane_ids)
+        if len(source_indices) != batch_size or len(timestamps) != batch_size:
+            raise ValueError("stream state update metadata has inconsistent lengths")
+        if self.recurrent:
+            if state is None:
+                raise RuntimeError("recurrent stream forward returned no state")
+            if self._batch_size(state) != batch_size:
+                raise ValueError("recurrent stream state has the wrong batch size")
+        elif state is not None:
+            raise ValueError("feedforward stream unexpectedly returned recurrent state")
+
+        detached_state = detach_recurrent_state(state)
+        active_lanes = set(lane_ids)
+        self._lanes = {
+            lane_id: lane_state
+            for lane_id, lane_state in self._lanes.items()
+            if lane_id in active_lanes
+        }
+        for row, (lane_id, source_index, timestamp) in enumerate(
+            zip(lane_ids, source_indices, timestamps, strict=True)
+        ):
+            lane_state = None
+            if detached_state is not None:
+                lane_state = self._row(detached_state, row)
+            self._lanes[lane_id] = _StreamLaneState(
+                source_index=source_index,
+                t_end_us=timestamp,
+                state=lane_state,
+            )
+        self._batched_lane_ids = tuple(lane_ids)
+        self._batched_state = detached_state
 
 
 def _collate_detection(
@@ -325,19 +656,41 @@ def _collate_detection(
 
 def _collate_stream_detection(
     batch: Sequence[
-        tuple[torch.Tensor, torch.Tensor, np.ndarray, int, bool, bool]
+        tuple[torch.Tensor, torch.Tensor, np.ndarray, int, bool, bool, int, int]
     ],
-) -> tuple[torch.Tensor, torch.Tensor, tuple[np.ndarray, ...], tuple[int, ...], bool, bool]:
-    if len(batch) != 1:
-        raise ValueError("stateful detection currently requires batch-size 1")
-    image, labels, ground_truth, timestamp, has_labels, state_reset = batch[0]
-    return (
-        image.unsqueeze(0),
-        labels.unsqueeze(0),
-        (ground_truth,),
-        (timestamp,),
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    tuple[np.ndarray, ...],
+    tuple[int, ...],
+    torch.Tensor,
+    torch.Tensor,
+    tuple[int, ...],
+    tuple[int, ...],
+]:
+    (
+        images,
+        labels,
+        ground_truth,
+        timestamps,
         has_labels,
         state_reset,
+        source_ids,
+        lane_ids,
+    ) = zip(*batch, strict=True)
+    maximum = max(len(value) for value in labels)
+    padded = torch.zeros((len(labels), maximum, 5), dtype=torch.float32)
+    for index, value in enumerate(labels):
+        padded[index, : len(value)] = value
+    return (
+        torch.stack(images),
+        padded,
+        tuple(ground_truth),
+        tuple(timestamps),
+        torch.tensor(has_labels, dtype=torch.bool),
+        torch.tensor(state_reset, dtype=torch.bool),
+        tuple(source_ids),
+        tuple(lane_ids),
     )
 
 
@@ -481,9 +834,14 @@ class WindowJEPAYOLOX(nn.Module):
         duration_ms: torch.Tensor,
         targets: torch.Tensor | None = None,
         *,
-        state: Any = None,
+        state: RecurrentState | None = None,
+        detection_mask: torch.Tensor | None = None,
         features_only: bool = False,
-    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None, Any]:
+    ) -> tuple[
+        torch.Tensor | None,
+        dict[str, torch.Tensor] | None,
+        RecurrentState | None,
+    ]:
         images = functional.pad(images, (0, 16, 0, 16))
         if self.freeze_backbone:
             with torch.no_grad():
@@ -494,10 +852,38 @@ class WindowJEPAYOLOX(nn.Module):
             base, next_state = _dynamic_encoder_feature_map_stateful(
                 self.backbone, images, duration_ms, state
             )
-        if features_only:
+        if detection_mask is None:
+            has_detection_rows = not features_only
+            detection_mask = torch.full(
+                (len(images),),
+                has_detection_rows,
+                dtype=torch.bool,
+                device=base.device,
+            )
+        else:
+            if (
+                detection_mask.dtype != torch.bool
+                or tuple(detection_mask.shape) != (len(images),)
+            ):
+                raise ValueError("detection_mask must be a boolean [B] tensor")
+            has_detection_rows = bool(detection_mask.any())
+            if features_only and has_detection_rows:
+                raise ValueError("features_only cannot select detection rows")
+            detection_mask = detection_mask.to(device=base.device)
+        if not has_detection_rows:
             return None, None, next_state
-        features = (self.p3(base), self.p4(base), self.p5(base))
-        decoded, losses = self.head(features, targets)
+        selected_base = base[detection_mask]
+        selected_targets = targets
+        if targets is not None:
+            if targets.ndim != 3 or targets.shape[0] != len(images):
+                raise ValueError("stateful targets must have shape [B,N,5]")
+            selected_targets = targets[detection_mask]
+        features = (
+            self.p3(selected_base),
+            self.p4(selected_base),
+            self.p5(selected_base),
+        )
+        decoded, losses = self.head(features, selected_targets)
         return decoded, losses, next_state
 
 
@@ -597,7 +983,10 @@ def _evaluate_stateful(
     model.eval()
     ground_truth: list[np.ndarray] = []
     predictions: list[np.ndarray] = []
-    state: Any = None
+    state_manager = StreamStateManager(
+        recurrent=model.recurrent,
+        stride_us=round(duration_ms * 1_000),
+    )
     for (
         images,
         _,
@@ -605,10 +994,17 @@ def _evaluate_stateful(
         timestamps,
         has_labels,
         state_reset,
+        source_indices,
+        lane_ids,
     ) in tqdm(loader, desc="stateful detection val"):
-        if state_reset:
-            state = None
+        state = state_manager.prepare(
+            lane_ids=lane_ids,
+            source_indices=source_indices,
+            timestamps=timestamps,
+            state_reset=state_reset,
+        )
         images = images.to(device, non_blocking=True)
+        detection_mask = has_labels
         duration = torch.full((len(images),), duration_ms, device=device)
         context = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -616,13 +1012,20 @@ def _evaluate_stateful(
             else nullcontext()
         )
         with context:
-            decoded, _, state = model.forward_stateful(
+            decoded, _, next_state = model.forward_stateful(
                 images,
                 duration,
                 state=state,
-                features_only=not has_labels,
+                detection_mask=detection_mask,
             )
-        if not has_labels:
+        state_manager.update(
+            lane_ids=lane_ids,
+            source_indices=source_indices,
+            timestamps=timestamps,
+            state=next_state,
+        )
+        selected_indices = torch.nonzero(has_labels, as_tuple=False).flatten().tolist()
+        if not selected_indices:
             continue
         if decoded is None:
             raise RuntimeError("stateful detector produced no labeled prediction")
@@ -632,10 +1035,14 @@ def _evaluate_stateful(
             conf_thre=confidence_threshold,
             nms_thre=nms_threshold,
         )
-        ground_truth.extend(batch_ground_truth)
+        selected_ground_truth = tuple(
+            batch_ground_truth[index] for index in selected_indices
+        )
+        selected_timestamps = tuple(timestamps[index] for index in selected_indices)
+        ground_truth.extend(selected_ground_truth)
         predictions.extend(
             _predictions_to_prophesee(
-                processed, timestamps, height=240, width=304
+                processed, selected_timestamps, height=240, width=304
             )
         )
     metrics = components.evaluate_list(
@@ -661,6 +1068,8 @@ def _save_checkpoint(
     metrics: dict[str, float],
     best_ap: float,
     best_epoch: int,
+    pretrain_config_hash: str,
+    backbone_fingerprint: str,
 ) -> None:
     detector_state = {
         name: value
@@ -675,14 +1084,20 @@ def _save_checkpoint(
         )
     }
     payload = {
-        "schema": "event-window-jepa-gen1-yolox-v1",
+        "schema": "event-window-jepa-gen1-yolox-v2",
         "model": detector_state,
         "optimizer": optimizer.state_dict(),
         "epoch": epoch,
         "backbone_init": args.backbone_init,
         "pretrain_checkpoint": str(args.checkpoint.resolve()),
+        "pretrain_config_hash": pretrain_config_hash,
+        "backbone_fingerprint": backbone_fingerprint,
         "window_ms": args.window_ms,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "precision": args.precision,
         "stateful": args.stateful,
+        "stateful_lane_schema": "stable-lanes-v1" if args.stateful else None,
         "metrics": metrics,
         "best_ap": best_ap,
         "best_epoch": best_epoch,
@@ -709,19 +1124,119 @@ def _validate_args(args: argparse.Namespace) -> None:
         args.learning_rate,
         args.eval_every,
     )
-    if any(value <= 0 for value in positive):
+    if any(value <= 0 for value in positive) or round(args.window_ms * 1_000) <= 0:
         raise ValueError("window, batch, epoch, learning-rate, and eval cadence must be positive")
     if args.workers < 0 or min(args.max_train_frames, args.max_val_frames) < 0:
         raise ValueError("workers and frame limits cannot be negative")
     if not 0 < args.confidence_threshold < 1 or not 0 < args.nms_threshold < 1:
         raise ValueError("confidence and NMS thresholds must lie inside (0, 1)")
-    if args.stateful and args.batch_size != 1:
-        raise ValueError("stateful detection requires --batch-size 1")
     if args.stateful and args.unfreeze_backbone:
         raise ValueError(
             "stateful detection currently requires a frozen backbone; updating "
             "recurrent weights while carrying old state would be inconsistent"
         )
+
+
+def _validate_stateful_window_duration(
+    requested_ms: float,
+    *,
+    stateful: bool,
+    sequence_loader: bool,
+    checkpoint_ms: float,
+) -> None:
+    """Prevent a sequence checkpoint from silently changing its frame cadence."""
+
+    if not stateful or not sequence_loader:
+        return
+    requested_us = round(requested_ms * 1_000)
+    checkpoint_us = round(checkpoint_ms * 1_000)
+    if requested_us != checkpoint_us:
+        raise ValueError(
+            f"stateful --window-ms {requested_ms:g} does not match checkpoint "
+            f"recurrent.window_ms={checkpoint_ms:g}; use the checkpoint cadence"
+        )
+
+
+def _feature_backbone_fingerprint(backbone: nn.Module) -> str:
+    """Hash weights used by the full-frame feature path, independent of file path."""
+
+    digest = hashlib.sha256()
+    for namespace in ("online_encoder", "scale_embedding"):
+        module = getattr(backbone, namespace)
+        for name, tensor in sorted(module.state_dict().items()):
+            value = tensor.detach().cpu().contiguous()
+            identity = (
+                f"{namespace}.{name}\0{value.dtype}\0{tuple(value.shape)}\0"
+            ).encode("utf-8")
+            digest.update(identity)
+            digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _validate_detection_resume_metadata(
+    resumed: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    pretrain_config_hash: str,
+    backbone_fingerprint: str,
+) -> None:
+    """Reject resume combinations that would silently mix experiments."""
+
+    schema = resumed.get("schema")
+    if schema not in {
+        "event-window-jepa-gen1-yolox-v1",
+        "event-window-jepa-gen1-yolox-v2",
+    }:
+        raise ValueError("unsupported detection checkpoint")
+    if bool(resumed.get("stateful", False)) != args.stateful:
+        raise ValueError("detection resume stateful mode does not match checkpoint")
+    if schema == "event-window-jepa-gen1-yolox-v1":
+        # Stateless v1 keeps its historical resume behavior. Stateful v1 was a
+        # single-recording stream and is compatible only with the B=1 lane path.
+        if args.stateful:
+            saved_path = resumed.get("pretrain_checkpoint")
+            if saved_path is None or Path(saved_path).expanduser().resolve() != (
+                args.checkpoint.expanduser().resolve()
+            ):
+                raise ValueError(
+                    "legacy stateful detection pretrain checkpoint path does not match"
+                )
+            if resumed.get("backbone_init") != args.backbone_init:
+                raise ValueError(
+                    "legacy stateful detection backbone_init does not match"
+                )
+            if args.backbone_init == "random":
+                raise ValueError(
+                    "legacy stateful detection with a random backbone cannot be "
+                    "resumed because v1 did not store its seed or fingerprint"
+                )
+            if round(float(resumed.get("window_ms", -1.0)) * 1_000) != round(
+                args.window_ms * 1_000
+            ):
+                raise ValueError("legacy stateful detection window_ms does not match")
+            if args.batch_size != 1:
+                raise ValueError(
+                    "legacy stateful detection checkpoint can only resume with "
+                    "batch size 1"
+                )
+        return
+
+    required_identity = {
+        "pretrain_config_hash": pretrain_config_hash,
+        "backbone_fingerprint": backbone_fingerprint,
+        "backbone_init": args.backbone_init,
+        "seed": args.seed,
+        "batch_size": args.batch_size,
+        "precision": args.precision,
+        "stateful_lane_schema": "stable-lanes-v1" if args.stateful else None,
+    }
+    for name, expected in required_identity.items():
+        if resumed.get(name) != expected:
+            raise ValueError(f"detection resume {name} does not match checkpoint")
+    if round(float(resumed.get("window_ms", -1.0)) * 1_000) != round(
+        args.window_ms * 1_000
+    ):
+        raise ValueError("detection resume window_ms does not match checkpoint")
 
 
 def train(args: argparse.Namespace) -> None:
@@ -733,16 +1248,39 @@ def train(args: argparse.Namespace) -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     backbone, config = load_pretrained_model(args.checkpoint, device=device)
+    _validate_stateful_window_duration(
+        args.window_ms,
+        stateful=args.stateful,
+        sequence_loader=bool(config.recurrent.sequence_loader),
+        checkpoint_ms=config.recurrent.window_ms,
+    )
     if args.backbone_init == "random":
         from event_window_jepa.train.pretrain import build_model
 
         torch.manual_seed(args.seed)
         backbone = build_model(config).to(device)
+    pretrain_config_hash = config_hash(config)
+    backbone_fingerprint = _feature_backbone_fingerprint(backbone)
     recurrent_checkpoint = isinstance(
         backbone.online_encoder, RecurrentVJEPA21EventVisionTransformer
     )
     if recurrent_checkpoint and not args.stateful:
         require_feedforward_feature_model(backbone, caller="Gen1 detection")
+    resumed: dict[str, Any] | None = None
+    if args.resume is not None:
+        resumed = torch.load(args.resume, map_location="cpu", weights_only=False)
+        _validate_detection_resume_metadata(
+            resumed,
+            args,
+            pretrain_config_hash=pretrain_config_hash,
+            backbone_fingerprint=backbone_fingerprint,
+        )
+        if resumed.get("schema") == "event-window-jepa-gen1-yolox-v1" and args.stateful:
+            print(
+                "[gen1-detect] warning: legacy v1 stateful resume migrates "
+                "recording order to seeded epoch shuffle",
+                flush=True,
+            )
     components = _load_rvt_components()
     representation = _representation(config)
     train_sources = _read_label_sources(args.train_manifest)
@@ -767,6 +1305,7 @@ def train(args: argparse.Namespace) -> None:
                 train_labeled_references,
                 duration_us=duration_us,
                 maximum_labeled_frames=args.max_train_frames,
+                stream_lanes=args.batch_size,
             )
         )
         val_references: Sequence[FrameReference | StreamFrameReference] = (
@@ -775,6 +1314,7 @@ def train(args: argparse.Namespace) -> None:
                 val_labeled_references,
                 duration_us=duration_us,
                 maximum_labeled_frames=args.max_val_frames,
+                stream_lanes=args.batch_size,
             )
         )
     else:
@@ -794,12 +1334,7 @@ def train(args: argparse.Namespace) -> None:
     start_epoch = 0
     best_ap = float("-inf")
     best_epoch = 0
-    if args.resume is not None:
-        resumed = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if resumed.get("schema") != "event-window-jepa-gen1-yolox-v1":
-            raise ValueError("unsupported detection checkpoint")
-        if bool(resumed.get("stateful", False)) != args.stateful:
-            raise ValueError("detection resume stateful mode does not match checkpoint")
+    if resumed is not None:
         incompatible = model.load_state_dict(resumed["model"], strict=False)
         unexpected = list(incompatible.unexpected_keys)
         missing = [
@@ -833,50 +1368,98 @@ def train(args: argparse.Namespace) -> None:
         representation=representation,
     )
     train_generator = torch.Generator().manual_seed(args.seed)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=not args.stateful,
-        generator=train_generator,
-        num_workers=args.workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=args.workers > 0,
-        collate_fn=(
-            _collate_stream_detection if args.stateful else _collate_detection
-        ),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=args.workers > 0,
-        collate_fn=(
-            _collate_stream_detection if args.stateful else _collate_detection
-        ),
-    )
+    loader_options = {
+        "num_workers": args.workers,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": args.workers > 0,
+    }
+    if args.stateful:
+        train_lane_sampler = StreamLaneBatchSampler(
+            train_dataset.references,
+            args.batch_size,
+            shuffle=True,
+            seed=args.seed,
+        )
+        val_lane_sampler = StreamLaneBatchSampler(
+            val_dataset.references,
+            args.batch_size,
+            shuffle=False,
+            seed=args.seed + 1,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_lane_sampler,
+            collate_fn=_collate_stream_detection,
+            **loader_options,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_sampler=val_lane_sampler,
+            collate_fn=_collate_stream_detection,
+            **loader_options,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            generator=train_generator,
+            collate_fn=_collate_detection,
+            **loader_options,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=_collate_detection,
+            **loader_options,
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "train.jsonl"
     print(
-        f"[gen1-detect] train={len(train_dataset)}, val={len(val_dataset)}, "
+        f"[gen1-detect] train_windows={len(train_dataset)}, "
+        f"val_windows={len(val_dataset)}, "
         f"init={args.backbone_init}, frozen={not args.unfreeze_backbone}, "
-        f"stateful={args.stateful}, recurrent={recurrent_checkpoint}"
+        f"stateful={args.stateful}, recurrent={recurrent_checkpoint}, "
+        f"train_batches={len(train_loader)}, batch_size={args.batch_size}",
+        flush=True,
     )
     for epoch in range(start_epoch, args.epochs):
+        if args.stateful:
+            train_lane_sampler.set_epoch(epoch)
         model.train()
         running: dict[str, float] = {}
         samples = 0
         progress = tqdm(train_loader, desc=f"detection epoch {epoch + 1}/{args.epochs}")
-        state: Any = None
+        state_manager = StreamStateManager(
+            recurrent=model.recurrent,
+            stride_us=duration_us,
+        )
         for batch in progress:
             if args.stateful:
-                images, targets, _, _, has_labels, state_reset = batch
-                if state_reset:
-                    state = None
+                (
+                    images,
+                    targets,
+                    _,
+                    timestamps,
+                    has_labels,
+                    state_reset,
+                    source_indices,
+                    lane_ids,
+                ) = batch
+                state = state_manager.prepare(
+                    lane_ids=lane_ids,
+                    source_indices=source_indices,
+                    timestamps=timestamps,
+                    state_reset=state_reset,
+                )
+                detection_mask = has_labels
+                labeled_batch_size = int(has_labels.sum())
             else:
                 images, targets, _, _ = batch
-                has_labels = True
+                detection_mask = None
+                labeled_batch_size = len(images)
+                state = None
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             duration = torch.full((len(images),), args.window_ms, device=device)
@@ -885,38 +1468,46 @@ def train(args: argparse.Namespace) -> None:
                 if args.precision == "bf16" and device.type == "cuda"
                 else nullcontext()
             )
-            if args.stateful and not has_labels:
-                with context:
-                    _, _, state = model.forward_stateful(
-                        images,
-                        duration,
-                        state=state,
-                        features_only=True,
-                    )
-                continue
-            optimizer.zero_grad(set_to_none=True)
+            if labeled_batch_size:
+                optimizer.zero_grad(set_to_none=True)
             with context:
                 if args.stateful:
-                    _, losses, state = model.forward_stateful(
+                    _, losses, next_state = model.forward_stateful(
                         images,
                         duration,
                         targets,
                         state=state,
+                        detection_mask=detection_mask,
                     )
                 else:
                     _, losses = model(images, duration, targets)
+                    next_state = None
+            if args.stateful:
+                state_manager.update(
+                    lane_ids=lane_ids,
+                    source_indices=source_indices,
+                    timestamps=timestamps,
+                    state=next_state,
+                )
+            if not labeled_batch_size:
+                if losses is not None:
+                    raise RuntimeError("YOLOX returned losses for an unlabeled stream batch")
+                continue
             if losses is None:
                 raise RuntimeError("YOLOX returned no training losses")
             loss = losses["loss"]
             loss.backward()
             torch.nn.utils.clip_grad_norm_(parameters, 10.0)
             optimizer.step()
-            batch_size = len(images)
-            samples += batch_size
+            samples += labeled_batch_size
             for name, value in losses.items():
                 numeric = float(value.detach()) if torch.is_tensor(value) else float(value)
-                running[name] = running.get(name, 0.0) + numeric * batch_size
+                running[name] = (
+                    running.get(name, 0.0) + numeric * labeled_batch_size
+                )
             progress.set_postfix(loss=f"{float(loss.detach()):.4f}", refresh=False)
+        if samples == 0:
+            raise RuntimeError("detection epoch contained no labeled frames")
         train_metrics = {name: value / samples for name, value in running.items()}
         should_evaluate = (epoch + 1) % args.eval_every == 0 or epoch + 1 == args.epochs
         validation_metrics: dict[str, float] = {}
@@ -936,10 +1527,13 @@ def train(args: argparse.Namespace) -> None:
             "epoch": epoch + 1,
             "train": train_metrics,
             "validation": validation_metrics,
+            "train_labeled_frames": samples,
+            "train_input_frames": len(train_dataset),
+            "train_batches": len(train_loader),
         }
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
-        print(f"[gen1-detect] {json.dumps(record, sort_keys=True)}")
+        print(f"[gen1-detect] {json.dumps(record, sort_keys=True)}", flush=True)
         current_ap = validation_metrics.get("AP")
         if current_ap is not None and current_ap > best_ap:
             best_ap = current_ap
@@ -953,6 +1547,8 @@ def train(args: argparse.Namespace) -> None:
                 metrics=validation_metrics,
                 best_ap=best_ap,
                 best_epoch=best_epoch,
+                pretrain_config_hash=pretrain_config_hash,
+                backbone_fingerprint=backbone_fingerprint,
             )
         _save_checkpoint(
             args.output_dir / "checkpoint-latest.pt",
@@ -963,6 +1559,8 @@ def train(args: argparse.Namespace) -> None:
             metrics=validation_metrics,
             best_ap=best_ap,
             best_epoch=best_epoch,
+            pretrain_config_hash=pretrain_config_hash,
+            backbone_fingerprint=backbone_fingerprint,
         )
 
 

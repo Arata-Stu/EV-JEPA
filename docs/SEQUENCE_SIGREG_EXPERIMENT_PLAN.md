@@ -29,6 +29,13 @@ Stage 2では`gen1_detection --stateful`がrecurrent checkpointを受け取り�
 ラベルなし窓を含めてstateを更新する。既存ROI probeは引き続きrecurrent checkpointを拒否する
 ため補助分類評価は未実装だが、主指標のstateful Detection APでmodel選択できる。
 
+stateful DetectionはRVT型の複数recording laneを使う。各laneは50 ms frameを1 stepずつ
+因果順に進め、lane交代時だけresetし、step後のstateをdetachして次のbatchへ渡す。50 ms内部の
+temporal binsはrecurrent stepではなくchannelである。公式RVT Gen1の10 bins × 2 polarity =
+20 chに対し、本計画の2 ch（1 bin × 2）と10 ch（5 bins × 2）は、どちらも50 ms frame全体を
+空間encoderへ一括入力して1回だけrecurrent updateする。この違いはStage 1の入力表現比較であり、
+state update周波数の比較ではない。
+
 Stage 3で使用予定の`patch_event_activity: [B,T,P]`はloaderに実装済みだが、
 `return_patch_event_activity: true`へ変更しただけではSIGRegは有効にならない。
 
@@ -205,12 +212,15 @@ metadataをmodel計算に使わない。
 - labelのない窓でもstateを更新する。
 - sequence境界だけでstateをresetする。
 - validation中にstreamをshuffleしない。
-- Feedforwardにも同一timestamp/sample集合を使う。
+- Feedforwardにも同一loader、timestamp/sample集合を使うが、stateは保持しない。
+- 複数recording laneを1回のbackbone forwardで処理し、label有りrowだけをhead/lossへ渡す。
+- Detectionのframe幅をcheckpointの`recurrent.window_ms`と一致させる。
 - 凍結headとfine-tuneの結果を分ける。
 
 主指標はstateful Gen1 Detection APとする。凍結分類macro-F1はrecurrent版が未実装なので
-現時点では補助表から外す。stateful Detectionはbatch 1・凍結backboneで実行し、validation AP
-最大時の`checkpoint-best.pt`と最新再開用`checkpoint-latest.pt`を分けて保存する。
+現時点では補助表から外す。stateful Detectionのbatch sizeは同時recording lane数（R0は8）で、
+凍結backboneで実行する。batch 1も互換経路として残す。validation AP最大時の
+`checkpoint-best.pt`と最新再開用`checkpoint-latest.pt`を分けて保存する。
 
 ### 選択規則
 
