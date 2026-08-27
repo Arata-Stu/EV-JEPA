@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -190,6 +192,51 @@ def test_mixed_sampler_epoch_shuffle_is_deterministic_and_shards_stay_fixed() ->
     assert next_membership == fixed_membership
 
 
+def test_stream_only_and_stream_reset_share_identical_sampling() -> None:
+    common = {
+        "base_window_ms": 50,
+        "stride_ms": 50,
+        "sequence_length": 2,
+        "burn_in_steps": 1,
+        "samples_per_epoch": 16,
+        "batch_size": 4,
+        "stream_ratio": (1, 0),
+        "seed": 29,
+    }
+    carried = MixedRecurrentBatchSampler(_mixed_sequences(), **common)
+    reset = MixedRecurrentBatchSampler(
+        _mixed_sequences(), **common, force_stream_reset=True
+    )
+
+    carried_batches = list(carried)
+    reset_batches = list(reset)
+    assert carried.stream_batch_size == reset.stream_batch_size == 4
+    assert carried.random_batch_size == reset.random_batch_size == 0
+    assert len(carried_batches) == len(reset_batches) == 4
+
+    observed_continuation = False
+    for carried_batch, reset_batch in zip(
+        carried_batches, reset_batches, strict=True
+    ):
+        assert [request.sampling_mode for request in carried_batch] == [
+            "stream"
+        ] * 4
+        for carried_request, reset_request in zip(
+            carried_batch, reset_batch, strict=True
+        ):
+            assert replace(
+                reset_request, state_reset=carried_request.state_reset
+            ) == carried_request
+            assert carried_request.clip == reset_request.clip
+            assert carried_request.stream_id == reset_request.stream_id
+            assert carried_request.augmentation_seed == reset_request.augmentation_seed
+            assert carried_request.augmentation_id == reset_request.augmentation_id
+            assert carried_request.mask_seed == reset_request.mask_seed
+            assert reset_request.state_reset is True
+            observed_continuation |= not carried_request.state_reset
+    assert observed_continuation
+
+
 def test_mixed_sampler_drops_only_incomplete_global_batch_and_validates_streaming() -> None:
     sampler = MixedRecurrentBatchSampler(
         _mixed_sequences(),
@@ -214,6 +261,17 @@ def test_mixed_sampler_drops_only_incomplete_global_batch_and_validates_streamin
             burn_in_steps=1,
             samples_per_epoch=64,
             batch_size=4,
+        )
+    with pytest.raises(ValueError, match="1:1"):
+        MixedRecurrentBatchSampler(
+            _mixed_sequences(),
+            base_window_ms=50,
+            stride_ms=50,
+            sequence_length=2,
+            burn_in_steps=1,
+            samples_per_epoch=64,
+            batch_size=4,
+            stream_ratio=(1, 3),
         )
 
 

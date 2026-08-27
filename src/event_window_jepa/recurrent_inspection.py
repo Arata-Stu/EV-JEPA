@@ -430,20 +430,24 @@ def inspect_mixed_recurrent_batches(
         bool(metadata["state_reset"]) for metadata in metadata_batches[0]
     )
     stream_reset_contract = all(
-        bool(second["state_reset"]) != is_continuous
+        bool(second["state_reset"])
+        == (batch_sampler.force_stream_reset or not is_continuous)
         for (_, second), is_continuous in zip(
             stream_metadata_pairs, stream_continuity, strict=True
         )
     )
     augmentation_contract = all(
-        bool(second["state_reset"])
+        not is_continuous
         or (
             first["augmentation_seed"] == second["augmentation_seed"]
             and first["augmentation_id"] == second["augmentation_id"]
             and first_debug.spatial_transform == second_debug.spatial_transform
         )
-        for (first, second), (first_debug, second_debug) in zip(
-            stream_metadata_pairs, stream_debug_pairs, strict=True
+        for (first, second), (first_debug, second_debug), is_continuous in zip(
+            stream_metadata_pairs,
+            stream_debug_pairs,
+            stream_continuity,
+            strict=True,
         )
     )
     random_resets = all(
@@ -974,7 +978,7 @@ def main() -> None:
         raise ValueError("the inspection config must build a recurrent dataset")
     mixed_batch_sampler = (
         build_recurrent_batch_sampler(config, dataset, world_size=1, rank=0)
-        if config.recurrent.sampling == "mixed"
+        if config.recurrent.sampling in {"stream_reset", "stream", "mixed"}
         else None
     )
     output = args.output or (

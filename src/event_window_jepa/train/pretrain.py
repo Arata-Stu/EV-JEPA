@@ -262,15 +262,17 @@ def build_recurrent_batch_sampler(
     world_size: int,
     rank: int,
 ) -> MixedRecurrentBatchSampler:
-    """Build the RVT-style stream/random sampler for one DDP rank."""
+    """Build stable stream lanes, optionally mixed with random clips, per rank."""
 
     if (
         not config.recurrent.sequence_loader
-        or config.recurrent.sampling != "mixed"
+        or config.recurrent.sampling not in {"stream_reset", "stream", "mixed"}
     ):
-        raise ValueError("mixed sequence batch sampling is not enabled")
-    stream_batch_size = round(
-        config.data.batch_size * config.recurrent.stream_ratio
+        raise ValueError("stream-aware sequence batch sampling is not enabled")
+    stream_batch_size = (
+        config.data.batch_size
+        if config.recurrent.sampling in {"stream_reset", "stream"}
+        else round(config.data.batch_size * config.recurrent.stream_ratio)
     )
     random_batch_size = config.data.batch_size - stream_batch_size
     return MixedRecurrentBatchSampler(
@@ -286,6 +288,7 @@ def build_recurrent_batch_sampler(
         rank=rank,
         seed=config.runtime.seed,
         random_sampling_strategy=config.data.sequence_sampling,
+        force_stream_reset=config.recurrent.sampling == "stream_reset",
     )
 
 
@@ -306,18 +309,19 @@ def _validate_mixed_recurrent_batch(
     stream_batch_size: int,
     stride_us: int,
     previous_streams: MixedStreamContract | None,
+    stream_reset_every_batch: bool = False,
 ) -> MixedStreamContract:
-    """Validate lane stability and causality before a mixed batch reaches the GPU."""
+    """Validate lane stability and causality before a stream-aware GPU batch."""
 
-    if not 0 < stream_batch_size < batch_size:
-        raise ValueError("mixed batches require both stream and random rows")
+    if not 0 < stream_batch_size <= batch_size:
+        raise ValueError("stream-aware batches require at least one stream row")
     expected_modes = ["stream"] * stream_batch_size + ["random"] * (
         batch_size - stream_batch_size
     )
     modes = batch.get("sampling_mode")
     if not isinstance(modes, (list, tuple)) or list(modes) != expected_modes:
         raise ValueError(
-            "mixed recurrent rows must be ordered as fixed stream lanes followed "
+            "stream-aware recurrent rows must be ordered as fixed stream lanes followed "
             "by random clips"
         )
 
@@ -328,14 +332,14 @@ def _validate_mixed_recurrent_batch(
         or resets.dtype != torch.bool
         or tuple(resets.shape) != (batch_size,)
     ):
-        raise ValueError("mixed recurrent state_reset must be a boolean [B] tensor")
+        raise ValueError("stream-aware recurrent state_reset must be a boolean [B] tensor")
     if (
         not isinstance(timestamps, torch.Tensor)
         or timestamps.ndim != 2
         or timestamps.shape[0] != batch_size
         or timestamps.shape[1] == 0
     ):
-        raise ValueError("mixed recurrent t_end_us must have shape [B,T]")
+        raise ValueError("stream-aware recurrent t_end_us must have shape [B,T]")
 
     sequence_ids = batch.get("sequence_id")
     stream_ids = batch.get("stream_id")
@@ -346,10 +350,12 @@ def _validate_mixed_recurrent_batch(
         ("augmentation_id", augmentation_ids),
     ):
         if not isinstance(values, (list, tuple)) or len(values) != batch_size:
-            raise ValueError(f"mixed recurrent {name} must contain one value per row")
+            raise ValueError(
+                f"stream-aware recurrent {name} must contain one value per row"
+            )
 
     if previous_streams is not None and len(previous_streams) != stream_batch_size:
-        raise ValueError("previous mixed stream contract has the wrong lane count")
+        raise ValueError("previous stream contract has the wrong lane count")
     current_streams: list[tuple[str, str, str, int]] = []
     for row in range(stream_batch_size):
         stream_id = str(stream_ids[row])
@@ -360,9 +366,13 @@ def _validate_mixed_recurrent_batch(
         reset = bool(resets[row])
         if not stream_id:
             raise ValueError("stream rows require stable non-empty stream_id values")
+        if stream_reset_every_batch and not reset:
+            raise ValueError("stream_reset rows must reset recurrent state every batch")
         if previous_streams is None:
             if not reset:
-                raise ValueError("the first mixed batch must reset every stream lane")
+                raise ValueError(
+                    "the first stream-aware batch must reset every stream lane"
+                )
         else:
             (
                 previous_stream_id,
@@ -371,7 +381,7 @@ def _validate_mixed_recurrent_batch(
                 previous_last_end_us,
             ) = previous_streams[row]
             if stream_id != previous_stream_id:
-                raise ValueError("a mixed stream lane changed position between batches")
+                raise ValueError("a stream lane changed position between batches")
             is_adjacent = first_end_us == previous_last_end_us + stride_us
             if not reset and (
                 sequence_id != previous_sequence_id
@@ -382,7 +392,12 @@ def _validate_mixed_recurrent_batch(
                     "a non-reset stream row changed sequence, augmentation, or causal "
                     "timestamp continuity"
                 )
-            if reset and sequence_id == previous_sequence_id and is_adjacent:
+            if (
+                reset
+                and not stream_reset_every_batch
+                and sequence_id == previous_sequence_id
+                and is_adjacent
+            ):
                 raise ValueError("a continuous stream row was reset before its next chunk")
         current_streams.append(
             (stream_id, sequence_id, augmentation_id, last_end_us)
@@ -783,7 +798,7 @@ def train(
     }
     if (
         config.recurrent.sequence_loader
-        and config.recurrent.sampling == "mixed"
+        and config.recurrent.sampling in {"stream_reset", "stream", "mixed"}
         and isinstance(dataset, RecurrentWindowDataset)
     ):
         mixed_batch_sampler = build_recurrent_batch_sampler(
@@ -895,10 +910,23 @@ def train(
                     f", stream_per_rank={mixed_batch_sampler.stream_batch_size}, "
                     f"random_per_rank={mixed_batch_sampler.random_batch_size}"
                 )
+            elif config.recurrent.sampling in {"clip", "random"}:
+                mixture = (
+                    f", stream_per_rank=0, random_per_rank={config.data.batch_size}"
+                )
             temporal_execution = (
                 f"tbptt_chunks_per_update={chunks}, "
                 if config.recurrent.enabled
                 else "independent_frame_forward=true, "
+            )
+            cross_batch_state = (
+                "not_applicable"
+                if not config.recurrent.enabled
+                else (
+                    "carry_detached_stream_rows"
+                    if config.recurrent.sampling in {"stream", "mixed"}
+                    else "reset_all_rows"
+                )
             )
             print(
                 "[window-jepa] temporal sequence: "
@@ -908,6 +936,7 @@ def train(
                 f"burn_in={config.recurrent.burn_in_steps}, "
                 f"supervised_steps={config.recurrent.sequence_length}, "
                 f"{temporal_execution}"
+                f"cross_batch_state={cross_batch_state}, "
                 f"effective_clips_per_epoch={effective_clips}, "
                 f"input_frames_per_epoch={input_frames}, "
                 f"supervised_frames_per_epoch={processed_frames}",
@@ -942,6 +971,9 @@ def train(
                             stream_batch_size=mixed_batch_sampler.stream_batch_size,
                             stride_us=mixed_batch_sampler.stride_us,
                             previous_streams=previous_stream_contract,
+                            stream_reset_every_batch=(
+                                config.recurrent.sampling == "stream_reset"
+                            ),
                         )
                     batch = _move_batch(raw_batch, device)
                     learning_rate = learning_rate_at_step(
@@ -957,17 +989,17 @@ def train(
                     recurrent_state_rms = torch.zeros((), device=device)
                     if config.recurrent.enabled:
                         initial_state = None
-                        if config.recurrent.sampling == "mixed":
+                        if config.recurrent.sampling in {"stream", "mixed"}:
                             reset_mask = batch.get("state_reset")
                             if not isinstance(reset_mask, torch.Tensor):
                                 raise ValueError(
-                                    "mixed recurrent batches require state_reset [B]"
+                                    "stream-aware recurrent batches require state_reset [B]"
                                 )
                             if carried_recurrent_state is None and not bool(
                                 reset_mask.all()
                             ):
                                 raise ValueError(
-                                    "the first mixed batch of an epoch must reset every "
+                                    "the first stream-aware batch of an epoch must reset every "
                                     "stream and random lane"
                                 )
                             initial_state = reset_recurrent_state(
@@ -990,7 +1022,7 @@ def train(
                         )
                         carried_recurrent_state = (
                             detach_recurrent_state(final_recurrent_state)
-                            if config.recurrent.sampling == "mixed"
+                            if config.recurrent.sampling in {"stream", "mixed"}
                             else None
                         )
                     elif config.recurrent.sequence_loader:

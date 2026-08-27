@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,6 +21,7 @@ from event_window_jepa.data.spatial_transforms import (
 )
 from event_window_jepa.data.types import EventWindow, SequenceInfo
 from event_window_jepa.masks.multiblock import MultiBlockMaskGenerator
+from event_window_jepa.train.pretrain import build_recurrent_batch_sampler
 from event_window_jepa.representations.event_image import EventImage
 
 
@@ -413,3 +415,93 @@ def test_mixed_batch_sampler_requests_collate_to_recurrent_batch() -> None:
     assert batch["state_reset"].dtype == torch.bool
     assert batch["augmentation_seed"].shape == batch["mask_seed"].shape == (4,)
     assert batch["mask_step_seeds"].shape == (4, 3)
+
+
+def test_stream_only_loader_collates_stable_lanes_with_optional_forced_reset() -> None:
+    dataset, _ = _mixed_dataset()
+    common = {
+        "base_window_ms": 50,
+        "stride_ms": 50,
+        "sequence_length": 2,
+        "burn_in_steps": 1,
+        "samples_per_epoch": 8,
+        "batch_size": 4,
+        "stream_ratio": (1, 0),
+        "seed": 41,
+        "random_sampling_strategy": "sequence_balanced",
+    }
+    stream_sampler = MixedRecurrentBatchSampler(
+        dataset.clip_sampler.sequences, **common
+    )
+    stream_batches = iter(
+        DataLoader(dataset, batch_sampler=stream_sampler, num_workers=0)
+    )
+    first = next(stream_batches)
+    second = next(stream_batches)
+    assert first["sampling_mode"] == second["sampling_mode"] == ["stream"] * 4
+    assert first["state_reset"].tolist() == [True] * 4
+    assert second["state_reset"].tolist() == [False] * 4
+    assert first["stream_id"] == second["stream_id"]
+    assert first["augmentation_id"] == second["augmentation_id"]
+    assert torch.equal(
+        second["t_end_us"][:, 0], first["t_end_us"][:, -1] + 50_000
+    )
+
+    reset_sampler = MixedRecurrentBatchSampler(
+        dataset.clip_sampler.sequences, **common, force_stream_reset=True
+    )
+    reset_batches = iter(
+        DataLoader(dataset, batch_sampler=reset_sampler, num_workers=0)
+    )
+    reset_first = next(reset_batches)
+    reset_second = next(reset_batches)
+    assert reset_first["state_reset"].tolist() == [True] * 4
+    assert reset_second["state_reset"].tolist() == [True] * 4
+    assert torch.equal(reset_first["t_end_us"], first["t_end_us"])
+    assert torch.equal(reset_second["t_end_us"], second["t_end_us"])
+    assert reset_second["augmentation_id"] == second["augmentation_id"]
+
+
+def test_pretrain_builder_makes_stream_reset_and_stream_sampling_identical() -> None:
+    dataset, _ = _mixed_dataset()
+
+    def build(mode: str) -> MixedRecurrentBatchSampler:
+        config = SimpleNamespace(
+            recurrent=SimpleNamespace(
+                sequence_loader=True,
+                sampling=mode,
+                stream_ratio=0.5,
+                window_ms=50,
+                stride_ms=50,
+                sequence_length=2,
+                burn_in_steps=1,
+            ),
+            data=SimpleNamespace(
+                batch_size=4,
+                samples_per_epoch=8,
+                sequence_sampling="sequence_balanced",
+            ),
+            runtime=SimpleNamespace(seed=41),
+        )
+        return build_recurrent_batch_sampler(
+            config, dataset, world_size=1, rank=0
+        )
+
+    stream_reset = build("stream_reset")
+    stream = build("stream")
+    mixed = build("mixed")
+    assert (stream_reset.stream_batch_size, stream_reset.random_batch_size) == (4, 0)
+    assert (stream.stream_batch_size, stream.random_batch_size) == (4, 0)
+    assert (mixed.stream_batch_size, mixed.random_batch_size) == (2, 2)
+    assert stream_reset.force_stream_reset is True
+    assert stream.force_stream_reset is False
+
+    reset_batches = list(stream_reset)
+    stream_batches = list(stream)
+    for reset_batch, stream_batch in zip(reset_batches, stream_batches, strict=True):
+        for reset_request, stream_request in zip(
+            reset_batch, stream_batch, strict=True
+        ):
+            assert reset_request.clip == stream_request.clip
+            assert reset_request.augmentation_id == stream_request.augmentation_id
+            assert reset_request.mask_seed == stream_request.mask_seed

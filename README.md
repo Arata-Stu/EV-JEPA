@@ -140,6 +140,21 @@ FP16、native BF16対応GPUでBF16へ解決し、FP32経路も明示指定で残
 | `true` | `feedforward` | `sequence_window_jepa` / `sequence_dense_window_jepa` | 同じ時系列sampleを状態なしencoderで処理する比較 |
 | `true` | `conv_gru` / `conv_lstm` | `recurrent_window_jepa` / `recurrent_dense_window_jepa` | BPTT/TBPTTを使うrecurrent比較 |
 
+時系列samplingは`recurrent.sampling`で独立に切り替えます。
+
+| mode | 入力 | chunk境界のstate | 解釈 |
+|---|---|---|---|
+| `random` | 独立random clip | 毎回reset | chunk内full BPTT |
+| `stream_reset` | 因果stream lane | 毎回reset | `stream`とsamplingを揃えた対照 |
+| `stream` | 因果stream lane | detachしてcarry | TBPTT |
+| `mixed` | stream 50% + random 50% | rowごとにcarry/reset | RVT型hybrid |
+
+`stream_reset`と`stream`はlane、timestamp、augmentation、JEPA mask seedを同一にし、
+state carryの有無だけを変えます。したがってBPTT/TBPTTの主比較はこの2条件です。
+`random`対`stream`はsampling分布も同時に変わるため、補助比較として扱います。
+Feedforwardでは全modeを利用できますが、時間stateも時間方向のgradientもないため、
+BPTT/TBPTT比較ではなくsampling対照です。
+
 50 msの2/10 channel入力、Feedforward/ConvGRU/ConvLSTM、3種類のSIGRegを順番に
 切り分ける実験protocolは
 [Gen1 Sequence / SIGReg R0 実験計画](docs/SEQUENCE_SIGREG_EXPERIMENT_PLAN.md)にまとめています。
@@ -352,13 +367,15 @@ window-jepa-inspect-recurrent \
 HTML・JSONに加え、各stepのevent画像、representation、時間bin、mask overlayが
 `recurrent-clip_assets/`へPNGとして保存されます。時系列・sequence境界・共有crop/flip・
 burn-in/TBPTT maskのいずれかが不整合なら、CLIはレポート保存後に終了コード1を返します。
-`recurrent.sampling: mixed`の設定では、実際のsamplerから連続する2 batchを取り出して
-rank 0相当の経路を検査します。R0のper-rank batch 16では`--sample-index`はbatch内rowを表し、0〜7が
-stream、8〜15がrandomです。HTMLのmixed sampler表とJSONの`mixed_batches`には、
+`recurrent.sampling: stream_reset|stream|mixed`の設定では、実際のsamplerから連続する
+2 batchを取り出してrank 0相当の経路を検査します。mixed・per-rank batch 16では
+`--sample-index`はbatch内rowを表し、0〜7がstream、8〜15がrandomです。HTMLのsampler表と
+JSONの`mixed_batches`には、
 batch間timestamp、state reset、augmentation ID、crop・flipをrowごとに記録します。
 stream rowがresetなしで継続するのに時刻・ID・transformが変わった場合、連続した
 streamを誤ってresetした場合、random rowが毎batch resetされない場合も終了コード1に
-なります。短いsequenceの終了やrecording切替による正当なresetは境界として表示され、
+なります。`stream_reset`では連続chunkも毎回resetされることを検査します。短いsequenceの
+終了やrecording切替による正当なresetは境界として表示され、
 不合格にはしません。
 DDP学習時は、これと同じcontinuity/reset契約を各rankの実DataLoader batchに対して
 学習ループ内でも毎回検証します。
@@ -482,10 +499,30 @@ python -m event_window_jepa.downstream.gen1_roi_probe \
 実Detectionでは、全304x240画面を256x320へzero-padし、ViTの位置埋め込みを16x20 patch gridへ補間します。そのtokenからstride 8/16/32のfeature pyramidを作り、プロジェクトに同梱したRVT版YOLOX headを学習します。評価も同梱したProphesee COCO evaluatorを使い、小boxと各recording先頭0.5秒を公式protocolどおり除外します。必要部分はライセンス表示付きで固定しているため、外部RVT repositoryのcloneは不要です。
 
 これは正解bboxを推論入力に使わず、予測bboxからmAPを計算します。通常の呼び出しは
-frameごとに独立したbackbone評価で、`--stateful`時だけ本プロジェクトのConvGRU/ConvLSTM stateを
-recording間で引き継ぎます。RVTのbackbone構造や21-step学習をそのまま再現する実験ではありません。
-まず凍結backboneで事前学習特徴を評価し、必要な場合だけ非stateful経路の
-`--unfreeze-backbone`でfine-tuneします。
+frameごとに独立したbackbone評価です。`--stateful`では複数recordingを安定したlaneへ割り当て、
+`--sequence-length`個の連続frameを1 training chunkとして処理します。chunk内ではbackboneだけを
+時間順に進め、ラベルを持つ全時刻のfeatureをまとめてYOLOX headへ1回渡し、backwardと
+optimizer updateも1回だけ行います。ConvGRU/ConvLSTM stateはchunk境界でdetachして次chunkへ
+引き継ぎ、recording交代時だけ該当laneをresetします。
+
+training samplingは`--stateful-sampling random|stream_reset|stream|mixed`で切り替えます。
+`random`はlabel時刻を終端とする完全長T clip、`stream`はlabel間隔に基づいて分割した因果chunk、
+`stream_reset`は同じstream chunkを毎回zero-stateから処理する対照です。`mixed`はper-rank batchの
+前半をstream、後半をrandomにするRVT型1:1 protocolです。validationはtraining modeにかかわらず
+常にrecording全体を因果順に走査します。
+
+| Detection mode | per-rank/batch内の構成 | state |
+|---|---|---|
+| `random` | label終端の独立T clip | clip先頭でreset |
+| `stream_reset` | label保証stream chunk | chunk先頭でreset |
+| `stream` | label保証stream chunk | chunk末detach、次chunkへcarry |
+| `mixed` | 既定B=8ならstream 4＋random 4 | row種別に従う |
+
+ただしstateful Detectionは事前学習backboneを凍結するため、ここで比較するのはsamplingと
+state carryによる**特徴実行**であり、backboneのBPTT/TBPTTではありません。真のgradient比較は
+ConvGRU/ConvLSTM事前学習の`stream_reset`対`stream`で行います。また、Detectionには現時点で
+幾何・時間augmentationを適用していません（identity）。公式RVTと同じbackboneやaugmentationまで
+完全再現したものではなく、label-aware samplingとT-step実行を移植した経路です。
 
 ```bash
 python -m pip install -e '.[hdf5,detection]'
@@ -502,15 +539,16 @@ python -m event_window_jepa.downstream.gen1_detection \
   --max-val-frames 1000
 ```
 
-smoke test完走後はframe上限を外します。`train.jsonl`にYOLOX lossと`AP/AP_50/AP_75/AP_S/AP_M/AP_L`、`checkpoint-latest.pt`に再開可能なhead・optimizer状態を保存します。validation APが更新された時点のheadは`checkpoint-best.pt`にも保存されます。新しいv2 checkpointのresume時は、事前学習backboneのweight fingerprintとconfig、window幅、batch/lane方式、seed、precisionも照合し、異なる実験のheadを誤って混ぜません。legacy v1のstateful checkpointはpretrained backbone・同一path/window・batch 1だけ互換で、random backboneのresumeは拒否します。
+smoke test完走後はframe上限を外します。`train.jsonl`にYOLOX lossと`AP/AP_50/AP_75/AP_S/AP_M/AP_L`、`checkpoint-latest.pt`に再開可能なhead・optimizer状態を保存します。validation APが更新された時点のheadは`checkpoint-best.pt`にも保存されます。新しいsampling-aware checkpointのresume時は、事前学習backboneのweight fingerprintとconfig、window幅、batch/lane方式、sequence length、sampling mode、seed、precisionも照合し、異なる実験のheadを誤って混ぜません。旧stateful checkpointはsampling identityを持たないため、この経路へのresumeを拒否します。
 
 Stage 2のFeedforward / ConvGRU / ConvLSTMを同じ因果streamで比較する場合は
-`--stateful`を指定します。`--batch-size`は同時に処理するrecording lane数で、各lane内では
-recording先頭からtimestamp順に50 ms窓を読みます。ラベルのない窓でもrecurrent backboneの
-stateを更新し、recording交代時だけ該当laneをresetします。stateはlaneごとに保持し、各step後に
-detachします。複数laneのbackboneは1回のbatched forwardで処理し、YOLOX head/lossへ渡すのは
-そのstepでlabelを持つrowだけです。Feedforwardも同じloader、timestamp列、label集合を使いますが、
-stateは保持しません。`--batch-size 1`も従来どおり使用できます。
+`--stateful`を指定します。`--batch-size`は同時に処理するclip/lane数、
+`--sequence-length`は1 optimizer update内で展開する最大step数です。各lane内ではrecording先頭から
+timestamp順に50 ms窓を読みます。ラベルのない窓でもrecurrent backboneのstateを更新し、
+segment/recording交代時だけ該当laneをresetします。複数laneは各時刻に1回のbatched backbone forwardで
+処理し、chunk内のlabel付きrowをすべて連結してYOLOX head/lossへ1回だけ渡します。
+Feedforwardも同じloader、timestamp列、label集合、head batchを使いますが、stateは保持しません。
+`--batch-size 1`と`--sequence-length 1`も比較・互換経路として使用できます。
 
 ここでrecurrent updateの時間単位は50 ms frameです。50 ms内部のtemporal binは時間stepではなく
 channelとして空間encoderへ一括入力します。公式RVTのGen1設定は10 temporal bins × 2 polarity
@@ -518,13 +556,17 @@ channelとして空間encoderへ一括入力します。公式RVTのGen1設定�
 = 2 ch、または5 bins × 2 polarity = 10 chですが、どちらも50 msごとに1回だけstateを更新します。
 したがって10 ch条件は10回（または5回）のrecurrent updateを行う設定ではありません。
 
-過去weightで作ったstateと更新後weightの混在を避けるため、stateful評価は凍結backbone専用で、
+過去weightで作ったstateと更新後weightの混在を避けるため、stateful学習・評価は凍結backbone専用で、
 `--unfreeze-backbone`との併用を拒否します。trainではrecording群だけをepochごとにseed付きで
-shuffleし、validationでは長いrecordingからlaneへ補充します。いずれもrecording内の順序は固定です。
+shuffleし、random clipはlabel anchorをshuffleします。validationでは長いrecordingからlaneへ
+補充します。いずれのstream条件もsegment内の順序は固定です。
 sequence loaderで事前学習したcheckpointでは、`--window-ms`がcheckpoint内の
 `recurrent.window_ms`と一致しない起動も拒否します。
-進捗barの総数は50 ms window数ではなくstream batch数になるため、例えば157万windowでも
-8 laneならforward回数は概ねその1/8です（recording長の偏りによる短い末尾batchを除く）。
+進捗barの総数は50 ms window数ではなくsequence chunk数です。例えば157万window、8 lane、
+21 stepなら概算は`1,570,000 / (8 * 21) = 9,345` chunksです（recording境界と短い末尾chunkで
+多少増えます）。backboneが読むwindow総数自体は減らない一方、YOLOX head、backward、
+optimizer updateはframe単位経路より大幅に少なくなります。`train.jsonl`にはloader上の
+`train_batches`と実際に更新した`optimizer_updates`を分けて記録します。
 
 ```bash
 python -m event_window_jepa.downstream.gen1_detection \
@@ -534,7 +576,9 @@ python -m event_window_jepa.downstream.gen1_detection \
   --output-dir /path/to/runs/gen1_stateful_detection \
   --window-ms 50 \
   --stateful \
+  --stateful-sampling mixed \
   --batch-size 8 \
+  --sequence-length 21 \
   --workers 4 \
   --precision fp32 \
   --epochs 30 \

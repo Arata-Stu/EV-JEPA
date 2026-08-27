@@ -298,3 +298,52 @@ def test_r0_requires_equal_non_overlapping_fifty_ms_windows() -> None:
     }
     with pytest.raises(ValueError, match="tbptt_steps == sequence_length"):
         ExperimentConfig.from_mapping(truncated_mixed)
+
+    for sampling in ("random", "stream_reset", "stream", "mixed"):
+        resolved = ExperimentConfig.from_mapping(
+            {
+                **base,
+                "recurrent": {**base["recurrent"], "sampling": sampling},
+            }
+        )
+        assert resolved.recurrent.sampling == sampling
+
+    truncated_explicit = {
+        **base,
+        "recurrent": {
+            **base["recurrent"],
+            "sampling": "stream_reset",
+            "tbptt_steps": 2,
+        },
+    }
+    with pytest.raises(ValueError, match="tbptt_steps == sequence_length"):
+        ExperimentConfig.from_mapping(truncated_explicit)
+
+    # stream_ratio is irrelevant outside mixed sampling.
+    stream_without_ratio = {
+        **base,
+        "recurrent": {
+            **base["recurrent"],
+            "sampling": "stream",
+            "stream_ratio": 1.0,
+        },
+    }
+    assert ExperimentConfig.from_mapping(stream_without_ratio).recurrent.sampling == "stream"
+
+    non_rvt_mixed_ratio = {
+        **base,
+        "recurrent": {
+            **base["recurrent"],
+            "sampling": "mixed",
+            "stream_ratio": 0.25,
+        },
+    }
+    with pytest.raises(ValueError, match="mixed 1:1"):
+        ExperimentConfig.from_mapping(non_rvt_mixed_ratio)
+
+    odd_mixed_batch = {
+        **base,
+        "data": {**base["data"], "batch_size": 3},
+    }
+    with pytest.raises(ValueError, match="even per-rank batch"):
+        ExperimentConfig.from_mapping(odd_mixed_batch)

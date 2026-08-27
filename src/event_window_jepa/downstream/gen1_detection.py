@@ -9,7 +9,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Literal, Sequence
 
 import numpy as np
 import torch
@@ -51,6 +51,9 @@ BBOX_DTYPE = np.dtype(
         "formats": ("<i8", "<f4", "<f4", "<f4", "<f4", "<u4", "<u4", "<f4"),
     }
 )
+STATEFUL_LANE_SCHEMA = "rvt-label-aware-sampling-v3"
+SEQUENCE_STATEFUL_LANE_SCHEMA = "stable-lanes-sequence-v2"
+LEGACY_STATEFUL_LANE_SCHEMA = "stable-lanes-v1"
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,8 @@ class StreamFrameReference:
     t_end_us: int
     has_labels: bool
     state_reset: bool
+    stream_segment_id: int = 0
+    sampling_mode: Literal["stream", "random"] = "stream"
 
 
 @dataclass(frozen=True)
@@ -76,6 +81,15 @@ class StreamLaneIndex:
 
     reference_index: int
     lane_id: int
+    force_state_reset: bool = False
+
+
+@dataclass(frozen=True)
+class DirectStreamLaneIndex:
+    """Worker-safe direct reference used by random-access training clips."""
+
+    reference: StreamFrameReference
+    lane_id: int
 
 
 @dataclass(frozen=True)
@@ -83,6 +97,16 @@ class _StreamLaneState:
     source_index: int
     t_end_us: int
     state: RecurrentState | None
+
+
+@dataclass(frozen=True)
+class StatefulSequenceForward:
+    decoded: torch.Tensor | None
+    losses: dict[str, torch.Tensor] | None
+    ground_truth: tuple[np.ndarray, ...]
+    timestamps: tuple[int, ...]
+    labeled_frames: int
+    input_frames: int
 
 
 def _parse_args() -> argparse.Namespace:
@@ -101,6 +125,41 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--window-ms", type=float, default=40.0)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=21,
+        help=(
+            "Number of consecutive stream windows unrolled inside one optimizer "
+            "step in --stateful mode (RVT-style recurrent chunk execution). The "
+            "current frozen-backbone detector carries state but does not backpropagate "
+            "into the backbone."
+        ),
+    )
+    parser.add_argument(
+        "--stateful-sampling",
+        choices=("mixed", "stream", "stream_reset", "random"),
+        default="mixed",
+        help=(
+            "Training sampling protocol for --stateful. mixed is the RVT default: "
+            "half stable stream lanes and half independent random label-anchored "
+            "clips. stream carries state between label-guaranteed chunks; "
+            "stream_reset uses the same chunks but resets every chunk as a "
+            "state-carry ablation; random resets every clip. Validation always "
+            "uses the complete causal stream. This option does not imply backbone "
+            "BPTT while the detector backbone is frozen."
+        ),
+    )
+    parser.add_argument(
+        "--stream-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "Number of stream lanes in a mixed stateful training batch. Zero uses "
+            "the required equal 1:1 split. An explicit value is accepted only when "
+            "it equals half of an even --batch-size."
+        ),
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
@@ -123,10 +182,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Process recordings in parallel causal lanes, carry lane-local recurrent "
-            "state, and update it on unlabeled windows. Batch size is the maximum "
-            "number of concurrent recording lanes. Requires a frozen backbone; use "
-            "this for fair FF/ConvGRU/ConvLSTM comparison. Window duration must "
-            "match recurrent.window_ms in a sequence-loader checkpoint."
+            "state, and update it on unlabeled windows. Training uses the selected "
+            "RVT-style stream/random sampling protocol; validation always traverses "
+            "the complete stream. Batch size counts concurrent clips. Requires a frozen "
+            "backbone; use this for fair FF/ConvGRU/ConvLSTM comparison. Window "
+            "duration must match recurrent.window_ms in a sequence-loader checkpoint."
         ),
     )
     parser.add_argument("--resume", type=Path, default=None)
@@ -237,6 +297,85 @@ class Gen1DetectionDataset(
         return image, torch.from_numpy(targets), ground_truth, reference.t_end_us
 
 
+def _limited_labeled_references_by_source(
+    sources: Sequence[LabelSource],
+    labeled_references: Sequence[FrameReference],
+    *,
+    maximum_labeled_frames: int,
+    stream_lanes: int,
+) -> dict[int, list[FrameReference]]:
+    """Keep a causal, lane-balanced prefix for bounded stateful smoke runs."""
+
+    by_source: dict[int, list[FrameReference]] = {
+        index: [] for index in range(len(sources))
+    }
+    for reference in labeled_references:
+        by_source[reference.source_index].append(reference)
+    for references in by_source.values():
+        references.sort(key=lambda value: value.t_end_us)
+    if maximum_labeled_frames <= 0:
+        return by_source
+
+    active_sources = [
+        source_index for source_index, references in by_source.items() if references
+    ]
+    selected_sources = active_sources[
+        : min(stream_lanes, maximum_labeled_frames, len(active_sources))
+    ]
+    if not selected_sources:
+        return {source_index: [] for source_index in by_source}
+    limits = {source_index: 0 for source_index in selected_sources}
+    remaining = maximum_labeled_frames
+    while remaining:
+        changed = False
+        for source_index in selected_sources:
+            if limits[source_index] >= len(by_source[source_index]):
+                continue
+            limits[source_index] += 1
+            remaining -= 1
+            changed = True
+            if not remaining:
+                break
+        if not changed:
+            break
+    return {
+        source_index: references[: limits.get(source_index, 0)]
+        for source_index, references in by_source.items()
+    }
+
+
+def _cadence_indices(
+    source: LabelSource,
+    references: Sequence[FrameReference],
+    *,
+    duration_us: int,
+) -> tuple[int, dict[int, FrameReference]]:
+    """Map labels to the recording-local representation cadence."""
+
+    if not references:
+        raise ValueError("cannot infer an event cadence without labels")
+    ordered = sorted(references, key=lambda value: value.t_end_us)
+    phase = (ordered[0].t_end_us - source.t_start_us) % duration_us
+    signed_phase = phase if phase <= duration_us // 2 else phase - duration_us
+    first_end = source.t_start_us + duration_us + signed_phase
+    while first_end - duration_us < source.t_start_us:
+        first_end += duration_us
+    indexed: dict[int, FrameReference] = {}
+    for reference in ordered:
+        delta = reference.t_end_us - first_end
+        if delta < 0 or delta % duration_us:
+            raise ValueError(
+                f"stateful label timestamp {reference.t_end_us} for "
+                f"{source.sequence_id} is not aligned to the {duration_us} us "
+                "window cadence; use the checkpoint and annotation cadence"
+            )
+        representation_index = delta // duration_us
+        if representation_index in indexed:
+            raise ValueError("stateful labels contain a duplicate representation index")
+        indexed[representation_index] = reference
+    return first_end, indexed
+
+
 def _stream_references(
     sources: Sequence[LabelSource],
     labeled_references: Sequence[FrameReference],
@@ -261,50 +400,20 @@ def _stream_references(
     if stream_lanes <= 0:
         raise ValueError("stateful stream_lanes must be positive")
 
-    by_source: dict[int, list[FrameReference]] = {
-        index: [] for index in range(len(sources))
-    }
-    for reference in labeled_references:
-        by_source[reference.source_index].append(reference)
-    if maximum_labeled_frames > 0:
-        active_sources = [
-            source_index
-            for source_index, references in by_source.items()
-            if references
-        ]
-        selected_sources = active_sources[
-            : min(stream_lanes, maximum_labeled_frames, len(active_sources))
-        ]
-        if not selected_sources:
-            return ()
-        limits = {source_index: 0 for source_index in selected_sources}
-        remaining = maximum_labeled_frames
-        while remaining:
-            changed = False
-            for source_index in selected_sources:
-                if limits[source_index] >= len(by_source[source_index]):
-                    continue
-                limits[source_index] += 1
-                remaining -= 1
-                changed = True
-                if not remaining:
-                    break
-            if not changed:
-                break
-        by_source = {
-            source_index: references[: limits.get(source_index, 0)]
-            for source_index, references in by_source.items()
-        }
+    by_source = _limited_labeled_references_by_source(
+        sources,
+        labeled_references,
+        maximum_labeled_frames=maximum_labeled_frames,
+        stream_lanes=stream_lanes,
+    )
     output: list[StreamFrameReference] = []
     for source_index, source in enumerate(sources):
-        references = sorted(by_source[source_index], key=lambda value: value.t_end_us)
+        references = by_source[source_index]
         if not references:
             continue
-        phase = (references[0].t_end_us - source.t_start_us) % duration_us
-        signed_phase = phase if phase <= duration_us // 2 else phase - duration_us
-        next_end = source.t_start_us + duration_us + signed_phase
-        while next_end - duration_us < source.t_start_us:
-            next_end += duration_us
+        next_end, _ = _cadence_indices(
+            source, references, duration_us=duration_us
+        )
         first = True
         for reference in references:
             while next_end < reference.t_end_us:
@@ -341,6 +450,71 @@ def _stream_references(
     return tuple(output)
 
 
+def _training_stream_references(
+    sources: Sequence[LabelSource],
+    labeled_references: Sequence[FrameReference],
+    *,
+    duration_us: int,
+    sequence_length: int,
+    maximum_labeled_frames: int,
+    stream_lanes: int,
+) -> tuple[StreamFrameReference, ...]:
+    """Build RVT training streams whose every chunk contains a label.
+
+    Label-index gaps larger than ``sequence_length`` start a new independent
+    segment. Each segment begins at most ``T - 1`` representations before its
+    first label and stops immediately after its final label. Consequently, every
+    consecutive T-sized chunk (including the final partial chunk) has at least
+    one supervised timestep, exactly as RVT's training stream construction.
+    """
+
+    if duration_us <= 0 or sequence_length <= 0 or stream_lanes <= 0:
+        raise ValueError("training stream cadence, length, and lanes must be positive")
+    by_source = _limited_labeled_references_by_source(
+        sources,
+        labeled_references,
+        maximum_labeled_frames=maximum_labeled_frames,
+        stream_lanes=stream_lanes,
+    )
+    output: list[StreamFrameReference] = []
+    segment_id = 0
+    for source_index, source in enumerate(sources):
+        references = by_source[source_index]
+        if not references:
+            continue
+        first_end, indexed = _cadence_indices(
+            source, references, duration_us=duration_us
+        )
+        label_indices = sorted(indexed)
+        group_start = 0
+        split_stops = [
+            index
+            for index in range(len(label_indices) - 1)
+            if label_indices[index + 1] - label_indices[index] > sequence_length
+        ]
+        for group_stop in (*split_stops, len(label_indices) - 1):
+            group = label_indices[group_start : group_stop + 1]
+            start_index = max(group[0] - sequence_length + 1, 0)
+            stop_index = group[-1] + 1
+            for representation_index in range(start_index, stop_index):
+                labeled = indexed.get(representation_index)
+                output.append(
+                    StreamFrameReference(
+                        source_index=source_index,
+                        start=0 if labeled is None else labeled.start,
+                        stop=0 if labeled is None else labeled.stop,
+                        t_end_us=first_end + representation_index * duration_us,
+                        has_labels=labeled is not None,
+                        state_reset=representation_index == start_index,
+                        stream_segment_id=segment_id,
+                        sampling_mode="stream",
+                    )
+                )
+            segment_id += 1
+            group_start = group_stop + 1
+    return tuple(output)
+
+
 class Gen1StreamDetectionDataset(Gen1DetectionDataset):
     references: tuple[StreamFrameReference, ...]
 
@@ -363,8 +537,22 @@ class Gen1StreamDetectionDataset(Gen1DetectionDataset):
         self.references = tuple(references)
 
     def __getitem__(
-        self, index: int | StreamLaneIndex
+        self, index: int | StreamLaneIndex | DirectStreamLaneIndex
     ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray, int, bool, bool, int, int]:
+        if isinstance(index, DirectStreamLaneIndex):
+            reference = index.reference
+            lane_id = index.lane_id
+            image, targets, ground_truth, timestamp = self._load_reference(reference)
+            return (
+                image,
+                targets,
+                ground_truth,
+                timestamp,
+                reference.has_labels,
+                reference.state_reset,
+                reference.source_index,
+                lane_id,
+            )
         if isinstance(index, StreamLaneIndex):
             reference_index = index.reference_index
             lane_id = index.lane_id
@@ -384,29 +572,62 @@ class Gen1StreamDetectionDataset(Gen1DetectionDataset):
             ground_truth,
             timestamp,
             reference.has_labels,
-            reference.state_reset,
+            reference.state_reset or (
+                isinstance(index, StreamLaneIndex) and index.force_state_reset
+            ),
             reference.source_index,
             lane_id,
         )
 
+    def _load_reference(
+        self, reference: StreamFrameReference
+    ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray, int]:
+        """Load a direct reference without materializing every random clip."""
+
+        source = self.sources[reference.source_index]
+        window = self.store.slice(source.sequence_id, reference.t_end_us, self.duration_us)
+        image = torch.from_numpy(self.representation(window))
+        labels = self._labels(source.path)[reference.start : reference.stop]
+        boxes, classes = _scaled_full_boxes(labels, source)
+        targets = np.zeros((len(boxes), 5), dtype=np.float32)
+        targets[:, 0] = classes
+        targets[:, 1] = (boxes[:, 0] + boxes[:, 2]) * 0.5
+        targets[:, 2] = (boxes[:, 1] + boxes[:, 3]) * 0.5
+        targets[:, 3] = boxes[:, 2] - boxes[:, 0]
+        targets[:, 4] = boxes[:, 3] - boxes[:, 1]
+        ground_truth = _ground_truth_array(boxes, classes, reference.t_end_us)
+        return image, torch.from_numpy(targets), ground_truth, reference.t_end_us
+
 
 class StreamLaneBatchSampler(Sampler[list[StreamLaneIndex]]):
-    """Keep one causal recording per batch lane and refill completed lanes."""
+    """Yield causal ``B x T`` chunks and refill lanes only at chunk boundaries."""
 
     def __init__(
         self,
         references: Sequence[StreamFrameReference],
         batch_size: int,
         *,
+        sequence_length: int = 21,
+        lane_offset: int = 0,
+        reset_every_chunk: bool = False,
         shuffle: bool = False,
         seed: int = 0,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("stream lane batch size must be positive")
+        if sequence_length <= 0:
+            raise ValueError("stream sequence length must be positive")
+        if lane_offset < 0:
+            raise ValueError("stream lane offset cannot be negative")
         self.batch_size = int(batch_size)
-        groups: OrderedDict[int, list[int]] = OrderedDict()
+        self.sequence_length = int(sequence_length)
+        self.lane_offset = int(lane_offset)
+        self.reset_every_chunk = bool(reset_every_chunk)
+        groups: OrderedDict[tuple[int, int], list[int]] = OrderedDict()
         for index, reference in enumerate(references):
-            groups.setdefault(reference.source_index, []).append(index)
+            groups.setdefault(
+                (reference.source_index, reference.stream_segment_id), []
+            ).append(index)
         self.groups = tuple(tuple(indices) for indices in groups.values())
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
@@ -420,8 +641,8 @@ class StreamLaneBatchSampler(Sampler[list[StreamLaneIndex]]):
     def _ordered_groups(self) -> tuple[tuple[int, ...], ...]:
         groups = list(self.groups)
         if self.shuffle:
-            # Recording order changes across epochs, while the references inside
-            # each recording remain untouched and causal. The explicit epoch also
+            # Segment order changes across epochs, while the references inside
+            # each segment remain untouched and causal. The explicit epoch also
             # makes a resumed run reproduce the same ordering at epoch boundaries.
             rng = random.Random(self.seed + self.epoch * 1_000_003)
             rng.shuffle(groups)
@@ -434,19 +655,39 @@ class StreamLaneBatchSampler(Sampler[list[StreamLaneIndex]]):
     def __iter__(self):  # type: ignore[no-untyped-def]
         pending = iter(self._ordered_groups())
         active: list[tuple[int, tuple[int, ...], int]] = []
-        for lane_id in range(self.batch_size):
+        for local_lane_id in range(self.batch_size):
             try:
-                active.append((lane_id, next(pending), 0))
+                active.append(
+                    (self.lane_offset + local_lane_id, next(pending), 0)
+                )
             except StopIteration:
                 break
         while active:
-            yield [
-                StreamLaneIndex(reference_index=indices[position], lane_id=lane_id)
+            lane_chunks = [
+                (
+                    lane_id,
+                    indices[
+                        position : min(position + self.sequence_length, len(indices))
+                    ],
+                )
                 for lane_id, indices, position in active
+            ]
+            # Time-major ordering lets collate build one variable-B batch per
+            # recurrent step without padding images or inventing fake windows.
+            maximum_steps = max(len(chunk) for _, chunk in lane_chunks)
+            yield [
+                StreamLaneIndex(
+                    reference_index=chunk[step],
+                    lane_id=lane_id,
+                    force_state_reset=self.reset_every_chunk and step == 0,
+                )
+                for step in range(maximum_steps)
+                for lane_id, chunk in lane_chunks
+                if step < len(chunk)
             ]
             next_active: list[tuple[int, tuple[int, ...], int]] = []
             for lane_id, indices, position in active:
-                next_position = position + 1
+                next_position = min(position + self.sequence_length, len(indices))
                 if next_position < len(indices):
                     next_active.append((lane_id, indices, next_position))
                     continue
@@ -459,20 +700,266 @@ class StreamLaneBatchSampler(Sampler[list[StreamLaneIndex]]):
     def __len__(self) -> int:
         # The iterator refills whichever lane finishes first. Computing the same
         # list-scheduling makespan by recording lengths avoids walking every frame
-        # merely to size a million-window progress bar.
+        # merely to size the chunk progress bar.
         groups = self._ordered_groups()
-        lane_loads = [len(group) for group in groups[: self.batch_size]]
-        for group in groups[self.batch_size :]:
+        chunk_counts = [
+            (len(group) + self.sequence_length - 1) // self.sequence_length
+            for group in groups
+        ]
+        lane_loads = chunk_counts[: self.batch_size]
+        for chunk_count in chunk_counts[self.batch_size :]:
             lane_id = min(
                 range(len(lane_loads)),
                 key=lambda index: (lane_loads[index], index),
             )
-            lane_loads[lane_id] += len(group)
+            lane_loads[lane_id] += chunk_count
         return max(lane_loads, default=0)
+
+    def iter_cycled(self) -> Iterator[list[StreamLaneIndex]]:
+        """Repeat lane-local segment shards without losing a partial tail.
+
+        Mixed training needs a fixed number of stream clips on every optimizer
+        step while the random and stream datasets can have different lengths.
+        Groups are assigned to stable lanes with the same least-loaded heuristic
+        as ``__len__``. Each lane then cycles only its own causal chunks; wraparound
+        lands on a segment start and therefore resets state.
+        """
+
+        groups = self._ordered_groups()
+        if len(groups) < self.batch_size:
+            raise ValueError("cyclic stream sampling needs one segment per lane")
+        lane_chunks: list[list[tuple[int, ...]]] = [
+            [] for _ in range(self.batch_size)
+        ]
+        lane_loads = [0 for _ in range(self.batch_size)]
+        for group_index, group in enumerate(groups):
+            lane = (
+                group_index
+                if group_index < self.batch_size
+                else min(
+                    range(self.batch_size),
+                    key=lambda index: (lane_loads[index], index),
+                )
+            )
+            chunks = [
+                group[start : start + self.sequence_length]
+                for start in range(0, len(group), self.sequence_length)
+            ]
+            lane_chunks[lane].extend(chunks)
+            lane_loads[lane] += len(chunks)
+        batch_index = 0
+        while True:
+            selected = [
+                chunks[batch_index % len(chunks)] for chunks in lane_chunks
+            ]
+            maximum_steps = max(len(chunk) for chunk in selected)
+            yield [
+                StreamLaneIndex(
+                    reference_index=chunk[step],
+                    lane_id=self.lane_offset + local_lane_id,
+                    force_state_reset=self.reset_every_chunk and step == 0,
+                )
+                for step in range(maximum_steps)
+                for local_lane_id, chunk in enumerate(selected)
+                if step < len(chunk)
+            ]
+            batch_index += 1
+
+
+class RandomLabelClipBatchSampler(Sampler[list[DirectStreamLaneIndex]]):
+    """Yield independent complete T-clips ending at shuffled label timestamps.
+
+    Earlier labeled timesteps inside a clip remain supervised, matching RVT's
+    Gen1 ``only_load_end_labels=False`` setting. Anchors without T complete event
+    windows of history are excluded. Every clip resets its lane at step zero.
+    """
+
+    def __init__(
+        self,
+        sources: Sequence[LabelSource],
+        labeled_references: Sequence[FrameReference],
+        *,
+        duration_us: int,
+        sequence_length: int,
+        batch_size: int,
+        lane_offset: int = 0,
+        maximum_labeled_frames: int = 0,
+        drop_last: bool = False,
+        seed: int = 0,
+    ) -> None:
+        if min(duration_us, sequence_length, batch_size) <= 0:
+            raise ValueError("random clip cadence, length, and batch must be positive")
+        if lane_offset < 0 or maximum_labeled_frames < 0:
+            raise ValueError("random lane offset and frame limit cannot be negative")
+        self.sources = tuple(sources)
+        self.duration_us = int(duration_us)
+        self.sequence_length = int(sequence_length)
+        self.batch_size = int(batch_size)
+        self.lane_offset = int(lane_offset)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        by_source: dict[int, list[FrameReference]] = {
+            index: [] for index in range(len(sources))
+        }
+        for reference in labeled_references:
+            by_source[reference.source_index].append(reference)
+        cadence: dict[int, tuple[int, dict[int, FrameReference]]] = {}
+        anchors: list[tuple[int, int]] = []
+        for source_index, source in enumerate(sources):
+            references = by_source[source_index]
+            if not references:
+                continue
+            first_end, indexed = _cadence_indices(
+                source, references, duration_us=self.duration_us
+            )
+            cadence[source_index] = (first_end, indexed)
+            anchors.extend(
+                (source_index, representation_index)
+                for representation_index in sorted(indexed)
+                if representation_index >= self.sequence_length - 1
+            )
+        if maximum_labeled_frames and len(anchors) > maximum_labeled_frames:
+            rng = random.Random(self.seed + 7_919)
+            selected = sorted(
+                rng.sample(range(len(anchors)), maximum_labeled_frames)
+            )
+            anchors = [anchors[index] for index in selected]
+        if not anchors:
+            raise ValueError(
+                "no labeled frame has enough history for a complete random clip"
+            )
+        if self.drop_last and len(anchors) < self.batch_size:
+            raise ValueError(
+                "random sampling has fewer valid anchors than its batch share"
+            )
+        self._cadence = cadence
+        self.anchors = tuple(anchors)
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("random sampler epoch cannot be negative")
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.anchors) // self.batch_size
+        return (len(self.anchors) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self) -> Iterator[list[DirectStreamLaneIndex]]:
+        order = list(range(len(self.anchors)))
+        rng = random.Random(self.seed + self.epoch * 1_000_003)
+        rng.shuffle(order)
+        stop = (
+            len(order) - len(order) % self.batch_size
+            if self.drop_last
+            else len(order)
+        )
+        for batch_start in range(0, stop, self.batch_size):
+            selected = order[batch_start : batch_start + self.batch_size]
+            if not selected:
+                continue
+            clips: list[tuple[int, tuple[StreamFrameReference, ...]]] = []
+            for local_lane_id, anchor_offset in enumerate(selected):
+                source_index, anchor_index = self.anchors[anchor_offset]
+                first_end, indexed = self._cadence[source_index]
+                first_index = anchor_index - self.sequence_length + 1
+                references: list[StreamFrameReference] = []
+                for step in range(self.sequence_length):
+                    representation_index = first_index + step
+                    labeled = indexed.get(representation_index)
+                    references.append(
+                        StreamFrameReference(
+                            source_index=source_index,
+                            start=0 if labeled is None else labeled.start,
+                            stop=0 if labeled is None else labeled.stop,
+                            t_end_us=(
+                                first_end
+                                + representation_index * self.duration_us
+                            ),
+                            has_labels=labeled is not None,
+                            state_reset=step == 0,
+                            stream_segment_id=-1,
+                            sampling_mode="random",
+                        )
+                    )
+                clips.append(
+                    (
+                        self.lane_offset + local_lane_id,
+                        tuple(references),
+                    )
+                )
+            yield [
+                DirectStreamLaneIndex(reference=clip[step], lane_id=lane_id)
+                for step in range(self.sequence_length)
+                for lane_id, clip in clips
+            ]
+
+
+StatefulTrainingIndex = StreamLaneIndex | DirectStreamLaneIndex
+
+
+class MixedStatefulBatchSampler(Sampler[list[StatefulTrainingIndex]]):
+    """Cycle two samplers into fixed RVT stream/random batch shares."""
+
+    def __init__(
+        self,
+        stream_sampler: StreamLaneBatchSampler,
+        random_sampler: RandomLabelClipBatchSampler,
+    ) -> None:
+        if stream_sampler.batch_size <= 0 or random_sampler.batch_size <= 0:
+            raise ValueError("mixed sampling requires both stream and random clips")
+        self.stream_sampler = stream_sampler
+        self.random_sampler = random_sampler
+        self.stream_batch_size = stream_sampler.batch_size
+        self.random_batch_size = random_sampler.batch_size
+        self.epoch = 0
+        if len(stream_sampler.groups) < self.stream_batch_size:
+            raise ValueError(
+                "mixed sampling needs at least one training segment per stream lane"
+            )
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("mixed sampler epoch cannot be negative")
+        self.epoch = int(epoch)
+        self.stream_sampler.set_epoch(epoch)
+        self.random_sampler.set_epoch(epoch)
+
+    def __len__(self) -> int:
+        return max(len(self.stream_sampler), len(self.random_sampler))
+
+    @staticmethod
+    def _next_cycled(
+        iterator: Iterator[list[Any]], factory: Callable[[], Iterator[list[Any]]]
+    ) -> tuple[list[Any], Iterator[list[Any]]]:
+        try:
+            return next(iterator), iterator
+        except StopIteration:
+            iterator = factory()
+            try:
+                return next(iterator), iterator
+            except StopIteration as error:
+                raise RuntimeError("mixed sampling component is empty") from error
+
+    def __iter__(self) -> Iterator[list[StatefulTrainingIndex]]:
+        stream_factory = self.stream_sampler.iter_cycled
+        random_factory = lambda: iter(self.random_sampler)
+        stream_iterator: Iterator[list[Any]] = stream_factory()
+        random_iterator: Iterator[list[Any]] = random_factory()
+        for _ in range(len(self)):
+            stream_batch, stream_iterator = self._next_cycled(
+                stream_iterator, stream_factory
+            )
+            random_batch, random_iterator = self._next_cycled(
+                random_iterator, random_factory
+            )
+            yield [*stream_batch, *random_batch]
 
 
 class StreamStateManager:
-    """Own detached recurrent state for stable recording lanes.
+    """Own recurrent state for stable lanes and detach it at chunk boundaries.
 
     DataLoader workers only construct CPU samples. State lives here, next to the
     model, and is keyed by the explicit lane id emitted by StreamLaneBatchSampler.
@@ -506,8 +993,6 @@ class StreamStateManager:
             raise ValueError("stream metadata must contain one reset/source/time per lane")
         if len(set(lane_ids)) != batch_size:
             raise ValueError("a stream batch cannot contain a lane more than once")
-        if len(set(source_indices)) != batch_size:
-            raise ValueError("a recording cannot occupy multiple lanes in one batch")
         if any(lane_id < 0 for lane_id in lane_ids):
             raise ValueError("stream lane ids must be non-negative")
 
@@ -613,8 +1098,9 @@ class StreamStateManager:
         source_indices: Sequence[int],
         timestamps: Sequence[int],
         state: RecurrentState | None,
+        detach: bool = True,
     ) -> None:
-        """Split a model state into lane-owned detached rows after one stream step."""
+        """Split model state into lane rows, optionally detaching the graph."""
 
         batch_size = len(lane_ids)
         if len(source_indices) != batch_size or len(timestamps) != batch_size:
@@ -627,7 +1113,7 @@ class StreamStateManager:
         elif state is not None:
             raise ValueError("feedforward stream unexpectedly returned recurrent state")
 
-        detached_state = detach_recurrent_state(state)
+        stored_state = detach_recurrent_state(state) if detach else state
         active_lanes = set(lane_ids)
         self._lanes = {
             lane_id: lane_state
@@ -638,15 +1124,28 @@ class StreamStateManager:
             zip(lane_ids, source_indices, timestamps, strict=True)
         ):
             lane_state = None
-            if detached_state is not None:
-                lane_state = self._row(detached_state, row)
+            if stored_state is not None:
+                lane_state = self._row(stored_state, row)
             self._lanes[lane_id] = _StreamLaneState(
                 source_index=source_index,
                 t_end_us=timestamp,
                 state=lane_state,
             )
         self._batched_lane_ids = tuple(lane_ids)
-        self._batched_state = detached_state
+        self._batched_state = stored_state
+
+    def detach(self) -> None:
+        """Cut recurrent history after a complete sequence chunk."""
+
+        self._batched_state = detach_recurrent_state(self._batched_state)
+        self._lanes = {
+            lane_id: _StreamLaneState(
+                source_index=lane_state.source_index,
+                t_end_us=lane_state.t_end_us,
+                state=detach_recurrent_state(lane_state.state),
+            )
+            for lane_id, lane_state in self._lanes.items()
+        }
 
 
 def _collate_detection(
@@ -700,6 +1199,59 @@ def _collate_stream_detection(
     )
 
 
+def _collate_stream_sequence_detection(
+    batch: Sequence[
+        tuple[torch.Tensor, torch.Tensor, np.ndarray, int, bool, bool, int, int]
+    ],
+) -> tuple[
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+        tuple[np.ndarray, ...],
+        tuple[int, ...],
+        torch.Tensor,
+        torch.Tensor,
+        tuple[int, ...],
+        tuple[int, ...],
+    ],
+    ...,
+]:
+    """Transpose flattened lane chunks into a tuple of variable-B time steps."""
+
+    if not batch:
+        raise ValueError("stream sequence batch cannot be empty")
+    steps: list[list[Any]] = []
+    next_step_by_lane: dict[int, int] = {}
+    for sample in batch:
+        lane_id = int(sample[-1])
+        step = next_step_by_lane.get(lane_id, 0)
+        next_step_by_lane[lane_id] = step + 1
+        if step == len(steps):
+            steps.append([])
+        elif step > len(steps):
+            raise RuntimeError("stream sequence contains a lane timestep gap")
+        steps[step].append(sample)
+    return tuple(_collate_stream_detection(step) for step in steps)
+
+
+def _concatenate_padded_targets(targets: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Concatenate target rows whose per-timestep box padding may differ."""
+
+    if not targets:
+        raise ValueError("cannot concatenate an empty target sequence")
+    maximum = max(int(value.shape[1]) for value in targets)
+    total = sum(int(value.shape[0]) for value in targets)
+    output = targets[0].new_zeros((total, maximum, 5))
+    offset = 0
+    for value in targets:
+        if value.ndim != 3 or value.shape[2] != 5:
+            raise ValueError("detection targets must have shape [B,N,5]")
+        count = int(value.shape[0])
+        output[offset : offset + count, : value.shape[1]] = value
+        offset += count
+    return output
+
+
 def _interpolated_position_embedding(
     encoder: Any, grid_size: tuple[int, int], dtype: torch.dtype
 ) -> torch.Tensor:
@@ -749,6 +1301,8 @@ def _dynamic_encoder_feature_map_stateful(
     images: torch.Tensor,
     duration_ms: torch.Tensor,
     state: Any,
+    *,
+    detach_state: bool,
 ) -> tuple[torch.Tensor, Any]:
     encoder = model.online_encoder
     if not isinstance(encoder, RecurrentVJEPA21EventVisionTransformer):
@@ -760,7 +1314,7 @@ def _dynamic_encoder_feature_map_stateful(
         images,
         scale,
         state=state,
-        detach_state=True,
+        detach_state=detach_state,
     )
 
 
@@ -831,8 +1385,45 @@ class WindowJEPAYOLOX(nn.Module):
                 base = _dynamic_encoder_feature_map(self.backbone, images, duration_ms)
         else:
             base = _dynamic_encoder_feature_map(self.backbone, images, duration_ms)
+        return self.forward_detection_features(base, targets)
+
+    def forward_detection_features(
+        self,
+        base: torch.Tensor,
+        targets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Run the trainable pyramid/head on selected backbone feature rows."""
+
         features = (self.p3(base), self.p4(base), self.p5(base))
         return self.head(features, targets)
+
+    def forward_stateful_backbone(
+        self,
+        images: torch.Tensor,
+        duration_ms: torch.Tensor,
+        *,
+        state: RecurrentState | None = None,
+        detach_state: bool = False,
+    ) -> tuple[torch.Tensor, RecurrentState | None]:
+        """Advance every stream lane once without invoking the detection head."""
+
+        images = functional.pad(images, (0, 16, 0, 16))
+        if self.freeze_backbone:
+            with torch.no_grad():
+                return _dynamic_encoder_feature_map_stateful(
+                    self.backbone,
+                    images,
+                    duration_ms,
+                    state,
+                    detach_state=detach_state,
+                )
+        return _dynamic_encoder_feature_map_stateful(
+            self.backbone,
+            images,
+            duration_ms,
+            state,
+            detach_state=detach_state,
+        )
 
     def forward_stateful(
         self,
@@ -843,21 +1434,18 @@ class WindowJEPAYOLOX(nn.Module):
         state: RecurrentState | None = None,
         detection_mask: torch.Tensor | None = None,
         features_only: bool = False,
+        detach_state: bool = True,
     ) -> tuple[
         torch.Tensor | None,
         dict[str, torch.Tensor] | None,
         RecurrentState | None,
     ]:
-        images = functional.pad(images, (0, 16, 0, 16))
-        if self.freeze_backbone:
-            with torch.no_grad():
-                base, next_state = _dynamic_encoder_feature_map_stateful(
-                    self.backbone, images, duration_ms, state
-                )
-        else:
-            base, next_state = _dynamic_encoder_feature_map_stateful(
-                self.backbone, images, duration_ms, state
-            )
+        base, next_state = self.forward_stateful_backbone(
+            images,
+            duration_ms,
+            state=state,
+            detach_state=detach_state,
+        )
         if detection_mask is None:
             has_detection_rows = not features_only
             detection_mask = torch.full(
@@ -884,13 +1472,134 @@ class WindowJEPAYOLOX(nn.Module):
             if targets.ndim != 3 or targets.shape[0] != len(images):
                 raise ValueError("stateful targets must have shape [B,N,5]")
             selected_targets = targets[detection_mask]
-        features = (
-            self.p3(selected_base),
-            self.p4(selected_base),
-            self.p5(selected_base),
+        decoded, losses = self.forward_detection_features(
+            selected_base, selected_targets
         )
-        decoded, losses = self.head(features, selected_targets)
         return decoded, losses, next_state
+
+
+def _forward_stateful_sequence(
+    model: WindowJEPAYOLOX,
+    sequence: Sequence[Any],
+    state_manager: StreamStateManager,
+    *,
+    duration_ms: float,
+    device: torch.device,
+    precision: str,
+    compute_losses: bool,
+) -> StatefulSequenceForward:
+    """Unroll one causal chunk, then invoke the head once on all labeled rows."""
+
+    selected_features: list[torch.Tensor] = []
+    selected_targets: list[torch.Tensor] = []
+    selected_ground_truth: list[np.ndarray] = []
+    selected_timestamps: list[int] = []
+    input_frames = 0
+    for (
+        images,
+        targets,
+        batch_ground_truth,
+        timestamps,
+        has_labels,
+        state_reset,
+        source_indices,
+        lane_ids,
+    ) in sequence:
+        input_frames += len(images)
+        state = state_manager.prepare(
+            lane_ids=lane_ids,
+            source_indices=source_indices,
+            timestamps=timestamps,
+            state_reset=state_reset,
+        )
+        images = images.to(device, non_blocking=True)
+        duration = torch.full((len(images),), duration_ms, device=device)
+        context = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if precision == "bf16" and device.type == "cuda"
+            else nullcontext()
+        )
+        with context:
+            base, next_state = model.forward_stateful_backbone(
+                images, duration, state=state, detach_state=False
+            )
+        state_manager.update(
+            lane_ids=lane_ids,
+            source_indices=source_indices,
+            timestamps=timestamps,
+            state=next_state,
+            detach=False,
+        )
+        selected_indices = torch.nonzero(
+            has_labels, as_tuple=False
+        ).flatten().tolist()
+        if not selected_indices:
+            continue
+        detection_mask = has_labels.to(device=base.device)
+        selected_features.append(base[detection_mask])
+        if compute_losses:
+            targets = targets.to(device, non_blocking=True)
+            selected_targets.append(targets[detection_mask])
+        selected_ground_truth.extend(
+            batch_ground_truth[index] for index in selected_indices
+        )
+        selected_timestamps.extend(timestamps[index] for index in selected_indices)
+
+    # The recurrent state persists across the next chunk, but its history does
+    # not. With the currently required frozen backbone this is a state boundary,
+    # not an active backbone-gradient boundary.
+    state_manager.detach()
+    labeled_frames = len(selected_timestamps)
+    if not selected_features:
+        return StatefulSequenceForward(None, None, (), (), 0, input_frames)
+    head_targets = (
+        _concatenate_padded_targets(selected_targets) if compute_losses else None
+    )
+    context = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if precision == "bf16" and device.type == "cuda"
+        else nullcontext()
+    )
+    with context:
+        decoded, losses = model.forward_detection_features(
+            torch.cat(selected_features, dim=0), head_targets
+        )
+    return StatefulSequenceForward(
+        decoded=decoded,
+        losses=losses,
+        ground_truth=tuple(selected_ground_truth),
+        timestamps=tuple(selected_timestamps),
+        labeled_frames=labeled_frames,
+        input_frames=input_frames,
+    )
+
+
+def _stateful_sampling_counts(
+    sequence: Sequence[Any],
+    *,
+    sampling: str,
+    stream_batch_size: int,
+) -> tuple[int, int, int, int]:
+    """Return labeled stream/random frames and stream/random clip counts."""
+
+    stream_labeled = 0
+    random_labeled = 0
+    stream_lanes: set[int] = set()
+    random_lanes: set[int] = set()
+    for step in sequence:
+        has_labels: torch.Tensor = step[4]
+        lane_ids: tuple[int, ...] = step[7]
+        for labeled, lane_id in zip(has_labels.tolist(), lane_ids, strict=True):
+            is_stream = sampling in {"stream", "stream_reset"} or (
+                sampling == "mixed" and lane_id < stream_batch_size
+            )
+            if is_stream:
+                stream_lanes.add(lane_id)
+                stream_labeled += int(labeled)
+            else:
+                random_lanes.add(lane_id)
+                random_labeled += int(labeled)
+    return stream_labeled, random_labeled, len(stream_lanes), len(random_lanes)
 
 
 def _predictions_to_prophesee(
@@ -993,62 +1702,28 @@ def _evaluate_stateful(
         recurrent=model.recurrent,
         stride_us=round(duration_ms * 1_000),
     )
-    for (
-        images,
-        _,
-        batch_ground_truth,
-        timestamps,
-        has_labels,
-        state_reset,
-        source_indices,
-        lane_ids,
-    ) in tqdm(loader, desc="stateful detection val"):
-        state = state_manager.prepare(
-            lane_ids=lane_ids,
-            source_indices=source_indices,
-            timestamps=timestamps,
-            state_reset=state_reset,
+    for sequence in tqdm(loader, desc="stateful detection val"):
+        forward = _forward_stateful_sequence(
+            model,
+            sequence,
+            state_manager,
+            duration_ms=duration_ms,
+            device=device,
+            precision=precision,
+            compute_losses=False,
         )
-        images = images.to(device, non_blocking=True)
-        detection_mask = has_labels
-        duration = torch.full((len(images),), duration_ms, device=device)
-        context = (
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-            if precision == "bf16" and device.type == "cuda"
-            else nullcontext()
-        )
-        with context:
-            decoded, _, next_state = model.forward_stateful(
-                images,
-                duration,
-                state=state,
-                detection_mask=detection_mask,
-            )
-        state_manager.update(
-            lane_ids=lane_ids,
-            source_indices=source_indices,
-            timestamps=timestamps,
-            state=next_state,
-        )
-        selected_indices = torch.nonzero(has_labels, as_tuple=False).flatten().tolist()
-        if not selected_indices:
+        if forward.decoded is None:
             continue
-        if decoded is None:
-            raise RuntimeError("stateful detector produced no labeled prediction")
         processed = components.postprocess(
-            decoded.float().clone(),
+            forward.decoded.float().clone(),
             num_classes=2,
             conf_thre=confidence_threshold,
             nms_thre=nms_threshold,
         )
-        selected_ground_truth = tuple(
-            batch_ground_truth[index] for index in selected_indices
-        )
-        selected_timestamps = tuple(timestamps[index] for index in selected_indices)
-        ground_truth.extend(selected_ground_truth)
+        ground_truth.extend(forward.ground_truth)
         predictions.extend(
             _predictions_to_prophesee(
-                processed, selected_timestamps, height=240, width=304
+                processed, forward.timestamps, height=240, width=304
             )
         )
     metrics = components.evaluate_list(
@@ -1100,10 +1775,23 @@ def _save_checkpoint(
         "backbone_fingerprint": backbone_fingerprint,
         "window_ms": args.window_ms,
         "batch_size": args.batch_size,
+        "sequence_length": args.sequence_length if args.stateful else 1,
+        "stateful_sampling": args.stateful_sampling if args.stateful else None,
+        "stream_batch_size": (
+            _stateful_batch_partition(args)[0] if args.stateful else 0
+        ),
+        "max_train_frames": args.max_train_frames,
+        "max_val_frames": args.max_val_frames,
+        "train_manifest_identity": (
+            _manifest_identity(args.train_manifest) if args.stateful else None
+        ),
+        "val_manifest_identity": (
+            _manifest_identity(args.val_manifest) if args.stateful else None
+        ),
         "seed": args.seed,
         "precision": args.precision,
         "stateful": args.stateful,
-        "stateful_lane_schema": "stable-lanes-v1" if args.stateful else None,
+        "stateful_lane_schema": STATEFUL_LANE_SCHEMA if args.stateful else None,
         "metrics": metrics,
         "best_ap": best_ap,
         "best_epoch": best_epoch,
@@ -1122,16 +1810,53 @@ def _save_checkpoint(
             Path(temporary_name).unlink(missing_ok=True)
 
 
+def _stateful_batch_partition(args: argparse.Namespace) -> tuple[int, int]:
+    """Resolve (stream, random) clip counts for one stateful training batch."""
+
+    sampling = args.stateful_sampling
+    if sampling not in {"mixed", "stream", "stream_reset", "random"}:
+        raise ValueError("unsupported stateful sampling protocol")
+    requested_stream = int(args.stream_batch_size)
+    if requested_stream < 0:
+        raise ValueError("stream batch size cannot be negative")
+    if sampling == "mixed":
+        if args.batch_size % 2:
+            raise ValueError(
+                "equal mixed sampling requires an even batch size"
+            )
+        equal_stream = args.batch_size // 2
+        if requested_stream not in {0, equal_stream}:
+            raise ValueError(
+                "mixed sampling requires an exact 1:1 stream/random split; "
+                "omit --stream-batch-size or set it to half of batch size"
+            )
+        requested_stream = equal_stream
+        return requested_stream, args.batch_size - requested_stream
+    if sampling in {"stream", "stream_reset"}:
+        if requested_stream not in {0, args.batch_size}:
+            raise ValueError(
+                "stream sampling uses the full batch; omit --stream-batch-size"
+            )
+        return args.batch_size, 0
+    if requested_stream:
+        raise ValueError("random sampling cannot reserve stream lanes")
+    return 0, args.batch_size
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     positive = (
         args.window_ms,
         args.batch_size,
+        args.sequence_length,
         args.epochs,
         args.learning_rate,
         args.eval_every,
     )
     if any(value <= 0 for value in positive) or round(args.window_ms * 1_000) <= 0:
-        raise ValueError("window, batch, epoch, learning-rate, and eval cadence must be positive")
+        raise ValueError(
+            "window, batch, sequence length, epoch, learning-rate, and eval "
+            "cadence must be positive"
+        )
     if args.workers < 0 or min(args.max_train_frames, args.max_val_frames) < 0:
         raise ValueError("workers and frame limits cannot be negative")
     if not 0 < args.confidence_threshold < 1 or not 0 < args.nms_threshold < 1:
@@ -1141,6 +1866,17 @@ def _validate_args(args: argparse.Namespace) -> None:
             "stateful detection currently requires a frozen backbone; updating "
             "recurrent weights while carrying old state would be inconsistent"
         )
+    if args.stateful:
+        _stateful_batch_partition(args)
+        if (
+            args.stateful_sampling == "mixed"
+            and 0 < args.max_train_frames < args.batch_size
+        ):
+            raise ValueError(
+                "mixed max_train_frames must fit at least one complete batch"
+            )
+    elif args.stream_batch_size:
+        raise ValueError("--stream-batch-size requires --stateful")
 
 
 def _validate_stateful_window_duration(
@@ -1179,6 +1915,17 @@ def _feature_backbone_fingerprint(backbone: nn.Module) -> str:
     return digest.hexdigest()
 
 
+def _manifest_identity(path: Path) -> dict[str, str]:
+    """Identify a dataset manifest by canonical location and file contents."""
+
+    resolved = path.expanduser().resolve()
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return {"path": str(resolved), "sha256": digest.hexdigest()}
+
+
 def _validate_detection_resume_metadata(
     resumed: dict[str, Any],
     args: argparse.Namespace,
@@ -1197,34 +1944,13 @@ def _validate_detection_resume_metadata(
     if bool(resumed.get("stateful", False)) != args.stateful:
         raise ValueError("detection resume stateful mode does not match checkpoint")
     if schema == "event-window-jepa-gen1-yolox-v1":
-        # Stateless v1 keeps its historical resume behavior. Stateful v1 was a
-        # single-recording stream and is compatible only with the B=1 lane path.
+        # Stateless v1 keeps its historical resume behavior. Stateful v1 has no
+        # sampling identity and traversed a different full-stream train set.
         if args.stateful:
-            saved_path = resumed.get("pretrain_checkpoint")
-            if saved_path is None or Path(saved_path).expanduser().resolve() != (
-                args.checkpoint.expanduser().resolve()
-            ):
-                raise ValueError(
-                    "legacy stateful detection pretrain checkpoint path does not match"
-                )
-            if resumed.get("backbone_init") != args.backbone_init:
-                raise ValueError(
-                    "legacy stateful detection backbone_init does not match"
-                )
-            if args.backbone_init == "random":
-                raise ValueError(
-                    "legacy stateful detection with a random backbone cannot be "
-                    "resumed because v1 did not store its seed or fingerprint"
-                )
-            if round(float(resumed.get("window_ms", -1.0)) * 1_000) != round(
-                args.window_ms * 1_000
-            ):
-                raise ValueError("legacy stateful detection window_ms does not match")
-            if args.batch_size != 1:
-                raise ValueError(
-                    "legacy stateful detection checkpoint can only resume with "
-                    "batch size 1"
-                )
+            raise ValueError(
+                "legacy stateful detection checkpoint predates sampling identity "
+                "and cannot safely resume the RVT sampling protocol"
+            )
         return
 
     required_identity = {
@@ -1234,8 +1960,40 @@ def _validate_detection_resume_metadata(
         "seed": args.seed,
         "batch_size": args.batch_size,
         "precision": args.precision,
-        "stateful_lane_schema": "stable-lanes-v1" if args.stateful else None,
     }
+    if args.stateful:
+        required_identity.update(
+            max_train_frames=args.max_train_frames,
+            max_val_frames=args.max_val_frames,
+            train_manifest_identity=_manifest_identity(args.train_manifest),
+            val_manifest_identity=_manifest_identity(args.val_manifest),
+        )
+        saved_lane_schema = resumed.get("stateful_lane_schema")
+        if saved_lane_schema in {
+            LEGACY_STATEFUL_LANE_SCHEMA,
+            SEQUENCE_STATEFUL_LANE_SCHEMA,
+        }:
+            raise ValueError(
+                "stateful detection checkpoint predates label-aware sampling "
+                "identity and cannot safely resume"
+            )
+        if saved_lane_schema == STATEFUL_LANE_SCHEMA:
+            if resumed.get("sequence_length") != args.sequence_length:
+                raise ValueError(
+                    "detection resume sequence_length does not match checkpoint"
+                )
+            if resumed.get("stateful_sampling") != args.stateful_sampling:
+                raise ValueError(
+                    "detection resume stateful_sampling does not match checkpoint"
+                )
+            if resumed.get("stream_batch_size") != _stateful_batch_partition(args)[0]:
+                raise ValueError(
+                    "detection resume stream_batch_size does not match checkpoint"
+                )
+        else:
+            raise ValueError("detection resume stateful_lane_schema does not match")
+    elif resumed.get("stateful_lane_schema") is not None:
+        raise ValueError("stateless detection checkpoint has a lane schema")
     for name, expected in required_identity.items():
         if resumed.get(name) != expected:
             raise ValueError(f"detection resume {name} does not match checkpoint")
@@ -1281,12 +2039,6 @@ def train(args: argparse.Namespace) -> None:
             pretrain_config_hash=pretrain_config_hash,
             backbone_fingerprint=backbone_fingerprint,
         )
-        if resumed.get("schema") == "event-window-jepa-gen1-yolox-v1" and args.stateful:
-            print(
-                "[gen1-detect] warning: legacy v1 stateful resume migrates "
-                "recording order to seeded epoch shuffle",
-                flush=True,
-            )
     components = _load_rvt_components()
     representation = _representation(config)
     train_sources = _read_label_sources(args.train_manifest)
@@ -1305,14 +2057,27 @@ def train(args: argparse.Namespace) -> None:
         seed=args.seed + 1,
     )
     if args.stateful:
+        stream_batch_size, random_batch_size = _stateful_batch_partition(args)
+        train_stream_label_limit = args.max_train_frames
+        train_random_anchor_limit = args.max_train_frames
+        if args.stateful_sampling == "mixed" and args.max_train_frames:
+            train_stream_label_limit = (
+                args.max_train_frames * stream_batch_size // args.batch_size
+            )
+            train_random_anchor_limit = (
+                args.max_train_frames - train_stream_label_limit
+            )
         train_references: Sequence[FrameReference | StreamFrameReference] = (
-            _stream_references(
+            _training_stream_references(
                 train_sources,
                 train_labeled_references,
                 duration_us=duration_us,
-                maximum_labeled_frames=args.max_train_frames,
-                stream_lanes=args.batch_size,
+                sequence_length=args.sequence_length,
+                maximum_labeled_frames=train_stream_label_limit,
+                stream_lanes=stream_batch_size,
             )
+            if stream_batch_size
+            else ()
         )
         val_references: Sequence[FrameReference | StreamFrameReference] = (
             _stream_references(
@@ -1324,9 +2089,16 @@ def train(args: argparse.Namespace) -> None:
             )
         )
     else:
+        stream_batch_size, random_batch_size = 0, 0
+        train_stream_label_limit = args.max_train_frames
+        train_random_anchor_limit = 0
         train_references = train_labeled_references
         val_references = val_labeled_references
-    if not train_references or not val_references:
+    if (
+        (not args.stateful and not train_references)
+        or (stream_batch_size and not train_references)
+        or not val_references
+    ):
         raise ValueError("no valid labeled frames remain")
     model = WindowJEPAYOLOX(
         backbone,
@@ -1380,28 +2152,60 @@ def train(args: argparse.Namespace) -> None:
         "persistent_workers": args.workers > 0,
     }
     if args.stateful:
-        train_lane_sampler = StreamLaneBatchSampler(
-            train_dataset.references,
-            args.batch_size,
-            shuffle=True,
-            seed=args.seed,
-        )
+        train_stream_sampler: StreamLaneBatchSampler | None = None
+        train_random_sampler: RandomLabelClipBatchSampler | None = None
+        if stream_batch_size:
+            train_stream_sampler = StreamLaneBatchSampler(
+                train_dataset.references,
+                stream_batch_size,
+                sequence_length=args.sequence_length,
+                reset_every_chunk=args.stateful_sampling == "stream_reset",
+                shuffle=True,
+                seed=args.seed,
+            )
+        if random_batch_size:
+            train_random_sampler = RandomLabelClipBatchSampler(
+                train_sources,
+                train_labeled_references,
+                duration_us=duration_us,
+                sequence_length=args.sequence_length,
+                batch_size=random_batch_size,
+                lane_offset=stream_batch_size,
+                maximum_labeled_frames=train_random_anchor_limit,
+                drop_last=args.stateful_sampling == "mixed",
+                seed=args.seed + 17,
+            )
+        if args.stateful_sampling == "mixed":
+            if train_stream_sampler is None or train_random_sampler is None:
+                raise RuntimeError("mixed stateful samplers were not constructed")
+            train_batch_sampler: Any = MixedStatefulBatchSampler(
+                train_stream_sampler, train_random_sampler
+            )
+        elif args.stateful_sampling in {"stream", "stream_reset"}:
+            if train_stream_sampler is None:
+                raise RuntimeError("stream sampler was not constructed")
+            train_batch_sampler = train_stream_sampler
+        else:
+            if train_random_sampler is None:
+                raise RuntimeError("random sampler was not constructed")
+            train_batch_sampler = train_random_sampler
         val_lane_sampler = StreamLaneBatchSampler(
             val_dataset.references,
             args.batch_size,
+            sequence_length=args.sequence_length,
             shuffle=False,
             seed=args.seed + 1,
         )
         train_loader = DataLoader(
             train_dataset,
-            batch_sampler=train_lane_sampler,
-            collate_fn=_collate_stream_detection,
+            batch_sampler=train_batch_sampler,
+            collate_fn=_collate_stream_sequence_detection,
             **loader_options,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_sampler=val_lane_sampler,
-            collate_fn=_collate_stream_detection,
+            collate_fn=_collate_stream_sequence_detection,
             **loader_options,
         )
     else:
@@ -1422,20 +2226,46 @@ def train(args: argparse.Namespace) -> None:
         )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "train.jsonl"
+    effective_sequence_length = args.sequence_length if args.stateful else 1
+    random_anchor_count = (
+        len(train_random_sampler.anchors)
+        if args.stateful and train_random_sampler is not None
+        else 0
+    )
     print(
-        f"[gen1-detect] train_windows={len(train_dataset)}, "
-        f"val_windows={len(val_dataset)}, "
+        f"[gen1-detect] train_stream_valid_windows="
+        f"{len(train_dataset) if args.stateful else 0}, "
+        f"train_random_valid_anchors={random_anchor_count}, "
+        f"train_labeled_frames={len(train_dataset) if not args.stateful else 'n/a'}, "
+        f"val_full_stream_windows={len(val_dataset) if args.stateful else 0}, "
+        f"val_labeled_frames={len(val_dataset) if not args.stateful else 'n/a'}, "
         f"init={args.backbone_init}, frozen={not args.unfreeze_backbone}, "
         f"stateful={args.stateful}, recurrent={recurrent_checkpoint}, "
-        f"train_batches={len(train_loader)}, batch_size={args.batch_size}",
+        f"train_chunks={len(train_loader)}, batch_size={args.batch_size}, "
+        f"sequence_length={effective_sequence_length}, "
+        f"max_windows_per_chunk={args.batch_size * effective_sequence_length}, "
+        f"sampling={args.stateful_sampling if args.stateful else 'labeled-frames'}, "
+        f"stream_clips_per_batch={stream_batch_size}, "
+        f"random_clips_per_batch={random_batch_size}, "
+        f"stream_label_limit={train_stream_label_limit}, "
+        f"random_anchor_limit={train_random_anchor_limit}, "
+        f"eval_sampling={'full-stream' if args.stateful else 'labeled-frames'}, "
+        "augmentation=none(identity-consistent-across-time), "
+        f"backbone_bptt={'disabled-frozen' if args.stateful else 'not-applicable'}",
         flush=True,
     )
     for epoch in range(start_epoch, args.epochs):
         if args.stateful:
-            train_lane_sampler.set_epoch(epoch)
+            train_batch_sampler.set_epoch(epoch)
         model.train()
         running: dict[str, float] = {}
         samples = 0
+        optimizer_updates = 0
+        train_input_frames = 0
+        train_stream_labeled_frames = 0
+        train_random_labeled_frames = 0
+        train_stream_clips = 0
+        train_random_clips = 0
         progress = tqdm(train_loader, desc=f"detection epoch {epoch + 1}/{args.epochs}")
         state_manager = StreamStateManager(
             recurrent=model.recurrent,
@@ -1443,68 +2273,56 @@ def train(args: argparse.Namespace) -> None:
         )
         for batch in progress:
             if args.stateful:
-                (
-                    images,
-                    targets,
-                    _,
-                    timestamps,
-                    has_labels,
-                    state_reset,
-                    source_indices,
-                    lane_ids,
-                ) = batch
-                state = state_manager.prepare(
-                    lane_ids=lane_ids,
-                    source_indices=source_indices,
-                    timestamps=timestamps,
-                    state_reset=state_reset,
+                batch_counts = _stateful_sampling_counts(
+                    batch,
+                    sampling=args.stateful_sampling,
+                    stream_batch_size=stream_batch_size,
                 )
-                detection_mask = has_labels
-                labeled_batch_size = int(has_labels.sum())
+                optimizer.zero_grad(set_to_none=True)
+                forward = _forward_stateful_sequence(
+                    model,
+                    batch,
+                    state_manager,
+                    duration_ms=args.window_ms,
+                    device=device,
+                    precision=args.precision,
+                    compute_losses=True,
+                )
+                train_input_frames += forward.input_frames
+                train_stream_labeled_frames += batch_counts[0]
+                train_random_labeled_frames += batch_counts[1]
+                train_stream_clips += batch_counts[2]
+                train_random_clips += batch_counts[3]
+                labeled_batch_size = forward.labeled_frames
+                if batch_counts[0] + batch_counts[1] != labeled_batch_size:
+                    raise RuntimeError(
+                        "stateful sampling accounting disagrees with head labels"
+                    )
+                if not labeled_batch_size:
+                    continue
+                losses = forward.losses
             else:
                 images, targets, _, _ = batch
-                detection_mask = None
                 labeled_batch_size = len(images)
-                state = None
-            images = images.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            duration = torch.full((len(images),), args.window_ms, device=device)
-            context = (
-                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                if args.precision == "bf16" and device.type == "cuda"
-                else nullcontext()
-            )
-            if labeled_batch_size:
+                train_input_frames += labeled_batch_size
                 optimizer.zero_grad(set_to_none=True)
-            with context:
-                if args.stateful:
-                    _, losses, next_state = model.forward_stateful(
-                        images,
-                        duration,
-                        targets,
-                        state=state,
-                        detection_mask=detection_mask,
-                    )
-                else:
-                    _, losses = model(images, duration, targets)
-                    next_state = None
-            if args.stateful:
-                state_manager.update(
-                    lane_ids=lane_ids,
-                    source_indices=source_indices,
-                    timestamps=timestamps,
-                    state=next_state,
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                duration = torch.full((len(images),), args.window_ms, device=device)
+                context = (
+                    torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                    if args.precision == "bf16" and device.type == "cuda"
+                    else nullcontext()
                 )
-            if not labeled_batch_size:
-                if losses is not None:
-                    raise RuntimeError("YOLOX returned losses for an unlabeled stream batch")
-                continue
+                with context:
+                    _, losses = model(images, duration, targets)
             if losses is None:
                 raise RuntimeError("YOLOX returned no training losses")
             loss = losses["loss"]
             loss.backward()
             torch.nn.utils.clip_grad_norm_(parameters, 10.0)
             optimizer.step()
+            optimizer_updates += 1
             samples += labeled_batch_size
             for name, value in losses.items():
                 numeric = float(value.detach()) if torch.is_tensor(value) else float(value)
@@ -1534,8 +2352,22 @@ def train(args: argparse.Namespace) -> None:
             "train": train_metrics,
             "validation": validation_metrics,
             "train_labeled_frames": samples,
-            "train_input_frames": len(train_dataset),
+            "labeled_head_frames": samples,
+            "train_input_frames": train_input_frames,
+            "train_stream_labeled_frames": (
+                train_stream_labeled_frames if args.stateful else None
+            ),
+            "train_random_labeled_frames": (
+                train_random_labeled_frames if args.stateful else None
+            ),
+            "train_stream_clips": train_stream_clips if args.stateful else None,
+            "train_random_clips": train_random_clips if args.stateful else None,
             "train_batches": len(train_loader),
+            "train_chunks": len(train_loader) if args.stateful else None,
+            "sequence_length": effective_sequence_length,
+            "stateful_sampling": args.stateful_sampling if args.stateful else None,
+            "stream_batch_size": stream_batch_size if args.stateful else None,
+            "optimizer_updates": optimizer_updates,
         }
         with metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")

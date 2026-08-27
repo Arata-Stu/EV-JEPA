@@ -20,6 +20,10 @@ PYTHON_BIN=${PYTHON_BIN:-python}
 PRECISION=auto
 REQUESTED_PRECISION=$PRECISION
 BATCH_SIZE=16
+SAMPLING_MODE=mixed
+SEQUENCE_LENGTH=8
+BURN_IN_STEPS=2
+SAMPLES_PER_EPOCH=6250
 WORKERS=4
 KEEP_EVERY_EPOCHS=5
 SMOKE=0
@@ -36,7 +40,11 @@ usage() {
     '  --selected-model MODEL   ff, cgru, or clstm for the Stage 3 plan' \
     '  --nproc-per-node N|auto  GPUs/processes for training (default: 3)' \
     '  --precision MODE         auto, fp32, fp16, or bf16 (default: auto)' \
-    '  --batch-size N           Per-rank batch; even and >=2 (default: 16)' \
+    '  --batch-size N           Per-rank batch (default: 16)' \
+    '  --sampling-mode MODE     random, stream_reset, stream, or mixed (default: mixed)' \
+    '  --sequence-length N      Supervised recurrent steps per clip (default: 8)' \
+    '  --burn-in-steps N        State warm-up steps before supervision (default: 2)' \
+    '  --samples-per-epoch N    Global clips per formal epoch (default: 6250)' \
     '  --workers N              DataLoader workers per rank (default: 4)' \
     '  --keep-every-epochs N    Preserve a named checkpoint every N epochs (default: 5)' \
     '  --smoke                  Isolated 1-epoch, 2-global-batch hardware check' \
@@ -55,6 +63,8 @@ usage() {
     '  * executing Stage 2 requires an explicit --selected-input.' \
     '  * Stage 3 can only be planned until SIGReg is implemented.' \
     '  * smoke runs use a distinct run ID and cannot be resumed.' \
+    '  * smoke always uses 2 global batches, overriding --samples-per-epoch.' \
+    '  * sampling modes change BPTT/TBPTT only for ConvGRU/ConvLSTM; FF is a sampling control.' \
     '  * nproc=auto uses all visible GPUs; precision=auto uses their common mode.' \
     '  * resume requires concrete GPU count and precision, not auto.' \
     '  * --resume is accepted only with --action plan or --action run.'
@@ -244,6 +254,26 @@ while (($#)); do
       BATCH_SIZE=$2
       shift 2
       ;;
+    --sampling-mode)
+      require_option_value "$@"
+      SAMPLING_MODE=$2
+      shift 2
+      ;;
+    --sequence-length)
+      require_option_value "$@"
+      SEQUENCE_LENGTH=$2
+      shift 2
+      ;;
+    --burn-in-steps)
+      require_option_value "$@"
+      BURN_IN_STEPS=$2
+      shift 2
+      ;;
+    --samples-per-epoch)
+      require_option_value "$@"
+      SAMPLES_PER_EPOCH=$2
+      shift 2
+      ;;
     --workers)
       require_option_value "$@"
       WORKERS=$2
@@ -347,17 +377,71 @@ case "$PRECISION" in
     ;;
 esac
 case "$BATCH_SIZE" in
-  ''|*[!0-9]*|0|1)
-    printf 'batch-size must be an even per-rank integer >=2: %s\n' \
+  ''|*[!0-9]*|0)
+    printf 'batch-size must be a positive per-rank integer: %s\n' \
       "$BATCH_SIZE" >&2
     exit 2
     ;;
 esac
-if ((10#$BATCH_SIZE % 2 != 0)); then
+case "$SAMPLING_MODE" in
+  random)
+    SAMPLING_COMMENT='Random clips reset every batch: full BPTT inside each chunk.'
+    ;;
+  stream_reset)
+    SAMPLING_COMMENT='Stable stream lanes, but every chunk resets: sampling-matched full-BPTT control.'
+    ;;
+  stream)
+    SAMPLING_COMMENT='Stable stream lanes carry detached state between chunks: TBPTT.'
+    ;;
+  mixed)
+    SAMPLING_COMMENT='RVT-style mixed batching: half stream and half random clips per rank.'
+    ;;
+  *)
+    printf 'Unsupported sampling mode: %s (expected random, stream_reset, stream, or mixed)\n' \
+      "$SAMPLING_MODE" >&2
+    exit 2
+    ;;
+esac
+if [[ "$SAMPLING_MODE" == mixed ]] && ((10#$BATCH_SIZE % 2 != 0)); then
   printf '%s\n' \
     'batch-size must be even because mixed sampling uses a 0.5 stream ratio.' >&2
   exit 2
 fi
+case "$SAMPLING_MODE" in
+  random)
+    STREAM_ROWS_PER_RANK=0
+    RANDOM_ROWS_PER_RANK=$((10#$BATCH_SIZE))
+    ;;
+  stream_reset|stream)
+    STREAM_ROWS_PER_RANK=$((10#$BATCH_SIZE))
+    RANDOM_ROWS_PER_RANK=0
+    ;;
+  mixed)
+    STREAM_ROWS_PER_RANK=$((10#$BATCH_SIZE / 2))
+    RANDOM_ROWS_PER_RANK=$STREAM_ROWS_PER_RANK
+    ;;
+esac
+case "$SEQUENCE_LENGTH" in
+  ''|*[!0-9]*|0)
+    printf 'sequence-length must be a positive integer: %s\n' \
+      "$SEQUENCE_LENGTH" >&2
+    exit 2
+    ;;
+esac
+case "$BURN_IN_STEPS" in
+  ''|*[!0-9]*)
+    printf 'burn-in-steps must be a non-negative integer: %s\n' \
+      "$BURN_IN_STEPS" >&2
+    exit 2
+    ;;
+esac
+case "$SAMPLES_PER_EPOCH" in
+  ''|*[!0-9]*|0)
+    printf 'samples-per-epoch must be a positive integer: %s\n' \
+      "$SAMPLES_PER_EPOCH" >&2
+    exit 2
+    ;;
+esac
 case "$WORKERS" in
   ''|*[!0-9]*)
     printf 'workers must be a non-negative integer per rank: %s\n' \
@@ -430,16 +514,45 @@ resolve_auto_runtime
 TRAIN_MANIFEST="$DATA_ROOT/manifests/train.jsonl"
 GLOBAL_BATCH_SIZE=$((10#$NPROC_PER_NODE * 10#$BATCH_SIZE))
 RUN_SUFFIX="np${NPROC_PER_NODE}_bs${BATCH_SIZE}_${PRECISION}_seed${SEED}"
+if [[ "$SAMPLING_MODE" != mixed ]]; then
+  RUN_SUFFIX="sampling-${SAMPLING_MODE}_${RUN_SUFFIX}"
+fi
+if [[ "$SEQUENCE_LENGTH" != 8 || "$BURN_IN_STEPS" != 2 ]]; then
+  RUN_SUFFIX="sl${SEQUENCE_LENGTH}_bi${BURN_IN_STEPS}_${RUN_SUFFIX}"
+fi
+if [[ "$SMOKE" != 1 && "$SAMPLES_PER_EPOCH" != 6250 ]]; then
+  RUN_SUFFIX="${RUN_SUFFIX}_spe${SAMPLES_PER_EPOCH}"
+fi
 if [[ "$SMOKE" == 1 ]]; then
   RUN_SUFFIX="${RUN_SUFFIX}_smoke"
   CONFIG_SAMPLES_PER_EPOCH=$((2 * GLOBAL_BATCH_SIZE))
   CONFIG_EPOCHS=1
   CONFIG_WARMUP_EPOCHS=0
 else
-  CONFIG_SAMPLES_PER_EPOCH=6250
+  CONFIG_SAMPLES_PER_EPOCH=$SAMPLES_PER_EPOCH
   CONFIG_EPOCHS=100
   CONFIG_WARMUP_EPOCHS=10
 fi
+OPTIMIZER_UPDATES_PER_EPOCH=$((
+  10#$CONFIG_SAMPLES_PER_EPOCH / GLOBAL_BATCH_SIZE
+))
+if ((OPTIMIZER_UPDATES_PER_EPOCH < 1)); then
+  printf '%s\n' \
+    "samples-per-epoch must be at least one global batch ($GLOBAL_BATCH_SIZE clips); got $CONFIG_SAMPLES_PER_EPOCH." \
+    "The minimum is nproc-per-node ($NPROC_PER_NODE) x batch-size ($BATCH_SIZE) = $GLOBAL_BATCH_SIZE." >&2
+  exit 2
+fi
+EFFECTIVE_CLIPS_PER_EPOCH=$((
+  OPTIMIZER_UPDATES_PER_EPOCH * GLOBAL_BATCH_SIZE
+))
+SUPERVISED_WINDOWS_PER_EPOCH=$((
+  EFFECTIVE_CLIPS_PER_EPOCH * 10#$SEQUENCE_LENGTH
+))
+INPUT_WINDOWS_PER_EPOCH=$((
+  EFFECTIVE_CLIPS_PER_EPOCH * (
+    10#$SEQUENCE_LENGTH + 10#$BURN_IN_STEPS
+  )
+))
 SPEC_STAGES=()
 SPEC_RUN_IDS=()
 SPEC_INPUTS=()
@@ -734,6 +847,10 @@ validate_config_content() {
   grep -Fqx "  output_dir: $output_path" "$config"
   grep -Fqx "  precision: $PRECISION" "$config"
   grep -Fqx "$model_setting" "$config"
+  grep -Fqx "  sampling: $SAMPLING_MODE" "$config"
+  grep -Fqx "  sequence_length: $SEQUENCE_LENGTH" "$config"
+  grep -Fqx "  burn_in_steps: $BURN_IN_STEPS" "$config"
+  grep -Fqx "  tbptt_steps: $SEQUENCE_LENGTH" "$config"
   grep -Fqx '  variance_weight: 0.0' "$config"
   grep -Fqx '  covariance_weight: 0.0' "$config"
   if grep -Eq '^[[:space:]]*sigreg:' "$config"; then
@@ -779,6 +896,10 @@ prepare_one() {
   CONFIG_BINS="$bins" \
   CONFIG_BATCH_SIZE="$BATCH_SIZE" \
   CONFIG_WORKERS="$WORKERS" \
+  CONFIG_SAMPLING_MODE="$SAMPLING_MODE" \
+  CONFIG_SAMPLING_COMMENT="$SAMPLING_COMMENT" \
+  CONFIG_SEQUENCE_LENGTH="$SEQUENCE_LENGTH" \
+  CONFIG_BURN_IN_STEPS="$BURN_IN_STEPS" \
   CONFIG_PRECISION="$PRECISION" \
   CONFIG_EPOCHS_VALUE="$CONFIG_EPOCHS" \
   CONFIG_WARMUP="$CONFIG_WARMUP_EPOCHS" \
@@ -789,23 +910,31 @@ prepare_one() {
       s{(?m)^  samples_per_epoch:.*$}{  samples_per_epoch: $ENV{CONFIG_SAMPLES}};
       s{(?m)^  batch_size:.*$}{  batch_size: $ENV{CONFIG_BATCH_SIZE}};
       s{(?m)^  workers:.*$}{  workers: $ENV{CONFIG_WORKERS}};
+      s{(?m)^  sampling:.*$}{  sampling: $ENV{CONFIG_SAMPLING_MODE}};
       s{(?m)^  temporal_bins:.*$}{  temporal_bins: $ENV{CONFIG_BINS}};
+      s{(?m)^  sequence_length:.*$}{  sequence_length: $ENV{CONFIG_SEQUENCE_LENGTH}};
+      s{(?m)^  burn_in_steps:.*$}{  burn_in_steps: $ENV{CONFIG_BURN_IN_STEPS}};
+      s{(?m)^  tbptt_steps:.*$}{  tbptt_steps: $ENV{CONFIG_SEQUENCE_LENGTH}};
       s{(?m)^  epochs:.*$}{  epochs: $ENV{CONFIG_EPOCHS_VALUE}};
       s{(?m)^  warmup_epochs:.*$}{  warmup_epochs: $ENV{CONFIG_WARMUP}};
       s{(?m)^  precision:.*$}{  precision: $ENV{CONFIG_PRECISION}};
       s{(?m)^  seed:.*$}{  seed: $ENV{CONFIG_SEED}};
       s{(?m)^  output_dir:.*$}{  output_dir: $ENV{CONFIG_OUTPUT}};
       s{(?m)^  # Sequence mode counts clips\.[^\n]*\n  # nominal signal[^\n]*}
-       {  # Sequence mode counts clips; samples_per_epoch is global across ranks.\n  # Each clip contains eight supervised steps.};
+       {  # Sequence mode counts clips; samples_per_epoch is global across ranks.\n  # Each clip contains $ENV{CONFIG_SEQUENCE_LENGTH} supervised steps.};
       s{(?m)^  # Recurrent mode counts clips, not individual windows\.[^\n]*\n  # supervised steps[^\n]*}
-       {  # Recurrent mode counts clips; samples_per_epoch is global across ranks.\n  # Each clip contains eight supervised steps.};
+       {  # Recurrent mode counts clips; samples_per_epoch is global across ranks.\n  # Each clip contains $ENV{CONFIG_SEQUENCE_LENGTH} supervised steps.};
+      s{(?m)^  # Each dataset item contains[^\n]*}
+       {  # Each dataset item contains $ENV{CONFIG_BURN_IN_STEPS} burn-in windows\n  # followed by $ENV{CONFIG_SEQUENCE_LENGTH} supervised windows.};
+      s{(?m)^  # eight loss-bearing steps[^\n]*}
+       {  # The $ENV{CONFIG_SEQUENCE_LENGTH} loss-bearing steps ignore burn-in/state metadata.};
     ' "$temporary"
   if [[ "$model" == cgru ]]; then
     perl -0pi -e 's/conv_lstm/conv_gru/g; s/ConvLSTM/ConvGRU/g' "$temporary"
   fi
-  perl -0pi -e '
+  CONFIG_SAMPLING_COMMENT="$SAMPLING_COMMENT" perl -0pi -e '
     s{# RVT-style mixed batching:[^\n]*}
-     {# RVT-style mixed batching: half stream and half random clips per rank.};
+     {# $ENV{CONFIG_SAMPLING_COMMENT}};
   ' "$temporary"
   validate_config_content "$temporary" "$stage" "$run_id" "$input" "$model"
 
@@ -828,12 +957,25 @@ prepare_one() {
     printf 'nproc_per_node=%s\n' "$NPROC_PER_NODE"
     printf 'batch_size_per_rank=%s\n' "$BATCH_SIZE"
     printf 'global_batch_size=%s\n' "$GLOBAL_BATCH_SIZE"
+    printf 'sampling_mode=%s\n' "$SAMPLING_MODE"
+    printf 'stream_rows_per_rank=%s\n' "$STREAM_ROWS_PER_RANK"
+    printf 'random_rows_per_rank=%s\n' "$RANDOM_ROWS_PER_RANK"
+    printf 'sequence_length=%s\n' "$SEQUENCE_LENGTH"
+    printf 'burn_in_steps=%s\n' "$BURN_IN_STEPS"
+    printf 'tbptt_steps=%s\n' "$SEQUENCE_LENGTH"
     printf 'workers_per_rank=%s\n' "$WORKERS"
     printf 'keep_every_epochs=%s\n' "$KEEP_EVERY_EPOCHS"
     printf 'precision_request=%s\n' "$REQUESTED_PRECISION"
     printf 'precision=%s\n' "$PRECISION"
     printf 'smoke=%s\n' "$SMOKE"
+    printf 'samples_per_epoch_request=%s\n' "$SAMPLES_PER_EPOCH"
     printf 'samples_per_epoch=%s\n' "$CONFIG_SAMPLES_PER_EPOCH"
+    printf 'effective_clips_per_epoch=%s\n' "$EFFECTIVE_CLIPS_PER_EPOCH"
+    printf 'optimizer_updates_per_epoch=%s\n' \
+      "$OPTIMIZER_UPDATES_PER_EPOCH"
+    printf 'supervised_windows_per_epoch=%s\n' \
+      "$SUPERVISED_WINDOWS_PER_EPOCH"
+    printf 'input_windows_per_epoch=%s\n' "$INPUT_WINDOWS_PER_EPOCH"
     printf 'epochs=%s\n' "$CONFIG_EPOCHS"
     printf 'warmup_epochs=%s\n' "$CONFIG_WARMUP_EPOCHS"
     printf 'train_manifest=%s\n' "$TRAIN_MANIFEST"
@@ -873,6 +1015,25 @@ require_prepared() {
   grep -Fqx "nproc_per_node=$NPROC_PER_NODE" "$directory/launch_metadata.txt"
   grep -Fqx "batch_size_per_rank=$BATCH_SIZE" "$directory/launch_metadata.txt"
   grep -Fqx "global_batch_size=$GLOBAL_BATCH_SIZE" "$directory/launch_metadata.txt"
+  if grep -q '^sampling_mode=' "$directory/launch_metadata.txt"; then
+    grep -Fqx "sampling_mode=$SAMPLING_MODE" "$directory/launch_metadata.txt"
+    grep -Fqx "stream_rows_per_rank=$STREAM_ROWS_PER_RANK" \
+      "$directory/launch_metadata.txt"
+    grep -Fqx "random_rows_per_rank=$RANDOM_ROWS_PER_RANK" \
+      "$directory/launch_metadata.txt"
+  elif [[ "$SAMPLING_MODE" != mixed ]]; then
+    printf 'Prepared metadata predates sampling modes: %s\n' \
+      "$directory/launch_metadata.txt" >&2
+    return 1
+  fi
+  if grep -q '^sequence_length=' "$directory/launch_metadata.txt"; then
+    grep -Fqx "sequence_length=$SEQUENCE_LENGTH" \
+      "$directory/launch_metadata.txt"
+    grep -Fqx "burn_in_steps=$BURN_IN_STEPS" \
+      "$directory/launch_metadata.txt"
+    grep -Fqx "tbptt_steps=$SEQUENCE_LENGTH" \
+      "$directory/launch_metadata.txt"
+  fi
   grep -Fqx "workers_per_rank=$WORKERS" "$directory/launch_metadata.txt"
   if grep -q '^keep_every_epochs=' "$directory/launch_metadata.txt"; then
     grep -Fqx "keep_every_epochs=$KEEP_EVERY_EPOCHS" \
@@ -880,8 +1041,24 @@ require_prepared() {
   fi
   grep -Fqx "precision=$PRECISION" "$directory/launch_metadata.txt"
   grep -Fqx "smoke=$SMOKE" "$directory/launch_metadata.txt"
+  if grep -q '^samples_per_epoch_request=' \
+      "$directory/launch_metadata.txt"; then
+    grep -Fqx "samples_per_epoch_request=$SAMPLES_PER_EPOCH" \
+      "$directory/launch_metadata.txt"
+  fi
   grep -Fqx "samples_per_epoch=$CONFIG_SAMPLES_PER_EPOCH" \
     "$directory/launch_metadata.txt"
+  if grep -q '^optimizer_updates_per_epoch=' \
+      "$directory/launch_metadata.txt"; then
+    grep -Fqx "effective_clips_per_epoch=$EFFECTIVE_CLIPS_PER_EPOCH" \
+      "$directory/launch_metadata.txt"
+    grep -Fqx "optimizer_updates_per_epoch=$OPTIMIZER_UPDATES_PER_EPOCH" \
+      "$directory/launch_metadata.txt"
+    grep -Fqx "supervised_windows_per_epoch=$SUPERVISED_WINDOWS_PER_EPOCH" \
+      "$directory/launch_metadata.txt"
+    grep -Fqx "input_windows_per_epoch=$INPUT_WINDOWS_PER_EPOCH" \
+      "$directory/launch_metadata.txt"
+  fi
   grep -Fqx "epochs=$CONFIG_EPOCHS" "$directory/launch_metadata.txt"
   grep -Fqx "warmup_epochs=$CONFIG_WARMUP_EPOCHS" \
     "$directory/launch_metadata.txt"
@@ -1082,10 +1259,15 @@ print_plan() {
     'Sequence/SIGReg staged experiment plan' \
     "  seed=$SEED selected_input=$SELECTED_INPUT selected_model=$SELECTED_MODEL" \
     "  nproc_per_node=$NPROC_PER_NODE precision=$PRECISION" \
-    "  batch_size_per_rank=$BATCH_SIZE global_batch_size=$GLOBAL_BATCH_SIZE" \
+    "  batch_size_per_rank=$BATCH_SIZE global_batch_size=$GLOBAL_BATCH_SIZE sampling_mode=$SAMPLING_MODE" \
+    "  stream_rows_per_rank=$STREAM_ROWS_PER_RANK random_rows_per_rank=$RANDOM_ROWS_PER_RANK" \
+    "  temporal_note=FF_has_no_recurrent_state; BPTT/TBPTT applies_to_cgru_and_clstm" \
+    "  sequence_length=$SEQUENCE_LENGTH burn_in_steps=$BURN_IN_STEPS tbptt_steps=$SEQUENCE_LENGTH" \
     "  workers_per_rank=$WORKERS total_worker_processes=$((10#$NPROC_PER_NODE * 10#$WORKERS))" \
     "  keep_every_epochs=$KEEP_EVERY_EPOCHS" \
-    "  smoke=$SMOKE samples_per_epoch=$CONFIG_SAMPLES_PER_EPOCH epochs=$CONFIG_EPOCHS warmup_epochs=$CONFIG_WARMUP_EPOCHS" \
+    "  smoke=$SMOKE samples_per_epoch_request=$SAMPLES_PER_EPOCH samples_per_epoch=$CONFIG_SAMPLES_PER_EPOCH epochs=$CONFIG_EPOCHS warmup_epochs=$CONFIG_WARMUP_EPOCHS" \
+    "  effective_clips_per_epoch=$EFFECTIVE_CLIPS_PER_EPOCH optimizer_updates_per_epoch=$OPTIMIZER_UPDATES_PER_EPOCH" \
+    "  supervised_windows_per_epoch=$SUPERVISED_WINDOWS_PER_EPOCH input_windows_per_epoch=$INPUT_WINDOWS_PER_EPOCH" \
     "  manifest=$TRAIN_MANIFEST" \
     "  output_root=$OUTPUT_ROOT"
   if [[ "$REQUESTED_NPROC_PER_NODE" != "$NPROC_PER_NODE" || \

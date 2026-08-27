@@ -317,6 +317,12 @@ class RecurrentConfig:
     ``burn_in_steps + sequence_length`` windows in total.  Gradients span at
     most ``tbptt_steps`` loss-bearing windows before the state is detached.
 
+    Explicit ``sampling`` modes separate temporal execution from sampling:
+    ``random`` resets independently sampled clips, ``stream_reset`` uses the
+    same stable causal lanes as ``stream`` but resets every chunk, ``stream``
+    carries detached state across chunks, and ``mixed`` combines stream then
+    random rows in each per-rank batch. ``clip`` is the legacy random mode.
+
     ``enabled`` and ``cell`` are kept as backward-compatible aliases for the
     original R0 configuration.  New configurations should select the two
     independent axes explicitly with ``sequence_loader`` and
@@ -437,10 +443,21 @@ class RecurrentConfig:
         object.__setattr__(
             self, "cell", temporal_model if recurrent_enabled else legacy_cell
         )
-        if self.sampling not in {"clip", "mixed"}:
-            raise ValueError("recurrent.sampling must be clip or mixed")
-        if not 0.0 < self.stream_ratio < 1.0:
-            raise ValueError("recurrent.stream_ratio must lie inside (0, 1)")
+        if self.sampling not in {
+            "clip",
+            "random",
+            "stream_reset",
+            "stream",
+            "mixed",
+        }:
+            raise ValueError(
+                "recurrent.sampling must be clip, random, stream_reset, stream, "
+                "or mixed"
+            )
+        if self.sampling == "mixed" and self.stream_ratio != 0.5:
+            raise ValueError(
+                "recurrent.stream_ratio must be 0.5 for RVT-style mixed 1:1 sampling"
+            )
         if self.kernel_size <= 0 or self.kernel_size % 2 == 0:
             raise ValueError("recurrent.kernel_size must be a positive odd integer")
         if self.window_ms <= 0 or self.stride_ms <= 0:
@@ -784,6 +801,11 @@ class ExperimentConfig:
                     "online pass would leak the current masked input into recurrent state"
                 )
             if self.recurrent.sampling == "mixed":
+                if self.data.batch_size % 2:
+                    raise ValueError(
+                        "RVT-style mixed 1:1 sampling requires an even per-rank "
+                        "batch size"
+                    )
                 stream_batch = round(
                     self.data.batch_size * self.recurrent.stream_ratio
                 )
@@ -792,16 +814,19 @@ class ExperimentConfig:
                         "mixed sequence sampling requires at least one stream and one "
                         "random sample per rank"
                     )
-                if (
-                    self.recurrent.enabled
-                    and self.recurrent.tbptt_steps
-                    != self.recurrent.sequence_length
-                ):
-                    raise ValueError(
-                        "mixed recurrent sequence sampling requires tbptt_steps == "
-                        "sequence_length: random clips use full BPTT while stream "
-                        "state is detached and carried between batches"
-                    )
+            if (
+                self.recurrent.enabled
+                and self.recurrent.sampling
+                in {"random", "stream_reset", "stream", "mixed"}
+                and self.recurrent.tbptt_steps
+                != self.recurrent.sequence_length
+            ):
+                raise ValueError(
+                    "explicit random/stream_reset/stream/mixed recurrent sampling "
+                    "requires "
+                    "tbptt_steps == sequence_length: random clips use full BPTT, "
+                    "while stream state is detached and carried between batches"
+                )
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> ExperimentConfig:

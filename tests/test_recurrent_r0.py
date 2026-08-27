@@ -364,6 +364,53 @@ def test_mixed_contract_enforces_cross_batch_tbptt_and_random_resets() -> None:
         )
 
 
+def test_stream_reset_contract_preserves_lanes_but_allows_continuous_reset() -> None:
+    first = {
+        "sampling_mode": ["stream", "stream"],
+        "state_reset": torch.tensor([True, True], dtype=torch.bool),
+        "t_end_us": torch.tensor(
+            [[50_000, 100_000], [250_000, 300_000]], dtype=torch.int64
+        ),
+        "sequence_id": ["sequence-a", "sequence-b"],
+        "stream_id": ["rank-0:lane-0", "rank-0:lane-1"],
+        "augmentation_id": ["geometry-a", "geometry-b"],
+    }
+    previous = _validate_mixed_recurrent_batch(
+        first,
+        batch_size=2,
+        stream_batch_size=2,
+        stride_us=50_000,
+        previous_streams=None,
+        stream_reset_every_batch=True,
+    )
+    second = {
+        **first,
+        "t_end_us": torch.tensor(
+            [[150_000, 200_000], [350_000, 400_000]], dtype=torch.int64
+        ),
+    }
+    current = _validate_mixed_recurrent_batch(
+        second,
+        batch_size=2,
+        stream_batch_size=2,
+        stride_us=50_000,
+        previous_streams=previous,
+        stream_reset_every_batch=True,
+    )
+    assert current[-1][-1] == 400_000
+
+    second["state_reset"] = torch.tensor([False, True], dtype=torch.bool)
+    with pytest.raises(ValueError, match="stream_reset rows must reset"):
+        _validate_mixed_recurrent_batch(
+            second,
+            batch_size=2,
+            stream_batch_size=2,
+            stride_us=50_000,
+            previous_streams=previous,
+            stream_reset_every_batch=True,
+        )
+
+
 def test_dense_r0_backward_weights_an_uneven_tail_by_timestep_count() -> None:
     torch.manual_seed(11)
     config = _r0_config()

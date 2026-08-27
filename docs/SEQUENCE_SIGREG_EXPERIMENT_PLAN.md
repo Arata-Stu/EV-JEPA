@@ -1,6 +1,6 @@
 # Gen1 Sequence / SIGReg R0 実験計画
 
-更新日: 2026-08-25
+更新日: 2026-08-28
 
 ## 目的
 
@@ -22,15 +22,17 @@ Event Cameraの50 ms表現について、次の3段階を一度に混ぜず、�
 | 段階 | 比較軸 | 現在の状態 | 実行判定 |
 | --- | --- | --- | --- |
 | Stage 1 | 50 ms・2 ch / 50 ms・10 ch | `temporal_bins`切替とfeedforward sequence loaderは実装済み | 実行可能 |
-| Stage 2 | Feedforward / ConvGRU / ConvLSTM | 3 model、mixed BPTT/TBPTT loader、共有augmentation、stateful Detectionを実装済み | 実行・主評価可能 |
+| Stage 2 | Feedforward / ConvGRU / ConvLSTM | 3 model、4 sampling mode、共有augmentation、T-step stateful Detectionを実装済み | 実行・主評価可能 |
 | Stage 3 | SIGReg 3方式 | patch activityの返却だけ実装済み。SIGReg loss、projector、DDP統計は未実装 | まだ実行不可 |
 
 Stage 2では`gen1_detection --stateful`がrecurrent checkpointを受け取り、recording順に
 ラベルなし窓を含めてstateを更新する。既存ROI probeは引き続きrecurrent checkpointを拒否する
 ため補助分類評価は未実装だが、主指標のstateful Detection APでmodel選択できる。
 
-stateful DetectionはRVT型の複数recording laneを使う。各laneは50 ms frameを1 stepずつ
-因果順に進め、lane交代時だけresetし、step後のstateをdetachして次のbatchへ渡す。50 ms内部の
+stateful DetectionはRVT型の複数recording laneとrandom label-anchored clipを使う。各stream laneは50 ms frameを因果順に進め、
+最大21 stepを1 chunk内で展開する。chunk内のlabel付きfeatureをまとめてheadへ1回だけ渡し、
+backward・optimizer updateもchunkにつき1回とする。lane交代時だけresetし、chunk末のstateを
+detachして次chunkへ渡す。50 ms内部の
 temporal binsはrecurrent stepではなくchannelである。公式RVT Gen1の10 bins × 2 polarity =
 20 chに対し、本計画の2 ch（1 bin × 2）と10 ch（5 bins × 2）は、どちらも50 ms frame全体を
 空間encoderへ一括入力して1回だけrecurrent updateする。この違いはStage 1の入力表現比較であり、
@@ -87,6 +89,8 @@ R0基準とは別条件であり、同じStage内の比較途中では変更し�
 
 入力解像度とcropがともに240×304なので、現在のrandom cropは恒等変換である。
 mask、tube mask、augmentation追加、teacherless化はこの3段階では変更しない。
+上表は既存R0 baselineの`mixed`条件である。21-step follow-upではsamplingを
+`random / stream_reset / stream / mixed`の独立軸として比較する。
 
 ### 再現性の単位
 
@@ -99,6 +103,55 @@ mask、tube mask、augmentation追加、teacherless化はこの3段階では変�
   host-memoryの余裕を基準にper-rank batch 16、global batch 48、worker 4/rankとする。
 - gradient accumulationはSIGRegの同時標本数を増やさないため、Stage 3では
   `global_batch = per_rank_batch × world_size`を明記する。
+
+### RVT型21-step follow-up
+
+既存のStage 1/2 R0（`sequence_length=8`, `burn_in_steps=2`）は再現用baselineとして残す。
+RVT Gen1の1 training stepあたりtotal 21 framesへ合わせるfollow-upは、別runとして次を使う。
+参照する一次実装は、RVTの
+[Gen1設定](https://github.com/uzh-rpg/RVT/blob/master/config/experiment/gen1/default.yaml)、
+[training loop](https://github.com/uzh-rpg/RVT/blob/master/modules/detection.py)、
+[stream sequence構築](https://github.com/uzh-rpg/RVT/blob/master/data/genx_utils/sequence_for_streaming.py)、
+[random sequence構築](https://github.com/uzh-rpg/RVT/blob/master/data/genx_utils/sequence_rnd.py)である。
+
+| 項目 | RVT型follow-up |
+| --- | --- |
+| supervised sequence | 21 steps |
+| burn-in | 0 steps |
+| TBPTT chunk | 21 steps |
+| per-rank batch / world size | 6 / 3 |
+| global batch | 18 clips |
+| samples per epoch | 2,340 clips |
+| optimizer updates per epoch | 130 |
+| supervised windows per epoch | 49,140 |
+
+旧R0はper-rank batch 16、sequence 8、130 updates、49,920 supervised windows/epochである。
+したがって上表は、1 rankあたりのactivation目安を`16*8=128`から`6*21=126`へほぼ維持し、
+optimizer update数と入力信号量も近づけた比較である。`sequence_length=21`にburn-in 2を足すと
+total 23 framesになりRVTのtotal 21とは異なるため、run IDの`sl21_bi0`を必ず確認する。
+
+PretrainのConvGRU/ConvLSTM経路は、既に`[B,T,C,H,W]`を受け、T回のrecurrent forward、
+T平均loss、1 backward、1 optimizer/EMA updateを行う。samplingは次の4条件を使う。
+
+| mode | sample列 | chunk境界 | 研究上の役割 |
+| --- | --- | --- | --- |
+| `random` | 独立random clip | reset | chunk内full BPTT。sampling差を含む補助条件 |
+| `stream_reset` | stable causal stream | reset | `stream`と入力を一致させた主対照 |
+| `stream` | stable causal stream | detach + carry | TBPTT条件 |
+| `mixed` | stream 50% + random 50% | row別carry/reset | RVT型hybrid |
+
+`stream_reset`と`stream`はlane、timestamp、augmentation、mask seedを一致させる。したがって
+state carry/TBPTT効果の主比較はこの2条件であり、`random`対`stream`を純粋な
+BPTT/TBPTT差とは解釈しない。Feedforwardはstateを持たないため、同じT frameを
+`B*T`へflattenして1 encoder forward・1 updateとする。Feedforwardのmode差はsampling対照で、
+BPTT/TBPTT比較ではない。
+
+Detectionでは`--sequence-length 21`により、8 clip/lane×最大21 stepを1 chunkとして読み、
+backboneを時間loopした後、全label付きfeatureを1 head batchへまとめる。
+`--stateful-sampling`で同じ4 modeを選び、mixedはstream 4＋random 4、stream trainingは
+label gapでsegment化、validationは全modeでfull causal streamとする。ただしDetectionの
+backboneは凍結するため、ここでのmode差はsampling/stateful feature executionであり、真の
+backbone BPTT/TBPTTではない。またDetection augmentationは現時点でidentityである。
 
 runnerの既定precisionはserver移行に対応するため`auto`とする。`--precision auto`は選択した
 全rankの共通能力を調べ、全台native BF16なら`bf16`、全台
@@ -120,13 +173,17 @@ resolved configを要求する。runnerはresume時の`auto`を拒否するた�
 run IDは比較軸が名前から分かるようにする。
 
 ```text
-s{stage}_{input}_{model}_{regularizer}_np{world_size}_bs{per_rank_batch}_{precision}_seed{seed}[_smoke]
+s{stage}_{input}_{model}_{regularizer}[_sl{T}_bi{burn}][_sampling-{mode}]_np{world_size}_bs{per_rank_batch}_{precision}_seed{seed}[_spe{clips}][_smoke]
 ```
 
 例えばV100 3台の基準条件は
 `s1_input_2ch_ff_nosig_np3_bs16_fp16_seed0`となる。`_smoke`は1 epoch・2 global batchesの
 hardware確認専用で、正式runとは別artifactとして保持する。world size、per-rank batch、
 precisionをrun IDへ含めることで、互換性のないcheckpointを誤ってresumeしない。
+既定の`sl8_bi2`と`samples_per_epoch=6250`は後方互換のためsuffixを省略する。非既定の
+sequence条件とformal clip予算は、例えば`_sl21_bi0_..._spe2340`として明示する。
+非既定samplingは`sampling-random`、`sampling-stream_reset`、`sampling-stream`をrun IDへ
+含める。既定`mixed`は既存run IDとの互換性のためsuffixを省略する。
 
 短縮名は次に固定する。
 
@@ -199,6 +256,11 @@ burn-inでstateを作り、stream laneはbatch境界を越えてdetach済みstat
 random laneは毎clip resetする。Feedforwardは同じsampleを受け取るが、burn-inとstate
 metadataをmodel計算に使わない。
 
+既存8-step主表は`mixed`で再現する。21-step sampling比較では、ConvGRUとConvLSTMに対して
+4 modeを実行する。最初に`stream_reset`対`stream`を比較し、次に`random`でsampling分布の
+影響、最後に`mixed`でRVT型hybridの有効性を確認する。runnerの`--action all`は同じmodeで
+Feedforwardも実行するため、FFはsampling-only controlとして表へ残す。
+
 これは「同じ現在frameだけを見た公平な計算量比較」ではなく、時間履歴を利用できるmodelの
 実運用上の比較である。parameter数、peak VRAM、supervised windows/sも併記する。
 必要なら全モデル`burn_in_steps=0`の計算量寄り感度分析を後から行うが、R0の主表には混ぜない。
@@ -216,11 +278,19 @@ metadataをmodel計算に使わない。
 - 複数recording laneを1回のbackbone forwardで処理し、label有りrowだけをhead/lossへ渡す。
 - Detectionのframe幅をcheckpointの`recurrent.window_ms`と一致させる。
 - 凍結headとfine-tuneの結果を分ける。
+- epoch数だけでなく、`optimizer_updates`、実入力frame数、stream/random clip数、
+  samplerが持つ固有stream window数とrandom anchor数を併記する。mixedは短い側を再利用するため、
+  これらを揃えずにmode間の学習量が同じとはみなさない。
 
 主指標はstateful Gen1 Detection APとする。凍結分類macro-F1はrecurrent版が未実装なので
 現時点では補助表から外す。stateful Detectionのbatch sizeは同時recording lane数（R0は8）で、
 凍結backboneで実行する。batch 1も互換経路として残す。validation AP最大時の
 `checkpoint-best.pt`と最新再開用`checkpoint-latest.pt`を分けて保存する。
+
+事前学習samplingの4条件を比較する主表では、下流headのtraining protocolを全checkpointで
+`--stateful-sampling mixed`へ固定する。Detection側の`random / stream_reset / stream / mixed`
+比較は別ablationとし、事前学習modeと下流modeを一度に変えない。Detection backboneは凍結される
+ため、この下流ablationをBPTT/TBPTTの証拠には使わない。
 
 ### 選択規則
 
@@ -491,6 +561,42 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
   --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
   --precision auto --batch-size 16 --workers 4 --nproc-per-node auto
 ```
+
+RVT型total 21-step follow-upは、既存8-step runを上書きせず次の別条件で行う。
+以下はStage 1で2 chを選択済み、V100 3台を使う例である。最初に4 modeのsmokeを行う。
+
+```bash
+for MODE in stream_reset stream random mixed; do
+  CUDA_VISIBLE_DEVICES=0,1,2 \
+    bash scripts/experiments/run_sequence_sigreg_plan.sh \
+    --stage 2 --action all --selected-input 2ch --seed 0 --smoke \
+    --sampling-mode "$MODE" \
+    --sequence-length 21 --burn-in-steps 0 --samples-per-epoch 2340 \
+    --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+    --output-root /home/iASL/Arata_repo/EV-JEPA/outputs/pretrain/sequence_sampling_t21 \
+    --precision fp16 --batch-size 6 --workers 4 --nproc-per-node 3
+done
+```
+
+smoke完走後、`--smoke`だけを外して4 modeのformal 100 epochsを実行する。
+
+```bash
+for MODE in stream_reset stream random mixed; do
+  CUDA_VISIBLE_DEVICES=0,1,2 \
+    bash scripts/experiments/run_sequence_sigreg_plan.sh \
+    --stage 2 --action all --selected-input 2ch --seed 0 \
+    --sampling-mode "$MODE" \
+    --sequence-length 21 --burn-in-steps 0 --samples-per-epoch 2340 \
+    --data-root /home/iASL/Arata_repo/dataset/gen1_304x240 \
+    --output-root /home/iASL/Arata_repo/EV-JEPA/outputs/pretrain/sequence_sampling_t21 \
+    --precision fp16 --batch-size 6 --workers 4 --nproc-per-node 3
+done
+```
+
+このformal run IDには`sl21_bi0`と`spe2340`が入り、non-mixed条件にはsampling名も入るため、
+8-step baselineや異なるepoch予算と混同しない。runnerは各modeについてFF、ConvGRU、
+ConvLSTMを同じ設定で順番に実行する。合計12 runなので、主比較だけ先に行う場合は
+`stream_reset`と`stream`の2周を先行する。
 
 中断後に同じworld size・configで再開する場合だけ、明示的に`--resume`を付ける。
 

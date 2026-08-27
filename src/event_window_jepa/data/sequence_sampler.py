@@ -182,7 +182,7 @@ class UniformSequenceClipSampler:
 
 
 class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
-    """RVT-style fixed random/stream mixture with stable stream lanes.
+    """RVT-style stable stream lanes with optional random rows.
 
     ``samples_per_epoch`` is the requested number of items across all ranks.
     Complete global batches are retained, so ``len(self)`` is
@@ -190,7 +190,11 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
     assigned once to global ``(rank, lane)`` shards. Their order is shuffled
     deterministically per epoch, while every recording's chunks remain causal
     and consecutive inside its lane. A stream recording shares one spatial
-    augmentation seed for all of its chunks in an epoch.
+    augmentation seed for all of its chunks in an epoch. ``stream_ratio`` may
+    be ``(1, 0)`` for stream-only TBPTT. ``force_stream_reset`` keeps those
+    exact stream chunks and augmentations but resets every chunk, providing a
+    sampling-matched full-BPTT control. The historical class name is retained
+    because mixed 1:1 sampling remains its default and primary use.
     """
 
     def __init__(
@@ -208,6 +212,7 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
         rank: int = 0,
         seed: int = 0,
         random_sampling_strategy: str = "dataset_balanced",
+        force_stream_reset: bool = False,
     ) -> None:
         if sequence_length <= 0:
             raise ValueError("sequence_length must be positive")
@@ -217,8 +222,18 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
             raise ValueError("epoch and batch sizes must be positive")
         if world_size <= 0 or not 0 <= rank < world_size:
             raise ValueError("rank must lie inside a positive world_size")
-        if len(stream_ratio) != 2 or min(stream_ratio) <= 0:
-            raise ValueError("stream_ratio must contain positive (stream, random) weights")
+        if not isinstance(force_stream_reset, bool):
+            raise TypeError("force_stream_reset must be boolean")
+        if (
+            len(stream_ratio) != 2
+            or stream_ratio[0] <= 0
+            or stream_ratio[1] < 0
+        ):
+            raise ValueError(
+                "stream_ratio must contain positive stream and non-negative random weights"
+            )
+        if stream_ratio[1] and stream_ratio[0] != stream_ratio[1]:
+            raise ValueError("mixed stream/random sampling requires a 1:1 ratio")
         if batch_size % sum(stream_ratio):
             raise ValueError("batch_size must be divisible by the random/stream ratio sum")
 
@@ -234,12 +249,13 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
         self.world_size = int(world_size)
         self.rank = int(rank)
         self.seed = int(seed)
+        self.force_stream_reset = force_stream_reset
         self.epoch = 0
         ratio_sum = sum(stream_ratio)
         self.stream_batch_size = self.batch_size * stream_ratio[0] // ratio_sum
         self.random_batch_size = self.batch_size - self.stream_batch_size
-        if min(self.stream_batch_size, self.random_batch_size) <= 0:
-            raise ValueError("mixed batches require at least one random and one stream item")
+        if self.stream_batch_size <= 0:
+            raise ValueError("stream-aware batches require at least one stream item")
 
         self.global_batch_size = self.batch_size * self.world_size
         self.batches_per_epoch = self.samples_per_epoch // self.global_batch_size
@@ -276,18 +292,20 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
             shards[index % global_stream_lanes].append(recording_id)
         self._lane_recordings = tuple(tuple(values) for values in shards)
 
-        random_items = (
-            self.batches_per_epoch * self.world_size * self.random_batch_size
-        )
-        self._random_sampler = UniformSequenceClipSampler(
-            sequence_values,
-            base_window_ms=self.base_window_us / 1_000.0,
-            stride_ms=self.stride_us / 1_000.0,
-            sequence_length=self.sequence_length,
-            burn_in_steps=self.burn_in_steps,
-            samples_per_epoch=random_items,
-            seed=self.seed,
-            sampling_strategy=random_sampling_strategy,
+        random_items = self.batches_per_epoch * self.world_size * self.random_batch_size
+        self._random_sampler = (
+            UniformSequenceClipSampler(
+                sequence_values,
+                base_window_ms=self.base_window_us / 1_000.0,
+                stride_ms=self.stride_us / 1_000.0,
+                sequence_length=self.sequence_length,
+                burn_in_steps=self.burn_in_steps,
+                samples_per_epoch=random_items,
+                seed=self.seed,
+                sampling_strategy=random_sampling_strategy,
+            )
+            if random_items
+            else None
         )
 
     def _build_recording_chunks(
@@ -385,7 +403,7 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
             clip=chunk.clip,
             sampling_mode="stream",
             stream_id=f"rank-{self.rank}:lane-{global_lane % self.stream_batch_size}",
-            state_reset=chunk.state_reset,
+            state_reset=chunk.state_reset or self.force_stream_reset,
             augmentation_seed=augmentation_seed,
             augmentation_id=(
                 f"recording:{chunk.recording_id}:epoch-{self.epoch}:"
@@ -395,6 +413,8 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
         )
 
     def _random_request(self, global_random_index: int) -> RecurrentClipRequest:
+        if self._random_sampler is None:
+            raise RuntimeError("a stream-only sampler cannot create random requests")
         clip = self._random_sampler.sample(global_random_index, self.epoch)
         augmentation_seed = deterministic_seed(
             self.seed, self.epoch, global_random_index, stream=105
