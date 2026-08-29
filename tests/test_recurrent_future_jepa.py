@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from event_window_jepa.config import ExperimentConfig
@@ -220,6 +221,99 @@ def test_future_input_changes_teacher_only_and_sigreg_backpropagates_online() ->
     assert model.future_regularizers["support"].projector.network[0].weight.grad is not None
     assert model.future_regularizers["temporal"].projector.network[0].weight.grad is not None
     assert all(parameter.grad is None for parameter in model.target_encoder.parameters())
+
+
+def test_future_latent_extraction_matches_training_path_and_detaches_outputs() -> None:
+    torch.manual_seed(31)
+    model = _future_model().eval()
+    (
+        context,
+        future,
+        duration,
+        context_mask,
+        target_mask,
+        context_activity,
+        future_activity,
+    ) = _inputs()
+
+    with torch.no_grad():
+        expected = model(
+            context,
+            future,
+            duration,
+            duration,
+            context_mask,
+            target_mask,
+            objective="recurrent_future_jepa",
+            context_event_activity=context_activity,
+            target_event_activity=future_activity,
+        )
+    first = model.extract_recurrent_future_step(
+        context[:, 0],
+        future[:, 0],
+        duration[:, 0],
+        duration[:, 0],
+    )
+    second = model.extract_recurrent_future_step(
+        context[:, 1],
+        future[:, 1],
+        duration[:, 1],
+        duration[:, 1],
+        online_state=first.online_state,
+    )
+
+    assert first.frame_tokens.shape == first.recurrent_tokens.shape == (
+        2,
+        4,
+        32,
+    )
+    assert torch.equal(
+        torch.cat((first.prediction, second.prediction), dim=0),
+        expected.prediction,
+    )
+    assert torch.equal(
+        torch.cat((first.target_tokens, second.target_tokens), dim=0),
+        expected.target,
+    )
+    assert _state_equal(second.online_state, expected.online_state)
+    for value in (
+        first.frame_tokens,
+        first.recurrent_tokens,
+        first.prediction,
+        first.target_tokens,
+        second.frame_tokens,
+        second.recurrent_tokens,
+        second.prediction,
+        second.target_tokens,
+    ):
+        assert not value.requires_grad
+    for state in (first.online_state, second.online_state):
+        state_values = state if isinstance(state, tuple) else (state,)
+        assert all(not value.requires_grad for value in state_values)
+    assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_future_latent_extraction_validates_eval_and_placement() -> None:
+    model = _future_model()
+    context, future, duration, *_ = _inputs()
+
+    with pytest.raises(RuntimeError, match=r"model\.eval"):
+        model.extract_recurrent_future_step(
+            context[:, 0],
+            future[:, 0],
+            duration[:, 0],
+            duration[:, 0],
+        )
+
+    model.eval()
+    model.online_encoder.recurrent_placement = "pre_encoder"
+    with pytest.raises(ValueError, match="post_encoder"):
+        model.extract_recurrent_future_step(
+            context[:, 0],
+            future[:, 0],
+            duration[:, 0],
+            duration[:, 0],
+        )
 
 
 def test_event_support_uses_raw_presence_and_only_meaningful_count_splits() -> None:

@@ -70,6 +70,17 @@ class WindowJEPAOutput:
     inactive_prediction_count: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class RecurrentFutureLatentStep:
+    """Latents produced by one causal future-prediction inference step."""
+
+    frame_tokens: torch.Tensor
+    recurrent_tokens: torch.Tensor
+    prediction: torch.Tensor
+    target_tokens: torch.Tensor
+    online_state: RecurrentState
+
+
 class WindowJEPA(nn.Module):
     def __init__(
         self,
@@ -682,6 +693,107 @@ class WindowJEPA(nn.Module):
         ).clamp_min(0.0)
         return prediction_variance.sqrt().mean(), target_variance.sqrt().mean()
 
+    def _recurrent_future_latent_step(
+        self,
+        x_context: torch.Tensor,
+        x_target: torch.Tensor,
+        context_duration_ms: torch.Tensor,
+        target_duration_ms: torch.Tensor,
+        online_state: RecurrentState | None,
+        *,
+        detach_state: bool,
+    ) -> RecurrentFutureLatentStep:
+        """Build the shared online-predictor/stateless-EMA future path."""
+
+        online_encoder, target_encoder = self._recurrent_encoders()
+        if (
+            online_encoder.recurrent_placement != "post_encoder"
+            or target_encoder.recurrent_placement != "post_encoder"
+        ):
+            raise ValueError(
+                "recurrent future latent extraction requires post_encoder recurrence"
+            )
+        if x_context.ndim != 4 or x_context.shape != x_target.shape:
+            raise ValueError("future step inputs must share shape [B,C,H,W]")
+        if x_context.device != x_target.device or x_context.dtype != x_target.dtype:
+            raise ValueError("future step inputs must share a device and dtype")
+        batch_size = x_context.shape[0]
+        if (
+            context_duration_ms.numel() != batch_size
+            or target_duration_ms.numel() != batch_size
+        ):
+            raise ValueError("future step durations must contain one value per sample")
+        if (
+            context_duration_ms.device != x_context.device
+            or target_duration_ms.device != x_context.device
+        ):
+            raise ValueError("future step durations and inputs must share a device")
+
+        context_ms = context_duration_ms.reshape(batch_size)
+        target_ms = target_duration_ms.reshape(batch_size)
+        source_scale, target_scale, ratio_scale = self._scale_features(
+            context_ms, target_ms
+        )
+        frame_tokens, recurrent_tokens, next_state = (
+            online_encoder.forward_frame_and_recurrent(
+                x_context,
+                source_scale,
+                None,
+                state=online_state,
+                detach_state=detach_state,
+            )
+        )
+        with torch.no_grad():
+            ema_scale = self.target_scale_embedding(target_ms)
+            if not self.condition_on_scale:
+                ema_scale = torch.zeros_like(ema_scale)
+            ema_target = target_encoder.forward_frame(x_target, ema_scale, None)
+
+        full_mask = torch.ones(
+            (batch_size, self.num_patches),
+            dtype=torch.bool,
+            device=x_context.device,
+        )
+        prediction = self.predictor(
+            context_tokens=recurrent_tokens,
+            context_keep_mask=full_mask,
+            target_mask=full_mask,
+            source_scale=source_scale,
+            target_scale=target_scale,
+            ratio_scale=ratio_scale,
+        )
+        return RecurrentFutureLatentStep(
+            frame_tokens=frame_tokens,
+            recurrent_tokens=recurrent_tokens,
+            prediction=prediction,
+            target_tokens=ema_target,
+            online_state=next_state,
+        )
+
+    @torch.no_grad()
+    def extract_recurrent_future_step(
+        self,
+        x_context: torch.Tensor,
+        x_future: torch.Tensor,
+        context_duration_ms: torch.Tensor,
+        target_duration_ms: torch.Tensor,
+        online_state: RecurrentState | None = None,
+    ) -> RecurrentFutureLatentStep:
+        """Extract one detached future-JEPA step from a model in evaluation mode."""
+
+        if self.training:
+            raise RuntimeError(
+                "future latent extraction requires model.eval() before inference"
+            )
+        return self._recurrent_future_latent_step(
+            x_context=x_context,
+            x_target=x_future,
+            context_duration_ms=context_duration_ms,
+            target_duration_ms=target_duration_ms,
+            online_state=online_state,
+            detach_state=True,
+        )
+
     def recurrent_future_sequence(
         self,
         x_context: torch.Tensor,
@@ -699,7 +811,7 @@ class WindowJEPA(nn.Module):
         event-support map is applied only to loss balancing and SIGReg pooling.
         """
 
-        online_encoder, target_encoder = self._recurrent_encoders()
+        online_encoder, _ = self._recurrent_encoders()
         if online_encoder.recurrent_placement != "post_encoder":
             raise ValueError(
                 "recurrent_future_jepa requires post_encoder recurrence"
@@ -722,41 +834,20 @@ class WindowJEPA(nn.Module):
         state = online_state
         outputs: list[WindowJEPAOutput] = []
         for index in range(steps):
-            context_ms = context_duration_ms[:, index].reshape(batch_size)
-            target_ms = target_duration_ms[:, index].reshape(batch_size)
-            source_scale, target_scale, ratio_scale = self._scale_features(
-                context_ms, target_ms
-            )
             previous_state = state
-            frame_tokens, recurrent_tokens, state = (
-                online_encoder.forward_frame_and_recurrent(
-                    x_context[:, index],
-                    source_scale,
-                    None,
-                    state=state,
-                )
+            latent_step = self._recurrent_future_latent_step(
+                x_context=x_context[:, index],
+                x_target=x_target[:, index],
+                context_duration_ms=context_duration_ms[:, index],
+                target_duration_ms=target_duration_ms[:, index],
+                online_state=state,
+                detach_state=False,
             )
-            with torch.no_grad():
-                ema_scale = self.target_scale_embedding(target_ms)
-                if not self.condition_on_scale:
-                    ema_scale = torch.zeros_like(ema_scale)
-                target_tokens = target_encoder.forward_frame(
-                    x_target[:, index], ema_scale, None
-                )
-
-            full_mask = torch.ones(
-                (batch_size, self.num_patches),
-                dtype=torch.bool,
-                device=x_context.device,
-            )
-            prediction = self.predictor(
-                context_tokens=recurrent_tokens,
-                context_keep_mask=full_mask,
-                target_mask=full_mask,
-                source_scale=source_scale,
-                target_scale=target_scale,
-                ratio_scale=ratio_scale,
-            )
+            frame_tokens = latent_step.frame_tokens
+            recurrent_tokens = latent_step.recurrent_tokens
+            prediction = latent_step.prediction
+            target_tokens = latent_step.target_tokens
+            state = latent_step.online_state
             balanced = balanced_event_support_latent_prediction_loss(
                 prediction,
                 target_tokens,

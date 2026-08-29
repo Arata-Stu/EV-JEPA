@@ -295,6 +295,22 @@ torchrun --standalone --nproc-per-node=3 \
   --config configs/pretrain/recurrent_future_convlstm_vits_gen1.yaml
 ```
 
+学習済みcheckpointのFrame ViT、ConvLSTM、prediction、EMA future targetは、EMA targetから
+fitした共通PCA基底で可視化できます。正しい履歴、過去順序のshuffle、state resetでは同じ
+現在・未来を固定し、別clipのfuture targetとの対応も別controlで比較するため、時系列stateを
+実際に使っているかも同時に確認できます。
+
+```bash
+window-jepa-visualize-future \
+  --checkpoint outputs/pretrain/recurrent_future_convlstm_vits_gen1_seed0/checkpoint-latest.pt \
+  --calibration-samples 4 \
+  --output outputs/feature-vis/epoch-100.html
+```
+
+HTML、数値JSON、patch map PNGが保存されます。checkpointと評価serverでmanifestの場所が
+異なる場合は`--manifest /path/to/manifest.jsonl`を追加します。解釈と全optionは
+[Causal Future Event JEPA](docs/CAUSAL_FUTURE_EVENT_JEPA.md#特徴量の定性可視化)を参照してください。
+
 各sampleは内部で`2 burn-in + 8 context + 1 lookahead`の11窓を読みます。ただしonline stateへ
 入るのは先頭10窓だけです。stream chunkは10窓ずつ進むため、前chunkのlookahead窓が次chunkの
 先頭contextとして一度だけonline側へ入り、時刻を飛ばしません。

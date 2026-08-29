@@ -163,3 +163,54 @@ SIGReg bufferも保存します。厳密resumeではこれらが欠けていれ�
 復元したencoderは`recurrent_placement=post_encoder`なので、推論も
 `Frame ViT → ConvLSTM`の順序を維持します。Linear Probeでframe-only表現を評価したい場合は
 `online_encoder.forward_frame()`を使い、時間表現の評価とは分けて報告してください。
+
+## 特徴量の定性可視化
+
+学習済みcheckpointについて、現在・未来のeventとpatch latentを同じレポートで比較できます。
+PCAは評価対象を見て都度fitせず、指定したsample群の**EMA future targetだけ**から1回fitし、
+Frame ViT、ConvLSTM、prediction、controlへ同じ基底と表示scaleを適用します。そのため、同一
+checkpoint内ではpanel間のRGB差をlatent差として比較できます。別run間ではlatent軸が任意回転
+し得るため、RGBそのものではなく数値診断を主に比較してください。またsample indexは各runの
+runtime seedから実clipへ写像されるため、run間の数値比較ではJSONの`sample_set_id`が一致する
+場合だけsample-matchedとして扱ってください。IDにはanchor、crop、flipも含まれます。
+
+```bash
+window-jepa-visualize-future \
+  --checkpoint outputs/pretrain/recurrent_future_convlstm_vits_gen1_seed0/checkpoint-latest.pt \
+  --calibration-samples 4 \
+  --sample-index 0 \
+  --output outputs/feature-vis/epoch-100.html
+```
+
+checkpointに保存されたmanifestの絶対pathが評価serverと異なる場合だけ、`--manifest`で差し替え
+ます。representation、crop、window、stride、horizonなどはcheckpoint設定から固定されます。
+
+```bash
+window-jepa-visualize-future \
+  --checkpoint /path/to/checkpoint-epoch0100.pt \
+  --manifest /path/to/gen1_train_manifest.jsonl \
+  --device cuda \
+  --output outputs/feature-vis/epoch-100.html
+```
+
+既定では、事前に固定した連続4 sampleをPCA calibrationと数値集計に使い、最初のsampleの
+最終supervised stepだけを画像化します。全supervised stepを画像化する場合は`--all-steps`を
+追加してください。無関係targetを別clipの同じonline stepから選ぶため、calibration sample数は
+2以上が必須です。HTMLと同じ場所に完全な数値を含むJSON、`*_assets/`にPNGが保存されます。
+
+`correct`、`history shuffled`、`state reset`は同じ現在窓と正しいEMA future targetを共有します。
+`unrelated target`だけはpredictionを固定し、比較先を別clipの同じonline stepへ交換します。
+
+| 条件 | 変更するもの | 主に確認すること |
+|---|---|---|
+| correct | なし | 基準となる未来予測 |
+| history shuffled | 現在窓を固定し、過去prefixだけ並べ替え | 時系列順序を利用しているか |
+| state reset | 現在窓の直前でstateを初期化 | 過去そのものを利用しているか |
+| unrelated target | predictionを固定し、比較先だけ別anchorへ交換 | 時刻・sample固有の未来を予測しているか |
+
+`correct`より各controlのcosine errorが大きければ、その差は順に「順序」「履歴」「正しい未来対応」
+が役立つ証拠になります。未学習modelでも成立する大小関係ではないため、CLIは合否を決めず、paired
+penaltyと固定位置centered effective rankを記録します。error heatmapはpanelごとのmin-maxを行わず、
+常にtoken LayerNorm後のcosine error `[0, 2]`を共通scaleで描画します。collapse表はraw latentと
+token LayerNorm後を分け、さらに同じonline stepのclip同士でstd/rankを計算します。これにより、
+時刻ごとに定数が違うだけの表現をsample間の有効な分散として数えることを避けます。
