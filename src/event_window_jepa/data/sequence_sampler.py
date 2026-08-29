@@ -87,8 +87,10 @@ class UniformSequenceClipSampler:
     """Stateless sampler for fixed-stride clips that never cross a sequence.
 
     ``sequence_length`` counts timesteps that contribute a training loss.
-    ``burn_in_steps`` are prepended to those timesteps, so every sampled clip
-    contains ``burn_in_steps + sequence_length`` windows in total.
+    ``burn_in_steps`` are prepended to those timesteps. ``lookahead_steps``
+    append target-only windows, so every sampled clip contains
+    ``burn_in_steps + sequence_length + lookahead_steps`` windows in total.
+    The online model consumes only the leading ``online_steps`` windows.
     """
 
     def __init__(
@@ -99,6 +101,7 @@ class UniformSequenceClipSampler:
         stride_ms: float,
         sequence_length: int,
         burn_in_steps: int,
+        lookahead_steps: int = 0,
         samples_per_epoch: int,
         seed: int = 0,
         sampling_strategy: str = "dataset_balanced",
@@ -107,6 +110,8 @@ class UniformSequenceClipSampler:
             raise ValueError("sequence_length must be positive")
         if burn_in_steps < 0:
             raise ValueError("burn_in_steps cannot be negative")
+        if lookahead_steps < 0:
+            raise ValueError("lookahead_steps cannot be negative")
         if samples_per_epoch <= 0:
             raise ValueError("samples_per_epoch must be positive")
         if sampling_strategy not in {"dataset_balanced", "sequence_balanced"}:
@@ -116,10 +121,12 @@ class UniformSequenceClipSampler:
         self.stride_us = milliseconds_to_microseconds(stride_ms)
         self.sequence_length = int(sequence_length)
         self.burn_in_steps = int(burn_in_steps)
+        self.lookahead_steps = int(lookahead_steps)
         self.samples_per_epoch = int(samples_per_epoch)
         self.seed = int(seed)
         self.sampling_strategy = sampling_strategy
-        self.total_steps = self.burn_in_steps + self.sequence_length
+        self.online_steps = self.burn_in_steps + self.sequence_length
+        self.total_steps = self.online_steps + self.lookahead_steps
         self.required_duration_us = self.base_window_us + (
             self.total_steps - 1
         ) * self.stride_us
@@ -205,6 +212,7 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
         stride_ms: float,
         sequence_length: int,
         burn_in_steps: int,
+        lookahead_steps: int = 0,
         samples_per_epoch: int,
         batch_size: int,
         stream_ratio: tuple[int, int] = (1, 1),
@@ -218,6 +226,8 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
             raise ValueError("sequence_length must be positive")
         if burn_in_steps < 0:
             raise ValueError("burn_in_steps cannot be negative")
+        if lookahead_steps < 0:
+            raise ValueError("lookahead_steps cannot be negative")
         if samples_per_epoch <= 0 or batch_size <= 0:
             raise ValueError("epoch and batch sizes must be positive")
         if world_size <= 0 or not 0 <= rank < world_size:
@@ -243,7 +253,9 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
             raise ValueError("mixed streaming requires stride_ms == base_window_ms")
         self.sequence_length = int(sequence_length)
         self.burn_in_steps = int(burn_in_steps)
-        self.total_steps = self.burn_in_steps + self.sequence_length
+        self.lookahead_steps = int(lookahead_steps)
+        self.online_steps = self.burn_in_steps + self.sequence_length
+        self.total_steps = self.online_steps + self.lookahead_steps
         self.samples_per_epoch = int(samples_per_epoch)
         self.batch_size = int(batch_size)
         self.world_size = int(world_size)
@@ -300,6 +312,7 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
                 stride_ms=self.stride_us / 1_000.0,
                 sequence_length=self.sequence_length,
                 burn_in_steps=self.burn_in_steps,
+                lookahead_steps=self.lookahead_steps,
                 samples_per_epoch=random_items,
                 seed=self.seed,
                 sampling_strategy=random_sampling_strategy,
@@ -329,12 +342,17 @@ class MixedRecurrentBatchSampler(Sampler[list[RecurrentClipRequest]]):
                     // self.stride_us
                     + 1
                 )
-                complete_chunks = max(0, available_steps) // self.total_steps
+                complete_chunks = (
+                    0
+                    if available_steps < self.total_steps
+                    else 1
+                    + (available_steps - self.total_steps) // self.online_steps
+                )
                 for chunk_index in range(complete_chunks):
                     first_end = (
                         info.t_start_us
                         + self.base_window_us
-                        + chunk_index * self.total_steps * self.stride_us
+                        + chunk_index * self.online_steps * self.stride_us
                     )
                     end_timestamps = tuple(
                         first_end + step * self.stride_us

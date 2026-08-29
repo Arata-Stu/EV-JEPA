@@ -343,6 +343,8 @@ class RecurrentConfig:
     sequence_length: int = 8
     burn_in_steps: int = 2
     tbptt_steps: int = 4
+    prediction_horizon_steps: int = 0
+    recurrent_placement: str = "pre_encoder"
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> RecurrentConfig:
@@ -362,6 +364,8 @@ class RecurrentConfig:
                 "sequence_length",
                 "burn_in_steps",
                 "tbptt_steps",
+                "prediction_horizon_steps",
+                "recurrent_placement",
             },
             "recurrent",
         )
@@ -394,6 +398,12 @@ class RecurrentConfig:
             sequence_length=int(values.get("sequence_length", 8)),
             burn_in_steps=int(values.get("burn_in_steps", 2)),
             tbptt_steps=int(values.get("tbptt_steps", 4)),
+            prediction_horizon_steps=int(
+                values.get("prediction_horizon_steps", 0)
+            ),
+            recurrent_placement=str(
+                values.get("recurrent_placement", "pre_encoder")
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -466,6 +476,14 @@ class RecurrentConfig:
             raise ValueError("recurrent.sequence_length must be positive")
         if self.burn_in_steps < 0:
             raise ValueError("recurrent.burn_in_steps cannot be negative")
+        if self.prediction_horizon_steps < 0:
+            raise ValueError(
+                "recurrent.prediction_horizon_steps cannot be negative"
+            )
+        if self.recurrent_placement not in {"pre_encoder", "post_encoder"}:
+            raise ValueError(
+                "recurrent.recurrent_placement must be pre_encoder or post_encoder"
+            )
         if not 0 < self.tbptt_steps <= self.sequence_length:
             raise ValueError(
                 "recurrent.tbptt_steps must lie in [1, sequence_length]"
@@ -611,6 +629,7 @@ class OptimizationConfig:
             "sequence_dense_window_jepa",
             "recurrent_window_jepa",
             "recurrent_dense_window_jepa",
+            "recurrent_future_jepa",
             "feature_consistency",
         }:
             raise ValueError(
@@ -635,6 +654,83 @@ class OptimizationConfig:
             raise ValueError("EMA momentum must increase within [0, 1]")
         if self.precision not in {"fp32", "fp16", "bf16"}:
             raise ValueError("precision must be fp32, fp16, or bf16")
+
+
+@dataclass(frozen=True)
+class FuturePredictionConfig:
+    """Collapse control and event-support settings for causal future JEPA."""
+
+    active_min_events: int = 1
+    activity_floor: float = 0.01
+    frame_sigreg_weight: float = 0.0
+    temporal_sigreg_weight: float = 0.0
+    allow_unregularized: bool = False
+    projector_hidden_dim: int = 512
+    projector_output_dim: int = 256
+    sigreg_num_slices: int = 1024
+    sigreg_t_max: float = 3.0
+    sigreg_num_points: int = 17
+    projection_seed: int = 0
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any]) -> FuturePredictionConfig:
+        _reject_unknown(
+            values,
+            {
+                "active_min_events",
+                "activity_floor",
+                "frame_sigreg_weight",
+                "temporal_sigreg_weight",
+                "allow_unregularized",
+                "projector_hidden_dim",
+                "projector_output_dim",
+                "sigreg_num_slices",
+                "sigreg_t_max",
+                "sigreg_num_points",
+                "projection_seed",
+            },
+            "future_prediction",
+        )
+        return cls(
+            active_min_events=int(values.get("active_min_events", 1)),
+            activity_floor=float(values.get("activity_floor", 0.01)),
+            frame_sigreg_weight=float(values.get("frame_sigreg_weight", 0.0)),
+            temporal_sigreg_weight=float(
+                values.get("temporal_sigreg_weight", 0.0)
+            ),
+            allow_unregularized=_boolean(
+                values.get("allow_unregularized", False),
+                "future_prediction.allow_unregularized",
+            ),
+            projector_hidden_dim=int(values.get("projector_hidden_dim", 512)),
+            projector_output_dim=int(values.get("projector_output_dim", 256)),
+            sigreg_num_slices=int(values.get("sigreg_num_slices", 1024)),
+            sigreg_t_max=float(values.get("sigreg_t_max", 3.0)),
+            sigreg_num_points=int(values.get("sigreg_num_points", 17)),
+            projection_seed=int(values.get("projection_seed", 0)),
+        )
+
+    def __post_init__(self) -> None:
+        if self.active_min_events <= 0:
+            raise ValueError("future_prediction.active_min_events must be positive")
+        if not 0 < self.activity_floor <= 1:
+            raise ValueError(
+                "future_prediction.activity_floor must lie inside (0, 1]"
+            )
+        if self.frame_sigreg_weight < 0 or self.temporal_sigreg_weight < 0:
+            raise ValueError("future_prediction SIGReg weights cannot be negative")
+        if min(self.projector_hidden_dim, self.projector_output_dim) <= 0:
+            raise ValueError("future_prediction projector dimensions must be positive")
+        if self.sigreg_num_slices <= 0:
+            raise ValueError("future_prediction.sigreg_num_slices must be positive")
+        if self.sigreg_t_max <= 0:
+            raise ValueError("future_prediction.sigreg_t_max must be positive")
+        if self.sigreg_num_points < 2:
+            raise ValueError(
+                "future_prediction.sigreg_num_points must be at least two"
+            )
+        if self.projection_seed < 0:
+            raise ValueError("future_prediction.projection_seed cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -680,6 +776,9 @@ class ExperimentConfig:
     recurrent: RecurrentConfig = field(default_factory=RecurrentConfig)
     mask: MaskConfig = field(default_factory=MaskConfig)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
+    future_prediction: FuturePredictionConfig = field(
+        default_factory=FuturePredictionConfig
+    )
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     def __post_init__(self) -> None:
@@ -696,6 +795,7 @@ class ExperimentConfig:
             "sequence_dense_window_jepa",
             "recurrent_window_jepa",
             "recurrent_dense_window_jepa",
+            "recurrent_future_jepa",
         }:
             if self.optimization.covariance_weight:
                 raise ValueError("covariance_weight is only used by feature_consistency")
@@ -743,6 +843,7 @@ class ExperimentConfig:
         recurrent_objectives = {
             "recurrent_window_jepa",
             "recurrent_dense_window_jepa",
+            "recurrent_future_jepa",
         }
         paired_objectives = {
             "window_jepa",
@@ -750,6 +851,7 @@ class ExperimentConfig:
             "feature_consistency",
         }
         objective = self.optimization.objective
+        is_future_objective = objective == "recurrent_future_jepa"
         is_sequence_objective = objective in sequence_objectives
         is_recurrent_objective = self.optimization.objective in recurrent_objectives
         if objective in paired_objectives and self.recurrent.sequence_loader:
@@ -773,6 +875,58 @@ class ExperimentConfig:
         if self.recurrent.enabled:
             if self.model.architecture != "vjepa2_1":
                 raise ValueError("R0 recurrent pretraining requires model.architecture=vjepa2_1")
+        if is_future_objective:
+            if self.recurrent.prediction_horizon_steps < 1:
+                raise ValueError(
+                    "recurrent_future_jepa requires prediction_horizon_steps >= 1"
+                )
+            if self.recurrent.recurrent_placement != "post_encoder":
+                raise ValueError(
+                    "recurrent_future_jepa requires recurrent_placement=post_encoder"
+                )
+            if not self.recurrent.return_patch_event_activity:
+                raise ValueError(
+                    "recurrent_future_jepa requires return_patch_event_activity=true"
+                )
+            if self.recurrent.burn_in_steps < 1:
+                raise ValueError(
+                    "recurrent_future_jepa requires at least one burn-in step"
+                )
+            if self.model.deep_supervision_layers != (
+                self.model.encoder_depth - 1,
+            ):
+                raise ValueError(
+                    "recurrent_future_jepa supervises only the final frame latent; "
+                    "model.deep_supervision_layers must contain only the final block"
+                )
+            if not (
+                self.future_prediction.frame_sigreg_weight
+                or self.future_prediction.temporal_sigreg_weight
+                or self.future_prediction.allow_unregularized
+            ):
+                raise ValueError(
+                    "recurrent_future_jepa requires SIGReg unless "
+                    "future_prediction.allow_unregularized=true is set for an ablation"
+                )
+        else:
+            if (
+                self.future_prediction.frame_sigreg_weight
+                or self.future_prediction.temporal_sigreg_weight
+            ):
+                raise ValueError(
+                    "future SIGReg weights are only used by recurrent_future_jepa"
+                )
+            if self.recurrent.prediction_horizon_steps:
+                raise ValueError(
+                    "prediction_horizon_steps is only used by recurrent_future_jepa"
+                )
+            if (
+                self.recurrent.enabled
+                and self.recurrent.recurrent_placement != "pre_encoder"
+            ):
+                raise ValueError(
+                    "legacy recurrent objectives require recurrent_placement=pre_encoder"
+                )
         if self.recurrent.sequence_loader:
             expected_windows = (self.recurrent.window_ms,)
             if (
@@ -840,6 +994,7 @@ class ExperimentConfig:
                 "recurrent",
                 "mask",
                 "optimization",
+                "future_prediction",
                 "runtime",
             },
             "configuration root",
@@ -852,6 +1007,9 @@ class ExperimentConfig:
             recurrent=RecurrentConfig.from_mapping(values.get("recurrent", {})),
             mask=MaskConfig.from_mapping(values.get("mask", {})),
             optimization=OptimizationConfig.from_mapping(values.get("optimization", {})),
+            future_prediction=FuturePredictionConfig.from_mapping(
+                values.get("future_prediction", {})
+            ),
             runtime=RuntimeConfig.from_mapping(values.get("runtime", {})),
         )
 

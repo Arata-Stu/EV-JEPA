@@ -8,7 +8,10 @@ from event_window_jepa.models.scale_embedding import LogFourierScaleEmbedding
 from event_window_jepa.models.vjepa21_event_vit import VJEPA21EventVisionTransformer
 from event_window_jepa.models.window_jepa import WindowJEPA
 from event_window_jepa.models.window_predictor import WindowPredictor
-from event_window_jepa.train.pretrain import _feedforward_sequence_backward
+from event_window_jepa.train.pretrain import (
+    OUTPUT_METRIC_NAMES,
+    _feedforward_sequence_backward,
+)
 
 
 def _model() -> WindowJEPA:
@@ -226,6 +229,6 @@ def test_feedforward_sequence_training_ignores_detach_state_metadata() -> None:
         device=torch.device("cpu"),
         world_size=1,
     )
-    assert metrics.shape == (8,)
+    assert metrics.shape == (len(OUTPUT_METRIC_NAMES),)
     assert any(parameter.grad is not None for parameter in model.online_encoder.parameters())
     assert all(parameter.grad is None for parameter in model.target_encoder.parameters())

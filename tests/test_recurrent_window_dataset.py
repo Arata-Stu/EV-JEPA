@@ -79,6 +79,7 @@ def make_dataset(
     samples_per_epoch: int = 2,
     tbptt_steps: int | None = 2,
     stride_ms: float = 10,
+    lookahead_steps: int = 0,
     return_patch_event_activity: bool = False,
 ) -> tuple[RecurrentWindowDataset, RecordingStore, RecordingTransform]:
     store = RecordingStore()
@@ -88,6 +89,7 @@ def make_dataset(
         stride_ms=stride_ms,
         sequence_length=4,
         burn_in_steps=2,
+        lookahead_steps=lookahead_steps,
         samples_per_epoch=samples_per_epoch,
         seed=11,
         sampling_strategy="sequence_balanced",
@@ -147,6 +149,9 @@ def test_dataset_returns_temporal_tensors_masks_and_shared_geometry() -> None:
     assert sample["loss_mask"].tolist() == [False, False, True, True, True, True]
     assert sample["detach_mask"].tolist() == [False, False, True, False, True, False]
     assert "patch_event_activity" not in sample
+    assert "x_future" not in sample
+    assert "future_dt_ms" not in sample
+    assert "future_t_end_us" not in sample
 
     assert transform.sample_calls == 1
     assert len(transform.applied) == 6
@@ -165,6 +170,35 @@ def test_dataset_returns_temporal_tensors_masks_and_shared_geometry() -> None:
     assert {sequence_id for sequence_id, _, _ in store.calls} == {"sequence"}
     assert store.calls[0][1] == debug.clip.t_end_us[-1]
     assert store.calls[0][2] == 100_000
+
+
+def test_lookahead_returns_future_views_aligned_to_every_online_step() -> None:
+    dataset, _, _ = make_dataset(
+        samples_per_epoch=1,
+        lookahead_steps=1,
+        return_patch_event_activity=True,
+    )
+    sample, debug = dataset.sample_with_debug(0)
+
+    assert dataset.online_steps == 6
+    assert dataset.total_steps == 7
+    assert dataset.lookahead_steps == 1
+    assert sample["x"].shape == sample["x_future"].shape == (6, 2, 4, 4)
+    assert sample["dt_ms"].shape == sample["future_dt_ms"].shape == (6,)
+    assert sample["t_end_us"].shape == sample["future_t_end_us"].shape == (6,)
+    assert torch.equal(sample["x"][1:], sample["x_future"][:-1])
+    assert torch.equal(
+        sample["future_t_end_us"], sample["t_end_us"] + 10_000
+    )
+    assert sample["loss_mask"].tolist() == [False, False, True, True, True, True]
+    assert sample["detach_mask"].tolist() == [False, False, True, False, True, False]
+    assert len(debug.windows) == 7
+    assert debug.windows[-1].t_end_us == int(sample["future_t_end_us"][-1])
+
+    activity = sample["patch_event_activity"]
+    future_activity = sample["future_patch_event_activity"]
+    assert activity.shape == future_activity.shape == (6, 4)
+    assert torch.equal(activity[1:], future_activity[:-1])
 
 
 def test_optional_patch_event_activity_matches_transformed_raw_windows() -> None:

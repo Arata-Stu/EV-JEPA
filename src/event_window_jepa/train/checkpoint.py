@@ -43,6 +43,26 @@ def config_hash(config: ExperimentConfig) -> str:
                 recurrent.pop("temporal_model", None)
         if recurrent.get("return_patch_event_activity") is False:
             recurrent.pop("return_patch_event_activity", None)
+        if recurrent.get("prediction_horizon_steps") == 0:
+            recurrent.pop("prediction_horizon_steps", None)
+        if recurrent.get("recurrent_placement") == "pre_encoder":
+            recurrent.pop("recurrent_placement", None)
+    # Future-prediction controls were added after schema v2. Their inert
+    # defaults must not change the identity of older checkpoints.
+    if resolved.get("future_prediction") == {
+        "active_min_events": 1,
+        "activity_floor": 0.01,
+        "frame_sigreg_weight": 0.0,
+        "temporal_sigreg_weight": 0.0,
+        "allow_unregularized": False,
+        "projector_hidden_dim": 512,
+        "projector_output_dim": 256,
+        "sigreg_num_slices": 1024,
+        "sigreg_t_max": 3.0,
+        "sigreg_num_points": 17,
+        "projection_seed": 0,
+    }:
+        resolved.pop("future_prediction", None)
     # Keep schema-v2 checkpoints created before the optional V-JEPA 2.1
     # architecture fields loadable. Their implicit architecture is v1.
     model = resolved["model"]
@@ -118,6 +138,10 @@ def save_checkpoint_atomic(
     rank_rng_states = rng_states or [_rng_state()]
     if len(rank_rng_states) != world_size:
         raise ValueError("checkpoint must contain exactly one RNG state per rank")
+    auxiliary_state = {}
+    auxiliary_state_fn = getattr(model, "auxiliary_state_dict", None)
+    if callable(auxiliary_state_fn):
+        auxiliary_state = auxiliary_state_fn()
     checkpoint = {
         "schema_version": SCHEMA_VERSION,
         "resolved_config": config.to_dict(),
@@ -127,6 +151,7 @@ def save_checkpoint_atomic(
         "predictor": model.predictor.state_dict(),
         "scale_embedding": model.scale_embedding.state_dict(),
         "target_scale_embedding": model.target_scale_embedding.state_dict(),
+        "auxiliary_modules": auxiliary_state,
         "optimizer": optimizer.state_dict(),
         "grad_scaler": (
             grad_scaler.state_dict() if grad_scaler is not None else None
@@ -181,6 +206,9 @@ def load_training_checkpoint(
     model.target_scale_embedding.load_state_dict(
         checkpoint["target_scale_embedding"], strict=True
     )
+    auxiliary_load_fn = getattr(model, "load_auxiliary_state_dict", None)
+    if callable(auxiliary_load_fn):
+        auxiliary_load_fn(checkpoint.get("auxiliary_modules", {}), strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
     grad_scaler_state = checkpoint.get("grad_scaler")
     if config.optimization.precision == "fp16":
@@ -224,6 +252,9 @@ def load_pretrained_model(
     model.scale_embedding.load_state_dict(checkpoint["scale_embedding"], strict=True)
     model.target_scale_embedding.load_state_dict(
         checkpoint["target_scale_embedding"], strict=True
+    )
+    model.load_auxiliary_state_dict(
+        checkpoint.get("auxiliary_modules", {}), strict=True
     )
     model.to(torch.device(device))
     model.eval()

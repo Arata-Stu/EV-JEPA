@@ -30,6 +30,8 @@
 - V-JEPA 2.1型のflat global ViT（2-D RoPE、SDPA、中間層監督）
 - 50 ms連続clip用のsequence samplerとclip共有geometry
 - patch-grid ConvLSTM / ConvGRU、burn-in、BPTT＋TBPTT学習
+- full-frame ViT特徴上のConvLSTMと、1 step先のstateless EMA latent予測
+- event-support balanced latent lossとFrame／Temporal SIGReg
 - `log(Δ)` Fourier embedding
 - `Δc`、`Δt`、`log(Δt/Δc)`で条件付けたcross-attention predictor
 - disjoint multiblock spatial mask
@@ -139,6 +141,7 @@ FP16、native BF16対応GPUでBF16へ解決し、FP32経路も明示指定で残
 | `false` | `feedforward` | `window_jepa` / `dense_window_jepa` | 従来の独立window baseline |
 | `true` | `feedforward` | `sequence_window_jepa` / `sequence_dense_window_jepa` | 同じ時系列sampleを状態なしencoderで処理する比較 |
 | `true` | `conv_gru` / `conv_lstm` | `recurrent_window_jepa` / `recurrent_dense_window_jepa` | BPTT/TBPTTを使うrecurrent比較 |
+| `true` | `conv_lstm` | `recurrent_future_jepa` | full-frame特徴から未来のEMA特徴を予測するcollapse対策付き方式 |
 
 時系列samplingは`recurrent.sampling`で独立に切り替えます。
 
@@ -159,8 +162,9 @@ BPTT/TBPTT比較ではなくsampling対照です。
 切り分ける実験protocolは
 [Gen1 Sequence / SIGReg R0 実験計画](docs/SEQUENCE_SIGREG_EXPERIMENT_PLAN.md)にまとめています。
 実行入口は[scripts/experiments/run_sequence_sigreg_plan.sh](scripts/experiments/run_sequence_sigreg_plan.sh)
-です。Stage 1と2の事前学習経路は実装済みですが、Stage 3のSIGReg lossは未実装のため、
-runnerも現時点ではStage 3の実行を明示的に拒否します。
+です。この旧protocolのStage 1と2は実装済みで、Stage 3 runnerは引き続き未接続です。
+一方、因果的な未来予測用のFrame／Temporal SIGRegは独立した
+`recurrent_future_jepa` objectiveとして実装済みです。
 
 現在の基準serverは`/home/iASL/Arata_repo/EV-JEPA`、Gen1 datasetは
 `/home/iASL/Arata_repo/dataset/gen1_304x240`です。V100 32 GB × 3での実測に基づく既定値は
@@ -249,12 +253,51 @@ stepだけを選び、`[B*T_loss,C,H,W]`へまとめて通常のencoderへ入力
 一括蓄積し、`temporal_bins: 5`なら10 ms相当の5 bin×2 polarityを`[10,H,W]`のchannel
 として空間処理します。後者もConvLSTMの5 step処理ではなく、1枚の50 ms入力です。
 
-将来のEvent-Support TC-SIGRegで活動領域を使う場合だけ
+Event-Support SIGRegで活動領域を使う場合だけ
 `return_patch_event_activity: true`にします。このときdatasetは、空間augmentation後の
 各patchに入ったraw event数を`patch_event_activity: [B,T,P]`（整数）として追加します。
 `false`ではkey自体を返さないため、通常のEMA-JEPA比較に余計なtensorは増えません。
-なお、この切り替えで追加されるのはloader/model比較経路までであり、SIGReg lossそのものは
-まだ有効化されません。
+従来のsequence/recurrent objectiveではこのtensorをlossに使いません。
+
+### Causal Future JEPA（推奨するcollapse対策付き方式）
+
+新方式は、各50 msイベント窓をfull-frame ViTで符号化した後、そのtoken gridを
+ConvLSTMへ入力します。オンライン側の因果stateから1 step（50 ms）先を予測し、教師側は
+同じEMA重みのframe encoderだけを使います。教師のConvLSTMは完全に迂回され、時間stateを
+持ちません。
+
+```text
+E_t ─ full-frame ViT ─ f_t ─ ConvLSTM(h_{t-1}) ─ h_t ─ Predictor ─ ẑ_{t+1}
+
+E_{t+1} ─ full-frame EMA ViT（recurrent cellを迂回）──────────── z_{t+1}
+```
+
+このobjectiveではrandom spatial maskをViT、ConvLSTM、EMA teacherのいずれにも渡しません。
+Predictorにもall-true maskを渡します。したがってmaskがGRU/LSTM stateへ混入することはなく、
+設定上生成されるmaskは旧条件と比較できる診断値にだけ使われます。event activityも教師入力を
+sparse化せず、full teacher latentを計算した後でactive/inactive patch lossをsampleごとに
+均等化するために使います。
+
+collapse対策は、オンラインframe latent、active/inactive空間contrast、因果差分
+`h_t - h_{t-1}`をそれぞれ独立projectorへ通すsliced Epps–Pulley SIGRegです。frame項は
+global poolingだけで空間的に同一tokenへ崩れる解を、support contrast項で明示的に抑えます。SIGRegは
+FP32で計算し、DDPでは全rankの同時刻sampleだけをautograd対応collectiveで集約します。
+時間軸をbatch軸へflattenしません。
+
+標準設定は
+[recurrent_future_convlstm_vits_gen1.yaml](configs/pretrain/recurrent_future_convlstm_vits_gen1.yaml)、
+詳細仕様は
+[Causal Future Event JEPA](docs/CAUSAL_FUTURE_EVENT_JEPA.md)です。
+
+```bash
+torchrun --standalone --nproc-per-node=3 \
+  -m event_window_jepa.train.pretrain \
+  --config configs/pretrain/recurrent_future_convlstm_vits_gen1.yaml
+```
+
+各sampleは内部で`2 burn-in + 8 context + 1 lookahead`の11窓を読みます。ただしonline stateへ
+入るのは先頭10窓だけです。stream chunkは10窓ずつ進むため、前chunkのlookahead窓が次chunkの
+先頭contextとして一度だけonline側へ入り、時刻を飛ばしません。
 
 旧設定の`enabled: true`と`cell: conv_lstm|conv_gru`も引き続き利用でき、自動的に
 `sequence_loader: true`と対応する`temporal_model`へ解決されます。新旧の指定が矛盾する
@@ -278,6 +321,8 @@ window-jepa-pretrain \
 ```
 
 この設定ではper-rank batch 16を、RVTと同じ比率でstream 8＋random 8へ分けます。
+V100 3台では合計24本のstream laneになるため、manifestに少なくとも24個の異なる
+`source_recording_id`が必要です。不足時は開始前にerrorとなります。
 各itemは次の10窓です。
 
 ```text

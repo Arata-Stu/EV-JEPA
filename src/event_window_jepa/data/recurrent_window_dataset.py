@@ -61,9 +61,12 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
 
     ``sequence_length`` on the sampler is the number of loss-bearing steps.
     The leading ``burn_in_steps`` initialize recurrent state without a loss,
-    giving ``T = burn_in_steps + sequence_length``. ``loss_mask[t]`` selects
-    supervised steps. ``detach_mask[t]`` requests a state detach immediately
-    *before* timestep ``t`` and marks the burn-in/TBPTT boundaries.
+    giving ``T = burn_in_steps + sequence_length`` online steps.
+    ``lookahead_steps`` additional windows are read only to build aligned future
+    targets. They are exposed through ``x_future`` and related metadata without
+    entering ``x`` or the recurrent control masks. ``loss_mask[t]`` selects
+    supervised online steps. ``detach_mask[t]`` requests a state detach
+    immediately *before* timestep ``t`` and marks the burn-in/TBPTT boundaries.
 
     When ``return_patch_event_activity`` is enabled, each sample additionally
     contains ``patch_event_activity`` with shape ``[T, P]`` and dtype int64.
@@ -114,7 +117,19 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
 
     @property
     def total_steps(self) -> int:
+        """Number of sampled windows, including target-only lookahead."""
+
         return self.clip_sampler.total_steps
+
+    @property
+    def online_steps(self) -> int:
+        """Number of windows consumed by the online recurrent encoder."""
+
+        return self.clip_sampler.online_steps
+
+    @property
+    def lookahead_steps(self) -> int:
+        return self.clip_sampler.lookahead_steps
 
     def set_epoch(self, epoch: int) -> None:
         if epoch < 0:
@@ -123,20 +138,20 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
 
     def _training_masks(self) -> tuple[torch.Tensor, torch.Tensor]:
         burn_in = self.clip_sampler.burn_in_steps
-        total_steps = self.clip_sampler.total_steps
-        loss_mask = torch.zeros(total_steps, dtype=torch.bool)
+        online_steps = self.clip_sampler.online_steps
+        loss_mask = torch.zeros(online_steps, dtype=torch.bool)
         loss_mask[burn_in:] = True
 
         # True means: detach recurrent state immediately before this timestep.
         # The burn-in boundary is detached so initialization does not become an
         # unbounded gradient path. Further boundaries implement TBPTT, while
         # gradients remain full-BPTT inside every chunk.
-        detach_mask = torch.zeros(total_steps, dtype=torch.bool)
+        detach_mask = torch.zeros(online_steps, dtype=torch.bool)
         detach_mask[burn_in] = True
         if self.tbptt_steps is not None:
             for step in range(
                 burn_in + self.tbptt_steps,
-                total_steps,
+                online_steps,
                 self.tbptt_steps,
             ):
                 detach_mask[step] = True
@@ -266,17 +281,22 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
         first_shape = representations[0].shape
         if any(value.shape != first_shape for value in representations[1:]):
             raise ValueError("all clip representations must share shape [C, H, W]")
-        x = torch.from_numpy(np.stack(representations, axis=0))
+        all_x = torch.from_numpy(np.stack(representations, axis=0))
+        online_steps = self.online_steps
+        online_slice = slice(0, online_steps)
+        online_masks = masks[online_slice]
+        online_target_active_ratios = target_active_ratios[online_slice]
+        online_target_mass_coverages = target_mass_coverages[online_slice]
         loss_mask, detach_mask = self._training_masks()
 
         sample = {
-            "x": x,
+            "x": all_x[online_slice],
             "dt_ms": torch.full(
-                (self.total_steps,),
+                (online_steps,),
                 self.clip_sampler.base_window_ms,
                 dtype=torch.float32,
             ),
-            "t_end_us": torch.from_numpy(timestamps),
+            "t_end_us": torch.from_numpy(timestamps[online_slice]),
             "sequence_id": clip.sequence_id,
             "sampling_mode": request.sampling_mode,
             "stream_id": request.stream_id,
@@ -284,46 +304,65 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
             "augmentation_seed": request.augmentation_seed,
             "augmentation_id": request.augmentation_id,
             "mask_seed": request.mask_seed,
-            "mask_step_seeds": torch.tensor(mask_step_seeds, dtype=torch.int64),
+            "mask_step_seeds": torch.tensor(
+                mask_step_seeds[online_slice], dtype=torch.int64
+            ),
             "context_mask": torch.from_numpy(
-                np.stack([mask.context_keep for mask in masks], axis=0)
+                np.stack([mask.context_keep for mask in online_masks], axis=0)
             ),
             "target_mask": torch.from_numpy(
-                np.stack([mask.target for mask in masks], axis=0)
+                np.stack([mask.target for mask in online_masks], axis=0)
             ),
             "loss_mask": loss_mask,
             "detach_mask": detach_mask,
             "mask_activity_aware": torch.tensor(
-                [float(mask.activity_aware) for mask in masks],
+                [float(mask.activity_aware) for mask in online_masks],
                 dtype=torch.float32,
             ),
             "mask_activity_fallback": torch.tensor(
-                [float(mask.activity_fallback) for mask in masks],
+                [float(mask.activity_fallback) for mask in online_masks],
                 dtype=torch.float32,
             ),
             "mask_context_active_patch_ratio": torch.tensor(
-                [mask.selection_active_patch_ratio for mask in masks],
+                [mask.selection_active_patch_ratio for mask in online_masks],
                 dtype=torch.float32,
             ),
             "mask_context_event_mass_coverage": torch.tensor(
-                [mask.selection_event_mass_coverage for mask in masks],
+                [mask.selection_event_mass_coverage for mask in online_masks],
                 dtype=torch.float32,
             ),
             "mask_target_active_patch_ratio": torch.tensor(
-                target_active_ratios, dtype=torch.float32
+                online_target_active_ratios, dtype=torch.float32
             ),
             "mask_target_event_mass_coverage": torch.tensor(
-                target_mass_coverages, dtype=torch.float32
+                online_target_mass_coverages, dtype=torch.float32
             ),
             "mask_empty_target": torch.tensor(
-                [float(value == 0.0) for value in target_active_ratios],
+                [float(value == 0.0) for value in online_target_active_ratios],
                 dtype=torch.float32,
             ),
         }
         if self.return_patch_event_activity:
-            sample["patch_event_activity"] = torch.from_numpy(
+            all_patch_event_activity = torch.from_numpy(
                 np.stack(patch_event_activities, axis=0)
             )
+            sample["patch_event_activity"] = all_patch_event_activity[online_slice]
+        if self.lookahead_steps:
+            future_slice = slice(
+                self.lookahead_steps,
+                self.lookahead_steps + online_steps,
+            )
+            sample["x_future"] = all_x[future_slice]
+            sample["future_dt_ms"] = torch.full(
+                (online_steps,),
+                self.clip_sampler.base_window_ms,
+                dtype=torch.float32,
+            )
+            sample["future_t_end_us"] = torch.from_numpy(timestamps[future_slice])
+            if self.return_patch_event_activity:
+                sample["future_patch_event_activity"] = all_patch_event_activity[
+                    future_slice
+                ]
         debug = RecurrentWindowDebugSample(
             request=request,
             clip=clip,

@@ -193,9 +193,10 @@ def recurrent_clip_checks(
     target_mask = sample["target_mask"].detach().cpu().numpy()
     loss_mask = sample["loss_mask"].detach().cpu().tolist()
     detach_mask = sample["detach_mask"].detach().cpu().tolist()
-    total_steps = config.recurrent.burn_in_steps + config.recurrent.sequence_length
-    expected_loss, expected_detach = _expected_control_masks(config, total_steps)
-    sampling_metadata = _sampling_metadata_by_step(sample, total_steps)
+    online_steps = config.recurrent.burn_in_steps + config.recurrent.sequence_length
+    sampled_steps = online_steps + config.recurrent.prediction_horizon_steps
+    expected_loss, expected_detach = _expected_control_masks(config, online_steps)
+    sampling_metadata = _sampling_metadata_by_step(sample, online_steps)
 
     sequence_ids = (
         set(debug.sequence_ids)
@@ -206,10 +207,11 @@ def recurrent_clip_checks(
         [window.t_end_us for window in debug.windows], dtype=np.int64
     )
     strictly_increasing = bool(
-        timestamps.size == total_steps
+        timestamps.size == online_steps
         and (timestamps.size == 1 or np.all(timestamps[1:] > timestamps[:-1]))
-        and np.array_equal(timestamps, debug_timestamps)
-        and tuple(int(value) for value in timestamps) == debug.clip.t_end_us
+        and np.array_equal(timestamps, debug_timestamps[:online_steps])
+        and tuple(int(value) for value in timestamps)
+        == debug.clip.t_end_us[:online_steps]
     )
 
     fifty_ms_us = 50_000
@@ -232,7 +234,7 @@ def recurrent_clip_checks(
     )
 
     transforms_shared = bool(
-        len(debug.spatial_transforms) == total_steps
+        len(debug.spatial_transforms) == sampled_steps
         and all(
             params == debug.spatial_transform for params in debug.spatial_transforms
         )
@@ -251,7 +253,7 @@ def recurrent_clip_checks(
     masks_valid = bool(
         context_mask.shape
         == target_mask.shape
-        == (total_steps, num_patches)
+        == (online_steps, num_patches)
         and not np.any(context_mask & target_mask)
     )
     checks = [
@@ -259,13 +261,13 @@ def recurrent_clip_checks(
             "時系列テンソル形状",
             tuple(x.shape)
             == (
-                total_steps,
+                online_steps,
                 config.representation.channels,
                 *config.model.image_size,
             )
-            and len(debug.windows) == total_steps
-            and len(debug.masks) == total_steps,
-            f"x={tuple(x.shape)}, T={total_steps}",
+            and len(debug.windows) == sampled_steps
+            and len(debug.masks) == sampled_steps,
+            f"x={tuple(x.shape)}, online_T={online_steps}, sampled_T={sampled_steps}",
         ),
         Check(
             "有限・非負表現",
@@ -274,7 +276,7 @@ def recurrent_clip_checks(
         ),
         Check(
             "sequence ID単一",
-            len(sequence_ids) == 1 and len(debug.sequence_ids) == total_steps,
+            len(sequence_ids) == 1 and len(debug.sequence_ids) == sampled_steps,
             f"ids={sorted(sequence_ids)}",
         ),
         Check(
@@ -290,7 +292,7 @@ def recurrent_clip_checks(
         Check(
             "dtとEventWindowの一致",
             bool(
-                durations.shape == (total_steps,)
+                durations.shape == (online_steps,)
                 and np.allclose(durations, 50.0, rtol=0.0, atol=1e-6)
             ),
             f"dt_ms={durations.tolist()}",
@@ -311,6 +313,23 @@ def recurrent_clip_checks(
             f"loss={loss_mask}, detach={detach_mask}",
         ),
     ]
+    if config.recurrent.prediction_horizon_steps:
+        horizon = config.recurrent.prediction_horizon_steps
+        future_timestamps = (
+            sample["future_t_end_us"].detach().cpu().numpy().astype(np.int64)
+        )
+        future = sample["x_future"]
+        checks.append(
+            Check(
+                "future target alignment",
+                tuple(future.shape) == tuple(x.shape)
+                and np.array_equal(
+                    future_timestamps,
+                    debug_timestamps[horizon : horizon + online_steps],
+                ),
+                f"horizon={horizon}, future_t_end_us={future_timestamps.tolist()}",
+            )
+        )
     sampling_check = _sampling_metadata_check(sampling_metadata)
     if sampling_check is not None:
         checks.append(sampling_check)
@@ -457,8 +476,8 @@ def inspect_mixed_recurrent_batches(
     )
     masks_independent = all(
         first["mask_seed"] != second["mask_seed"]
-        and len(set(first["mask_step_seeds"])) == dataset.total_steps
-        and len(set(second["mask_step_seeds"])) == dataset.total_steps
+        and len(set(first["mask_step_seeds"])) == dataset.online_steps
+        and len(set(second["mask_step_seeds"])) == dataset.online_steps
         for first, second in stream_metadata_pairs
     )
 
@@ -474,7 +493,7 @@ def inspect_mixed_recurrent_batches(
                 "stream_id": request.stream_id,
                 "state_reset": request.state_reset,
                 "sequence_id": request.clip.sequence_id,
-                "t_end_us": request.clip.t_end_us,
+                "t_end_us": request.clip.t_end_us[: dataset.online_steps],
                 "augmentation_seed": request.augmentation_seed,
                 "augmentation_id": request.augmentation_id,
                 "mask_seed": request.mask_seed,
@@ -484,7 +503,8 @@ def inspect_mixed_recurrent_batches(
                 actual != expected
                 or debug.request != request
                 or debug.clip != request.clip
-                or tuple(debug.mask_step_seeds) != metadata["mask_step_seeds"]
+                or tuple(debug.mask_step_seeds[: dataset.online_steps])
+                != metadata["mask_step_seeds"]
             ):
                 request_mismatches.append(f"batch={batch_index}, item={item_index}")
 
@@ -723,11 +743,13 @@ def write_recurrent_inspection_report(
     assets = output.parent / f"{output.stem}_assets"
     assets.mkdir(parents=True, exist_ok=True)
 
-    event_counts = [_event_counts(window) for window in debug.windows]
+    display_windows = debug.windows[: dataset.online_steps]
+    display_masks = debug.masks[: dataset.online_steps]
+    event_counts = [_event_counts(window) for window in display_windows]
     event_scale = _display_scale([np.log1p(value) for value in event_counts])
     representation_bins = [
         _representation_bins(sample["x"][index], config.representation.temporal_bins)
-        for index in range(len(debug.windows))
+        for index in range(dataset.online_steps)
     ]
     representation_scale = _display_scale(
         [array for bins in representation_bins for pair in bins for array in pair]
@@ -746,7 +768,7 @@ def write_recurrent_inspection_report(
         config.model.image_size[0] // config.model.patch_size,
         config.model.image_size[1] // config.model.patch_size,
     )
-    sampling_metadata = _sampling_metadata_by_step(sample, len(debug.windows))
+    sampling_metadata = _sampling_metadata_by_step(sample, dataset.online_steps)
     sampling_summary = {
         key: values[0] if all(value == values[0] for value in values) else values
         for key, values in sampling_metadata.items()
@@ -760,8 +782,8 @@ def write_recurrent_inspection_report(
     sections: list[str] = []
     for index, (window, mask, counts, bins, aggregate) in enumerate(
         zip(
-            debug.windows,
-            debug.masks,
+            display_windows,
+            display_masks,
             event_counts,
             representation_bins,
             aggregate_pairs,
@@ -930,7 +952,8 @@ th,td {{ border-bottom:1px solid #2b3240; padding:8px; text-align:left;
   <h1>Recurrent EV-JEPA clip検査 — {'合格' if passed else '要確認'}</h1>
   <div class="metadata">
     <code>{html.escape(str(sample['sequence_id']))}</code>
-    <span>{selection_label}={sample_index}, epoch={epoch}, T={len(debug.windows)}</span>
+    <span>{selection_label}={sample_index}, epoch={epoch},
+      online T={dataset.online_steps}, sampled T={len(debug.windows)}</span>
     <b>selected mode={html.escape(selected_mode)}</b>
     <span>crop x={params.x0}, y={params.y0}, {params.output_width}×{params.output_height}</span>
     <span>flip={str(params.horizontal_flip).lower()}</span>

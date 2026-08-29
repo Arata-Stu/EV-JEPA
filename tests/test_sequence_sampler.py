@@ -44,6 +44,28 @@ def test_sampler_builds_strict_fixed_stride_clips_inside_one_sequence() -> None:
         assert clip == sampler.sample(index, epoch=3)
 
 
+def test_sampler_appends_target_only_lookahead_windows() -> None:
+    sequence = SequenceInfo("long", None, 4, 4, 0, 200_000, "train", "events")
+    sampler = UniformSequenceClipSampler(
+        (sequence,),
+        base_window_ms=50,
+        stride_ms=10,
+        sequence_length=3,
+        burn_in_steps=2,
+        lookahead_steps=2,
+        samples_per_epoch=1,
+        seed=9,
+        sampling_strategy="sequence_balanced",
+    )
+
+    assert sampler.online_steps == 5
+    assert sampler.total_steps == 7
+    assert sampler.required_duration_us == 110_000
+    clip = sampler.sample(0, epoch=0)
+    assert len(clip.t_end_us) == 7
+    assert np.diff(clip.t_end_us).tolist() == [10_000] * 6
+
+
 def test_sampler_rejects_invalid_or_impossible_clip_geometry() -> None:
     sequence = SequenceInfo("s", None, 4, 4, 0, 80_000)
     with pytest.raises(ValueError, match="no sequence is long enough"):
@@ -157,6 +179,36 @@ def test_mixed_sampler_preserves_stream_lanes_and_global_epoch_accounting() -> N
     assert sampler.effective_samples_per_epoch == 64
     assert sampler.global_batch_size == 8
     assert len(sampler) == 8
+
+
+def test_stream_chunks_overlap_only_the_target_lookahead() -> None:
+    sampler = MixedRecurrentBatchSampler(
+        _mixed_sequences(count=4),
+        base_window_ms=50,
+        stride_ms=50,
+        sequence_length=1,
+        burn_in_steps=1,
+        lookahead_steps=1,
+        samples_per_epoch=4,
+        batch_size=2,
+        stream_ratio=(1, 0),
+        seed=19,
+    )
+
+    batches = list(sampler)
+    assert sampler.online_steps == 2
+    assert sampler.total_steps == 3
+    assert len(batches) == 2
+    for lane in range(2):
+        first = batches[0][lane]
+        second = batches[1][lane]
+        assert first.clip.sequence_id == second.clip.sequence_id
+        assert second.state_reset is False
+        assert len(first.clip.t_end_us) == len(second.clip.t_end_us) == 3
+        assert second.clip.t_end_us[0] == first.clip.t_end_us[-1]
+        assert second.clip.t_end_us[0] == (
+            first.clip.t_end_us[sampler.online_steps - 1] + sampler.stride_us
+        )
 
 
 def test_mixed_sampler_epoch_shuffle_is_deterministic_and_shards_stay_fixed() -> None:

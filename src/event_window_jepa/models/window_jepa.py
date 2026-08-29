@@ -3,10 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import torch
+import torch.distributed as distributed
 import torch.nn.functional as functional
 from torch import nn
 
-from event_window_jepa.losses.latent_prediction import latent_prediction_loss
+from event_window_jepa.losses.latent_prediction import (
+    balanced_event_support_latent_prediction_loss,
+    latent_prediction_loss,
+)
+from event_window_jepa.losses.sigreg import ProjectedSIGReg
 from event_window_jepa.losses.variance_regularization import (
     covariance_regularization,
     feature_standard_deviation,
@@ -41,6 +46,28 @@ class WindowJEPAOutput:
     online_state: RecurrentState | None = None
     prediction_sequence: torch.Tensor | None = None
     target_sequence: torch.Tensor | None = None
+    future_prediction_loss: torch.Tensor | None = None
+    active_prediction_loss: torch.Tensor | None = None
+    inactive_prediction_loss: torch.Tensor | None = None
+    frame_sigreg_loss: torch.Tensor | None = None
+    support_sigreg_loss: torch.Tensor | None = None
+    temporal_sigreg_loss: torch.Tensor | None = None
+    sigreg_loss: torch.Tensor | None = None
+    active_patch_fraction: torch.Tensor | None = None
+    context_active_patch_fraction: torch.Tensor | None = None
+    frame_sigreg_samples: torch.Tensor | None = None
+    support_sigreg_samples: torch.Tensor | None = None
+    temporal_sigreg_samples: torch.Tensor | None = None
+    frame_sigreg_real_error: torch.Tensor | None = None
+    frame_sigreg_imaginary_error: torch.Tensor | None = None
+    support_sigreg_real_error: torch.Tensor | None = None
+    support_sigreg_imaginary_error: torch.Tensor | None = None
+    temporal_sigreg_real_error: torch.Tensor | None = None
+    temporal_sigreg_imaginary_error: torch.Tensor | None = None
+    active_prediction_sum: torch.Tensor | None = None
+    active_prediction_count: torch.Tensor | None = None
+    inactive_prediction_sum: torch.Tensor | None = None
+    inactive_prediction_count: torch.Tensor | None = None
 
 
 class WindowJEPA(nn.Module):
@@ -58,6 +85,16 @@ class WindowJEPA(nn.Module):
         variance_weight: float = 0.0,
         covariance_weight: float = 0.0,
         canonical_query_weight: float = 0.0,
+        future_active_min_events: int = 1,
+        future_activity_floor: float = 0.01,
+        frame_sigreg_weight: float = 0.0,
+        temporal_sigreg_weight: float = 0.0,
+        sigreg_projector_hidden_dim: int = 512,
+        sigreg_projector_output_dim: int = 256,
+        sigreg_num_slices: int = 1024,
+        sigreg_t_max: float = 3.0,
+        sigreg_num_points: int = 17,
+        sigreg_projection_seed: int = 0,
     ) -> None:
         super().__init__()
         if predictor.num_patches != encoder.num_patches:
@@ -72,6 +109,12 @@ class WindowJEPA(nn.Module):
             raise ValueError("regularization weights cannot be negative")
         if canonical_query_weight < 0:
             raise ValueError("canonical_query_weight cannot be negative")
+        if future_active_min_events <= 0:
+            raise ValueError("future_active_min_events must be positive")
+        if not 0 < future_activity_floor <= 1:
+            raise ValueError("future_activity_floor must lie inside (0, 1]")
+        if frame_sigreg_weight < 0 or temporal_sigreg_weight < 0:
+            raise ValueError("future SIGReg weights cannot be negative")
         self.online_encoder = encoder
         self.target_encoder = make_ema_copy(encoder)
         self.predictor = predictor
@@ -82,6 +125,40 @@ class WindowJEPA(nn.Module):
         self.variance_weight = variance_weight
         self.covariance_weight = covariance_weight
         self.canonical_query_weight = canonical_query_weight
+        self.future_active_min_events = int(future_active_min_events)
+        self.future_activity_floor = float(future_activity_floor)
+        self.frame_sigreg_weight = float(frame_sigreg_weight)
+        self.temporal_sigreg_weight = float(temporal_sigreg_weight)
+        self.future_regularizers = nn.ModuleDict()
+        if self.frame_sigreg_weight:
+            self.future_regularizers["frame"] = ProjectedSIGReg(
+                encoder.embed_dim,
+                sigreg_projector_output_dim,
+                hidden_dim=sigreg_projector_hidden_dim,
+                num_slices=sigreg_num_slices,
+                num_frequencies=sigreg_num_points,
+                maximum_frequency=sigreg_t_max,
+                seed=sigreg_projection_seed,
+            )
+            self.future_regularizers["support"] = ProjectedSIGReg(
+                encoder.embed_dim,
+                sigreg_projector_output_dim,
+                hidden_dim=sigreg_projector_hidden_dim,
+                num_slices=sigreg_num_slices,
+                num_frequencies=sigreg_num_points,
+                maximum_frequency=sigreg_t_max,
+                seed=sigreg_projection_seed + 5_000,
+            )
+        if self.temporal_sigreg_weight:
+            self.future_regularizers["temporal"] = ProjectedSIGReg(
+                encoder.embed_dim,
+                sigreg_projector_output_dim,
+                hidden_dim=sigreg_projector_hidden_dim,
+                num_slices=sigreg_num_slices,
+                num_frequencies=sigreg_num_points,
+                maximum_frequency=sigreg_t_max,
+                seed=sigreg_projection_seed + 10_000,
+            )
 
     @property
     def num_patches(self) -> int:
@@ -92,6 +169,29 @@ class WindowJEPA(nn.Module):
         self.target_encoder.eval()
         self.target_scale_embedding.eval()
         return self
+
+    def auxiliary_state_dict(self) -> dict[str, dict[str, torch.Tensor]]:
+        """Return trainable future-objective state omitted by legacy checkpoints."""
+
+        return {"future_regularizers": self.future_regularizers.state_dict()}
+
+    def load_auxiliary_state_dict(
+        self,
+        state: dict[str, object],
+        *,
+        strict: bool = True,
+    ) -> None:
+        expected = bool(self.future_regularizers.state_dict())
+        saved = state.get("future_regularizers") if isinstance(state, dict) else None
+        if saved is None:
+            if strict and expected:
+                raise ValueError(
+                    "checkpoint is missing future SIGReg projector state"
+                )
+            return
+        if not isinstance(saved, dict):
+            raise TypeError("future_regularizers checkpoint state must be a mapping")
+        self.future_regularizers.load_state_dict(saved, strict=strict)
 
     def _scale_features(
         self, context_ms: torch.Tensor, target_ms: torch.Tensor
@@ -116,6 +216,8 @@ class WindowJEPA(nn.Module):
         objective: str = "window_jepa",
         online_state: RecurrentState | None = None,
         sequence_loss_mask: torch.Tensor | None = None,
+        context_event_activity: torch.Tensor | None = None,
+        target_event_activity: torch.Tensor | None = None,
     ) -> WindowJEPAOutput:
         if objective in {"sequence_window_jepa", "sequence_dense_window_jepa"}:
             if sequence_loss_mask is None:
@@ -140,6 +242,20 @@ class WindowJEPA(nn.Module):
                 target_mask=target_mask,
                 online_state=online_state,
                 dense=objective == "recurrent_dense_window_jepa",
+            )
+        if objective == "recurrent_future_jepa":
+            if context_event_activity is None or target_event_activity is None:
+                raise ValueError(
+                    "recurrent_future_jepa requires context and target event activity"
+                )
+            return self.recurrent_future_sequence(
+                x_context=x_context,
+                x_target=x_target,
+                context_duration_ms=dt_context_ms,
+                target_duration_ms=dt_target_ms,
+                context_event_activity=context_event_activity,
+                target_event_activity=target_event_activity,
+                online_state=online_state,
             )
         if objective == "feature_consistency":
             return self.feature_consistency(
@@ -314,7 +430,7 @@ class WindowJEPA(nn.Module):
         self,
         x: torch.Tensor,
         duration_ms: torch.Tensor,
-        context_mask: torch.Tensor,
+        context_mask: torch.Tensor | None,
         online_state: RecurrentState | None = None,
     ) -> RecurrentState | None:
         """Initialize online memory without creating a gradient graph or target state."""
@@ -325,17 +441,27 @@ class WindowJEPA(nn.Module):
         batch_size, steps = x.shape[:2]
         if duration_ms.shape != (batch_size, steps):
             raise ValueError("burn-in duration must have shape [B,T]")
-        if context_mask.shape != (batch_size, steps, self.num_patches):
+        if context_mask is not None and context_mask.shape != (
+            batch_size,
+            steps,
+            self.num_patches,
+        ):
             raise ValueError("burn-in context mask must have shape [B,T,N]")
         state = online_state
         for index in range(steps):
             scale = self.scale_embedding(duration_ms[:, index])
             if not self.condition_on_scale:
                 scale = torch.zeros_like(scale)
+            step_mask = (
+                None
+                if online_encoder.recurrent_placement == "post_encoder"
+                or context_mask is None
+                else context_mask[:, index]
+            )
             _, state = online_encoder.forward_recurrent(
                 x[:, index],
                 scale,
-                context_mask[:, index],
+                step_mask,
                 state=state,
             )
         return detach_recurrent_state(state)
@@ -419,6 +545,405 @@ class WindowJEPA(nn.Module):
                 target, flattened_target_mask
             ),
             online_state=state,
+        )
+
+    def _event_support_pool(
+        self,
+        tokens: torch.Tensor,
+        event_activity: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pool one vector per sample without letting event-rich clips dominate."""
+
+        if tokens.ndim != 3:
+            raise ValueError("event-support pooling expects tokens [B,N,D]")
+        if event_activity.shape != tokens.shape[:2]:
+            raise ValueError("event activity must have shape [B,N]")
+        if event_activity.device != tokens.device:
+            raise ValueError("event activity and tokens must share a device")
+        active = event_activity >= self.future_active_min_events
+        weights = torch.where(
+            active,
+            torch.ones_like(event_activity, dtype=torch.float32),
+            torch.full_like(
+                event_activity,
+                self.future_activity_floor,
+                dtype=torch.float32,
+            ),
+        )
+        normalized = weights / weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        pooled = (tokens.float() * normalized.unsqueeze(-1)).sum(dim=1)
+        # A threshold greater than one must not discard a non-empty frame just
+        # because every patch falls below that threshold. Thresholding controls
+        # the pooling weights; raw event presence controls SIGReg validity.
+        return pooled, event_activity.sum(dim=1) > 0
+
+    def _event_support_contrast(
+        self,
+        tokens: torch.Tensor,
+        event_activity: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Contrast active and inactive frame regions to reject spatial collapse."""
+
+        if tokens.ndim != 3 or event_activity.shape != tokens.shape[:2]:
+            raise ValueError(
+                "event-support contrast expects tokens [B,N,D] and activity [B,N]"
+            )
+        if event_activity.device != tokens.device:
+            raise ValueError("event activity and tokens must share a device")
+        active = event_activity >= self.future_active_min_events
+        inactive = ~active
+        # A threshold can place every patch in the same class, especially for a
+        # dense frame or when active_min_events is greater than one. Where raw
+        # event counts genuinely vary, recover an event-derived contrast by
+        # splitting the lower/higher count halves. Equal-count rows remain
+        # invalid: an index-based tie break would turn this into a positional
+        # shortcut rather than an event-support regularizer.
+        if tokens.shape[1] >= 2:
+            has_events = event_activity.sum(dim=1) > 0
+            single_class = active.all(dim=1) | inactive.all(dim=1)
+            has_count_variation = event_activity.amax(dim=1) > event_activity.amin(
+                dim=1
+            )
+            use_count_split = single_class & has_events & has_count_variation
+            half = tokens.shape[1] // 2
+            order = event_activity.argsort(dim=1)
+            low_activity = torch.zeros_like(active)
+            high_activity = torch.zeros_like(active)
+            low_activity.scatter_(1, order[:, :half], True)
+            high_activity.scatter_(1, order[:, half:], True)
+            active = torch.where(
+                use_count_split.unsqueeze(1), high_activity, active
+            )
+            inactive = torch.where(
+                use_count_split.unsqueeze(1), low_activity, inactive
+            )
+        active_count = active.sum(dim=1, keepdim=True)
+        inactive_count = inactive.sum(dim=1, keepdim=True)
+        active_mean = (
+            tokens.float() * active.unsqueeze(-1).to(torch.float32)
+        ).sum(dim=1) / active_count.clamp_min(1).to(torch.float32)
+        inactive_mean = (
+            tokens.float() * inactive.unsqueeze(-1).to(torch.float32)
+        ).sum(dim=1) / inactive_count.clamp_min(1).to(torch.float32)
+        valid = (active_count[:, 0] > 0) & (inactive_count[:, 0] > 0)
+        return active_mean - inactive_mean, valid
+
+    @staticmethod
+    def _previous_hidden_tokens(
+        state: RecurrentState | None,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        if state is None:
+            return torch.zeros_like(reference)
+        hidden = state[0] if isinstance(state, tuple) else state
+        if not isinstance(hidden, torch.Tensor) or hidden.ndim != 4:
+            raise TypeError("recurrent state must contain a hidden grid [B,D,H,W]")
+        tokens = hidden.flatten(2).transpose(1, 2)
+        if tokens.shape != reference.shape:
+            raise ValueError("recurrent hidden grid and token grid do not match")
+        return tokens
+
+    @staticmethod
+    @torch.no_grad()
+    def _global_fixed_position_standard_deviations(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Measure collapse across the global batch at every fixed patch position."""
+
+        if prediction.shape != target.shape or prediction.ndim != 3:
+            raise ValueError("prediction and target must share shape [B,N,D]")
+        prediction_fp32 = prediction.detach().float()
+        target_fp32 = target.detach().float()
+        moments = torch.stack(
+            (
+                prediction_fp32.sum(dim=0),
+                prediction_fp32.square().sum(dim=0),
+                target_fp32.sum(dim=0),
+                target_fp32.square().sum(dim=0),
+            )
+        )
+        count = prediction_fp32.new_tensor(float(prediction.shape[0]))
+        if (
+            distributed.is_available()
+            and distributed.is_initialized()
+            and distributed.get_world_size() > 1
+        ):
+            distributed.all_reduce(moments, op=distributed.ReduceOp.SUM)
+            distributed.all_reduce(count, op=distributed.ReduceOp.SUM)
+        denominator = count.clamp_min(1.0)
+        prediction_mean = moments[0] / denominator
+        target_mean = moments[2] / denominator
+        prediction_variance = (
+            moments[1] / denominator - prediction_mean.square()
+        ).clamp_min(0.0)
+        target_variance = (
+            moments[3] / denominator - target_mean.square()
+        ).clamp_min(0.0)
+        return prediction_variance.sqrt().mean(), target_variance.sqrt().mean()
+
+    def recurrent_future_sequence(
+        self,
+        x_context: torch.Tensor,
+        x_target: torch.Tensor,
+        context_duration_ms: torch.Tensor,
+        target_duration_ms: torch.Tensor,
+        context_event_activity: torch.Tensor,
+        target_event_activity: torch.Tensor,
+        online_state: RecurrentState | None,
+    ) -> WindowJEPAOutput:
+        """Predict full future EMA frame latents from causal post-ViT memory.
+
+        Spatial masks are deliberately absent from this path. Both the online
+        frame encoder and the stateless EMA teacher see full event windows; the
+        event-support map is applied only to loss balancing and SIGReg pooling.
+        """
+
+        online_encoder, target_encoder = self._recurrent_encoders()
+        if online_encoder.recurrent_placement != "post_encoder":
+            raise ValueError(
+                "recurrent_future_jepa requires post_encoder recurrence"
+            )
+        if x_context.ndim != 5 or x_context.shape != x_target.shape:
+            raise ValueError("future recurrent inputs must share shape [B,T,C,H,W]")
+        batch_size, steps = x_context.shape[:2]
+        if steps <= 0:
+            raise ValueError("a future recurrent chunk requires at least one timestep")
+        if context_duration_ms.shape != (batch_size, steps) or (
+            target_duration_ms.shape != (batch_size, steps)
+        ):
+            raise ValueError("future recurrent durations must have shape [B,T]")
+        activity_shape = (batch_size, steps, self.num_patches)
+        if context_event_activity.shape != activity_shape or (
+            target_event_activity.shape != activity_shape
+        ):
+            raise ValueError("future event activity must have shape [B,T,N]")
+
+        state = online_state
+        outputs: list[WindowJEPAOutput] = []
+        for index in range(steps):
+            context_ms = context_duration_ms[:, index].reshape(batch_size)
+            target_ms = target_duration_ms[:, index].reshape(batch_size)
+            source_scale, target_scale, ratio_scale = self._scale_features(
+                context_ms, target_ms
+            )
+            previous_state = state
+            frame_tokens, recurrent_tokens, state = (
+                online_encoder.forward_frame_and_recurrent(
+                    x_context[:, index],
+                    source_scale,
+                    None,
+                    state=state,
+                )
+            )
+            with torch.no_grad():
+                ema_scale = self.target_scale_embedding(target_ms)
+                if not self.condition_on_scale:
+                    ema_scale = torch.zeros_like(ema_scale)
+                target_tokens = target_encoder.forward_frame(
+                    x_target[:, index], ema_scale, None
+                )
+
+            full_mask = torch.ones(
+                (batch_size, self.num_patches),
+                dtype=torch.bool,
+                device=x_context.device,
+            )
+            prediction = self.predictor(
+                context_tokens=recurrent_tokens,
+                context_keep_mask=full_mask,
+                target_mask=full_mask,
+                source_scale=source_scale,
+                target_scale=target_scale,
+                ratio_scale=ratio_scale,
+            )
+            balanced = balanced_event_support_latent_prediction_loss(
+                prediction,
+                target_tokens,
+                target_event_activity[:, index],
+                active_threshold=float(self.future_active_min_events - 1),
+                kind=self.loss_kind,
+            )
+
+            zero = balanced.loss.new_zeros(())
+            frame_sigreg = zero
+            support_sigreg = zero
+            temporal_sigreg = zero
+            frame_samples = zero
+            support_samples = zero
+            temporal_samples = zero
+            frame_real = zero
+            frame_imaginary = zero
+            support_real = zero
+            support_imaginary = zero
+            temporal_real = zero
+            temporal_imaginary = zero
+            context_activity = context_event_activity[:, index]
+            if "frame" in self.future_regularizers:
+                frame_vector, frame_valid = self._event_support_pool(
+                    frame_tokens, context_activity
+                )
+                frame_output = self.future_regularizers["frame"](
+                    frame_vector, valid_mask=frame_valid
+                )
+                frame_sigreg = frame_output.loss
+                frame_samples = frame_output.effective_samples
+                frame_real = frame_output.real_error
+                frame_imaginary = frame_output.imaginary_error
+                support_vector, support_valid = self._event_support_contrast(
+                    frame_tokens, context_activity
+                )
+                support_output = self.future_regularizers["support"](
+                    support_vector, valid_mask=support_valid
+                )
+                support_sigreg = support_output.loss
+                support_samples = support_output.effective_samples
+                support_real = support_output.real_error
+                support_imaginary = support_output.imaginary_error
+            if "temporal" in self.future_regularizers:
+                previous_tokens = self._previous_hidden_tokens(
+                    previous_state, recurrent_tokens
+                )
+                temporal_vector, temporal_valid = self._event_support_pool(
+                    recurrent_tokens - previous_tokens,
+                    context_activity,
+                )
+                temporal_output = self.future_regularizers["temporal"](
+                    temporal_vector, valid_mask=temporal_valid
+                )
+                temporal_sigreg = temporal_output.loss
+                temporal_samples = temporal_output.effective_samples
+                temporal_real = temporal_output.real_error
+                temporal_imaginary = temporal_output.imaginary_error
+            support_available = (
+                support_samples >= 2
+            ).to(dtype=frame_sigreg.dtype)
+            frame_regularization = (
+                frame_sigreg + support_sigreg
+            ) / (1.0 + support_available)
+            sigreg_loss = (
+                self.frame_sigreg_weight * frame_regularization
+                + self.temporal_sigreg_weight * temporal_sigreg
+            )
+            loss = balanced.loss + sigreg_loss
+            prediction_std, target_std = (
+                self._global_fixed_position_standard_deviations(
+                    prediction,
+                    target_tokens,
+                )
+            )
+            outputs.append(
+                WindowJEPAOutput(
+                    loss=loss,
+                    masked_loss=balanced.loss,
+                    canonical_loss=zero,
+                    dense_loss=balanced.loss,
+                    visible_loss=zero,
+                    deep_supervision_loss=zero,
+                    prediction=prediction,
+                    target=target_tokens,
+                    prediction_std=prediction_std,
+                    target_std=target_std,
+                    online_state=state,
+                    future_prediction_loss=balanced.loss,
+                    active_prediction_loss=balanced.active_loss,
+                    inactive_prediction_loss=balanced.inactive_loss,
+                    frame_sigreg_loss=frame_sigreg,
+                    support_sigreg_loss=support_sigreg,
+                    temporal_sigreg_loss=temporal_sigreg,
+                    sigreg_loss=sigreg_loss,
+                    active_patch_fraction=(
+                        target_event_activity[:, index]
+                        >= self.future_active_min_events
+                    ).float().mean(),
+                    context_active_patch_fraction=(
+                        context_activity >= self.future_active_min_events
+                    ).float().mean(),
+                    frame_sigreg_samples=frame_samples,
+                    support_sigreg_samples=support_samples,
+                    temporal_sigreg_samples=temporal_samples,
+                    frame_sigreg_real_error=frame_real,
+                    frame_sigreg_imaginary_error=frame_imaginary,
+                    support_sigreg_real_error=support_real,
+                    support_sigreg_imaginary_error=support_imaginary,
+                    temporal_sigreg_real_error=temporal_real,
+                    temporal_sigreg_imaginary_error=temporal_imaginary,
+                    active_prediction_sum=(
+                        balanced.active_loss
+                        * balanced.active_sample_count.to(
+                            balanced.active_loss.dtype
+                        )
+                    ),
+                    active_prediction_count=balanced.active_sample_count.float(),
+                    inactive_prediction_sum=(
+                        balanced.inactive_loss
+                        * balanced.inactive_sample_count.to(
+                            balanced.inactive_loss.dtype
+                        )
+                    ),
+                    inactive_prediction_count=(
+                        balanced.inactive_sample_count.float()
+                    ),
+                )
+            )
+
+        prediction = torch.cat([output.prediction for output in outputs], dim=0)
+        target = torch.cat([output.target for output in outputs], dim=0)
+        def mean(name: str) -> torch.Tensor:
+            values = [getattr(output, name) for output in outputs]
+            if any(value is None for value in values):
+                raise RuntimeError(f"future objective metric {name} is missing")
+            return torch.stack(values).mean()  # type: ignore[arg-type]
+
+        active_sum = mean("active_prediction_sum")
+        active_count = mean("active_prediction_count")
+        inactive_sum = mean("inactive_prediction_sum")
+        inactive_count = mean("inactive_prediction_count")
+
+        return WindowJEPAOutput(
+            loss=mean("loss"),
+            masked_loss=mean("masked_loss"),
+            canonical_loss=mean("canonical_loss"),
+            dense_loss=mean("dense_loss"),
+            visible_loss=mean("visible_loss"),
+            deep_supervision_loss=mean("deep_supervision_loss"),
+            prediction=prediction,
+            target=target,
+            prediction_std=mean("prediction_std"),
+            target_std=mean("target_std"),
+            online_state=state,
+            future_prediction_loss=mean("future_prediction_loss"),
+            active_prediction_loss=active_sum / active_count.clamp_min(1.0),
+            inactive_prediction_loss=(
+                inactive_sum / inactive_count.clamp_min(1.0)
+            ),
+            frame_sigreg_loss=mean("frame_sigreg_loss"),
+            support_sigreg_loss=mean("support_sigreg_loss"),
+            temporal_sigreg_loss=mean("temporal_sigreg_loss"),
+            sigreg_loss=mean("sigreg_loss"),
+            active_patch_fraction=mean("active_patch_fraction"),
+            context_active_patch_fraction=mean(
+                "context_active_patch_fraction"
+            ),
+            frame_sigreg_samples=mean("frame_sigreg_samples"),
+            support_sigreg_samples=mean("support_sigreg_samples"),
+            temporal_sigreg_samples=mean("temporal_sigreg_samples"),
+            frame_sigreg_real_error=mean("frame_sigreg_real_error"),
+            frame_sigreg_imaginary_error=mean(
+                "frame_sigreg_imaginary_error"
+            ),
+            support_sigreg_real_error=mean("support_sigreg_real_error"),
+            support_sigreg_imaginary_error=mean(
+                "support_sigreg_imaginary_error"
+            ),
+            temporal_sigreg_real_error=mean("temporal_sigreg_real_error"),
+            temporal_sigreg_imaginary_error=mean(
+                "temporal_sigreg_imaginary_error"
+            ),
+            active_prediction_sum=active_sum,
+            active_prediction_count=active_count,
+            inactive_prediction_sum=inactive_sum,
+            inactive_prediction_count=inactive_count,
         )
 
     def _recurrent_step(

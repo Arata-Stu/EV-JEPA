@@ -12,6 +12,7 @@ from event_window_jepa.models.vjepa21_event_vit import VJEPA21EventVisionTransfo
 ConvLSTMState = tuple[torch.Tensor, torch.Tensor]
 RecurrentState = torch.Tensor | ConvLSTMState
 RecurrentCellKind = Literal["conv_lstm", "conv_gru", "convlstm", "convgru"]
+RecurrentPlacement = Literal["pre_encoder", "post_encoder"]
 
 
 def _validate_kernel_size(kernel_size: int) -> None:
@@ -274,11 +275,19 @@ class ConvLSTMCell(nn.Module):
 class RecurrentVJEPA21EventVisionTransformer(VJEPA21EventVisionTransformer):
     """V-JEPA 2.1 event encoder with causal recurrence on its patch grid.
 
-    Current masked patch embeddings are zeroed before spatial recurrence to
-    prevent target leakage through the recurrent convolution. The recurrent
-    cell still updates a complete spatial grid before retained tokens are
-    gathered. State is always supplied and returned by the caller; the module
-    never retains sequence state in parameters or buffers.
+    ``pre_encoder`` preserves the original R0 path: current masked patch
+    embeddings are zeroed, spatial recurrence updates the complete patch grid,
+    and retained recurrent tokens then enter the transformer. ``post_encoder``
+    instead encodes a full frame with the ViT before updating recurrent state;
+    an optional keep mask is applied only after recurrence. The latter is the
+    causal future-prediction path, where masking must not alter temporal memory.
+
+    State is always supplied and returned by the caller; the module never
+    retains sequence state in parameters or buffers. ``forward_frame`` and
+    ``forward_frame_intermediates`` explicitly bypass recurrence, including for
+    an EMA copy of this module. ``forward_frame_and_recurrent`` exposes both the
+    frame and recurrent tokens from one frame-encoder execution in
+    ``post_encoder`` mode.
 
     The inherited ``forward`` and ``forward_intermediates`` APIs remain
     stateless and start from a zero state. Sequence training should use
@@ -299,6 +308,7 @@ class RecurrentVJEPA21EventVisionTransformer(VJEPA21EventVisionTransformer):
         dropout: float = 0.0,
         recurrent_cell: RecurrentCellKind = "conv_lstm",
         recurrent_kernel_size: int = 3,
+        recurrent_placement: RecurrentPlacement = "pre_encoder",
     ) -> None:
         super().__init__(
             image_size=image_size,
@@ -321,7 +331,12 @@ class RecurrentVJEPA21EventVisionTransformer(VJEPA21EventVisionTransformer):
             cell = ConvGRUCell(embed_dim, embed_dim, recurrent_kernel_size)
         else:
             raise ValueError("recurrent_cell must select ConvLSTM or ConvGRU")
+        if recurrent_placement not in {"pre_encoder", "post_encoder"}:
+            raise ValueError(
+                "recurrent_placement must be pre_encoder or post_encoder"
+            )
         self.recurrent_cell_type = normalized_cell
+        self.recurrent_placement = recurrent_placement
         self.recurrent_cell = cell
 
     @staticmethod
@@ -341,7 +356,81 @@ class RecurrentVJEPA21EventVisionTransformer(VJEPA21EventVisionTransformer):
         next_hidden = self.recurrent_cell(patches, state)
         return next_hidden, next_hidden
 
-    def _forward_recurrent_intermediates(
+    def _forward_frame_intermediates(
+        self,
+        x: torch.Tensor,
+        scale_embedding: torch.Tensor,
+        context_keep_mask: torch.Tensor | None,
+        *,
+        require_configured_size: bool,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[int, int]]:
+        """Run only the frame ViT, bypassing recurrent dynamic dispatch."""
+
+        return VJEPA21EventVisionTransformer._forward_intermediates(
+            self,
+            x,
+            scale_embedding,
+            context_keep_mask,
+            require_configured_size=require_configured_size,
+        )
+
+    def forward_frame_intermediates(
+        self,
+        x: torch.Tensor,
+        scale_embedding: torch.Tensor,
+        context_keep_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Return frame-ViT features without executing the recurrent cell."""
+
+        outputs, _ = self._forward_frame_intermediates(
+            x,
+            scale_embedding,
+            context_keep_mask,
+            require_configured_size=True,
+        )
+        return outputs
+
+    def forward_frame(
+        self,
+        x: torch.Tensor,
+        scale_embedding: torch.Tensor,
+        context_keep_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the final frame-ViT tokens with recurrence fully bypassed."""
+
+        return self.forward_frame_intermediates(
+            x, scale_embedding, context_keep_mask
+        )[-1]
+
+    def forward_frame_feature_map(
+        self,
+        x: torch.Tensor,
+        scale_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a recurrence-free frame feature map at a dynamic resolution."""
+
+        outputs, grid_size = self._forward_frame_intermediates(
+            x,
+            scale_embedding,
+            None,
+            require_configured_size=False,
+        )
+        return outputs[-1].transpose(1, 2).reshape(
+            x.shape[0], self.embed_dim, grid_size[0], grid_size[1]
+        )
+
+    @staticmethod
+    def _returned_state(
+        state: RecurrentState,
+        *,
+        detach_state: bool,
+    ) -> RecurrentState:
+        returned = detach_recurrent_state(state) if detach_state else state
+        if returned is None:
+            raise RuntimeError("recurrent cell did not produce a state")
+        return returned
+
+    def _forward_pre_encoder_recurrent_intermediates(
         self,
         x: torch.Tensor,
         scale_embedding: torch.Tensor,
@@ -393,12 +482,92 @@ class RecurrentVJEPA21EventVisionTransformer(VJEPA21EventVisionTransformer):
             if index in selected:
                 outputs.append(self.norm(sequence)[:, 1:, :])
 
-        returned_state = (
-            detach_recurrent_state(next_state) if detach_state else next_state
+        returned_state = self._returned_state(
+            next_state, detach_state=detach_state
         )
-        if returned_state is None:
-            raise RuntimeError("recurrent cell did not produce a state")
         return tuple(outputs), grid_size, returned_state
+
+    def _forward_post_encoder_recurrent_intermediates(
+        self,
+        x: torch.Tensor,
+        scale_embedding: torch.Tensor,
+        context_keep_mask: torch.Tensor | None,
+        state: RecurrentState | None,
+        *,
+        detach_state: bool,
+        require_configured_size: bool,
+    ) -> tuple[
+        tuple[torch.Tensor, ...],
+        tuple[int, int],
+        RecurrentState,
+        torch.Tensor,
+    ]:
+        # The frame encoder deliberately sees the full event window. A keep mask
+        # may select returned tokens, but it never erases information before the
+        # recurrent update or changes the full-grid temporal state.
+        frame_outputs, grid_size = self._forward_frame_intermediates(
+            x,
+            scale_embedding,
+            None,
+            require_configured_size=require_configured_size,
+        )
+        frame_tokens = frame_outputs[-1]
+        batch_size = x.shape[0]
+        frame_grid = frame_tokens.transpose(1, 2).reshape(
+            batch_size, self.embed_dim, grid_size[0], grid_size[1]
+        )
+        recurrent_grid, next_state = self._update_state(frame_grid, state)
+        recurrent_tokens = recurrent_grid.flatten(2).transpose(1, 2)
+
+        returned_frame_tokens = frame_tokens
+        if context_keep_mask is not None:
+            validate_patch_mask(
+                context_keep_mask, batch_size, grid_size[0] * grid_size[1]
+            )
+            if context_keep_mask.device != recurrent_tokens.device:
+                raise ValueError("context mask and recurrent tokens must share a device")
+            returned_frame_tokens = gather_equal_count(
+                returned_frame_tokens, context_keep_mask
+            )
+            recurrent_tokens = gather_equal_count(
+                recurrent_tokens, context_keep_mask
+            )
+
+        returned_state = self._returned_state(
+            next_state, detach_state=detach_state
+        )
+        return (recurrent_tokens,), grid_size, returned_state, returned_frame_tokens
+
+    def _forward_recurrent_intermediates(
+        self,
+        x: torch.Tensor,
+        scale_embedding: torch.Tensor,
+        context_keep_mask: torch.Tensor | None,
+        state: RecurrentState | None,
+        *,
+        detach_state: bool,
+        require_configured_size: bool,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[int, int], RecurrentState]:
+        if self.recurrent_placement == "pre_encoder":
+            return self._forward_pre_encoder_recurrent_intermediates(
+                x,
+                scale_embedding,
+                context_keep_mask,
+                state,
+                detach_state=detach_state,
+                require_configured_size=require_configured_size,
+            )
+        outputs, grid_size, next_state, _ = (
+            self._forward_post_encoder_recurrent_intermediates(
+                x,
+                scale_embedding,
+                context_keep_mask,
+                state,
+                detach_state=detach_state,
+                require_configured_size=require_configured_size,
+            )
+        )
+        return outputs, grid_size, next_state
 
     def _forward_intermediates(
         self,
@@ -455,6 +624,38 @@ class RecurrentVJEPA21EventVisionTransformer(VJEPA21EventVisionTransformer):
         )
         return outputs[-1], next_state
 
+    def forward_frame_and_recurrent(
+        self,
+        x: torch.Tensor,
+        scale_embedding: torch.Tensor,
+        context_keep_mask: torch.Tensor | None = None,
+        *,
+        state: RecurrentState | None = None,
+        detach_state: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, RecurrentState]:
+        """Return frame tokens, recurrent tokens, and state from one ViT pass.
+
+        This fused API is intentionally limited to ``post_encoder`` placement.
+        In ``pre_encoder`` placement the transformer consumes recurrent patches,
+        so a recurrence-free frame latent cannot share the same transformer pass.
+        """
+
+        if self.recurrent_placement != "post_encoder":
+            raise ValueError(
+                "forward_frame_and_recurrent requires post_encoder placement"
+            )
+        outputs, _, next_state, frame_tokens = (
+            self._forward_post_encoder_recurrent_intermediates(
+                x,
+                scale_embedding,
+                context_keep_mask,
+                state,
+                detach_state=detach_state,
+                require_configured_size=True,
+            )
+        )
+        return frame_tokens, outputs[-1], next_state
+
     def forward_feature_map_recurrent(
         self,
         x: torch.Tensor,
@@ -485,6 +686,7 @@ __all__ = [
     "ConvLSTMCell",
     "ConvLSTMState",
     "RecurrentCellKind",
+    "RecurrentPlacement",
     "RecurrentState",
     "RecurrentVJEPA21EventVisionTransformer",
     "detach_recurrent_state",

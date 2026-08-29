@@ -17,7 +17,11 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
 from event_window_jepa.config import ExperimentConfig
-from event_window_jepa.data.anchor_sampler import UniformTimeAnchorSampler, WindowPairSampler
+from event_window_jepa.data.anchor_sampler import (
+    UniformTimeAnchorSampler,
+    WindowPairSampler,
+    milliseconds_to_microseconds,
+)
 from event_window_jepa.data.event_store import H5EventStore, NpzEventStore
 from event_window_jepa.data.paired_window_dataset import PairedWindowDataset
 from event_window_jepa.data.recurrent_window_dataset import RecurrentWindowDataset
@@ -49,6 +53,39 @@ from event_window_jepa.train.checkpoint import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+OUTPUT_METRIC_NAMES = (
+    "loss",
+    "masked_loss",
+    "canonical_loss",
+    "dense_loss",
+    "visible_loss",
+    "deep_supervision_loss",
+    "prediction_std",
+    "target_std",
+    "future_prediction_loss",
+    "active_prediction_loss",
+    "inactive_prediction_loss",
+    "frame_sigreg_loss",
+    "support_sigreg_loss",
+    "temporal_sigreg_loss",
+    "sigreg_loss",
+    "active_patch_fraction",
+    "context_active_patch_fraction",
+    "frame_sigreg_samples",
+    "support_sigreg_samples",
+    "temporal_sigreg_samples",
+    "frame_sigreg_real_error",
+    "frame_sigreg_imaginary_error",
+    "support_sigreg_real_error",
+    "support_sigreg_imaginary_error",
+    "temporal_sigreg_real_error",
+    "temporal_sigreg_imaginary_error",
+    "active_prediction_sum",
+    "active_prediction_count",
+    "inactive_prediction_sum",
+    "inactive_prediction_count",
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -104,6 +141,7 @@ def build_model(config: ExperimentConfig) -> WindowJEPA:
             supervision_layers=model_config.deep_supervision_layers,
             recurrent_cell=config.recurrent.cell,
             recurrent_kernel_size=config.recurrent.kernel_size,
+            recurrent_placement=config.recurrent.recurrent_placement,
         )
     elif model_config.architecture == "vjepa2_1":
         encoder = VJEPA21EventVisionTransformer(
@@ -146,6 +184,20 @@ def build_model(config: ExperimentConfig) -> WindowJEPA:
         variance_weight=config.optimization.variance_weight,
         covariance_weight=config.optimization.covariance_weight,
         canonical_query_weight=config.optimization.canonical_query_weight,
+        future_active_min_events=config.future_prediction.active_min_events,
+        future_activity_floor=config.future_prediction.activity_floor,
+        frame_sigreg_weight=config.future_prediction.frame_sigreg_weight,
+        temporal_sigreg_weight=config.future_prediction.temporal_sigreg_weight,
+        sigreg_projector_hidden_dim=(
+            config.future_prediction.projector_hidden_dim
+        ),
+        sigreg_projector_output_dim=(
+            config.future_prediction.projector_output_dim
+        ),
+        sigreg_num_slices=config.future_prediction.sigreg_num_slices,
+        sigreg_t_max=config.future_prediction.sigreg_t_max,
+        sigreg_num_points=config.future_prediction.sigreg_num_points,
+        sigreg_projection_seed=config.future_prediction.projection_seed,
     )
     # Keep DDP's expected-gradient set exact for ablations that intentionally
     # remove a component from the objective.
@@ -212,6 +264,7 @@ def build_dataset(
             stride_ms=config.recurrent.stride_ms,
             sequence_length=config.recurrent.sequence_length,
             burn_in_steps=config.recurrent.burn_in_steps,
+            lookahead_steps=config.recurrent.prediction_horizon_steps,
             samples_per_epoch=config.data.samples_per_epoch,
             seed=config.runtime.seed,
             sampling_strategy=config.data.sequence_sampling,
@@ -281,6 +334,7 @@ def build_recurrent_batch_sampler(
         stride_ms=config.recurrent.stride_ms,
         sequence_length=config.recurrent.sequence_length,
         burn_in_steps=config.recurrent.burn_in_steps,
+        lookahead_steps=config.recurrent.prediction_horizon_steps,
         samples_per_epoch=config.data.samples_per_epoch,
         batch_size=config.data.batch_size,
         stream_ratio=(stream_batch_size, random_batch_size),
@@ -555,6 +609,40 @@ def _write_tensorboard_metrics(writer: Any, record: dict[str, Any]) -> None:
         ("loss/canonical", record["canonical_loss"]),
         ("representation/prediction_std", record["prediction_std"]),
         ("representation/target_std", record["target_std"]),
+        ("future/prediction_loss", record["future_prediction_loss"]),
+        ("future/active_prediction_loss", record["active_prediction_loss"]),
+        ("future/inactive_prediction_loss", record["inactive_prediction_loss"]),
+        ("future/frame_sigreg_loss", record["frame_sigreg_loss"]),
+        ("future/support_sigreg_loss", record["support_sigreg_loss"]),
+        ("future/temporal_sigreg_loss", record["temporal_sigreg_loss"]),
+        ("future/weighted_sigreg_loss", record["sigreg_loss"]),
+        (
+            "future/sigreg_to_prediction_ratio",
+            record["sigreg_to_prediction_ratio"],
+        ),
+        ("future/active_patch_fraction", record["active_patch_fraction"]),
+        (
+            "future/context_active_patch_fraction",
+            record["context_active_patch_fraction"],
+        ),
+        ("future/frame_sigreg_samples", record["frame_sigreg_samples"]),
+        ("future/support_sigreg_samples", record["support_sigreg_samples"]),
+        ("future/temporal_sigreg_samples", record["temporal_sigreg_samples"]),
+        ("future/frame_sigreg_real", record["frame_sigreg_real_error"]),
+        (
+            "future/frame_sigreg_imaginary",
+            record["frame_sigreg_imaginary_error"],
+        ),
+        ("future/support_sigreg_real", record["support_sigreg_real_error"]),
+        (
+            "future/support_sigreg_imaginary",
+            record["support_sigreg_imaginary_error"],
+        ),
+        ("future/temporal_sigreg_real", record["temporal_sigreg_real_error"]),
+        (
+            "future/temporal_sigreg_imaginary",
+            record["temporal_sigreg_imaginary_error"],
+        ),
         ("mask/activity_aware_fraction", record["mask_activity_aware_fraction"]),
         ("mask/activity_fallback_fraction", record["mask_activity_fallback_fraction"]),
         ("mask/context_active_patch_ratio", record["mask_context_active_patch_ratio"]),
@@ -583,18 +671,13 @@ def _write_tensorboard_metrics(writer: Any, record: dict[str, Any]) -> None:
 
 
 def _output_metric_tensor(output: Any) -> torch.Tensor:
-    return torch.stack(
-        [
-            output.loss.detach().float(),
-            output.masked_loss.detach().float(),
-            output.canonical_loss.detach().float(),
-            output.dense_loss.detach().float(),
-            output.visible_loss.detach().float(),
-            output.deep_supervision_loss.detach().float(),
-            output.prediction_std.detach().float(),
-            output.target_std.detach().float(),
-        ]
-    )
+    values: list[torch.Tensor] = []
+    for name in OUTPUT_METRIC_NAMES:
+        value = getattr(output, name, None)
+        if value is None:
+            value = output.loss.new_zeros(())
+        values.append(value.detach().float())
+    return torch.stack(values)
 
 
 def _recurrent_chunk_ranges(
@@ -663,6 +746,38 @@ def _recurrent_backward(
     """Run BPTT inside a batch and return state for optional cross-batch TBPTT."""
 
     ranges = _recurrent_chunk_ranges(batch["loss_mask"], batch["detach_mask"])
+    future_objective = config.optimization.objective == "recurrent_future_jepa"
+    if future_objective:
+        required_future = {
+            "x_future",
+            "future_dt_ms",
+            "future_t_end_us",
+            "patch_event_activity",
+            "future_patch_event_activity",
+        }
+        missing = sorted(required_future - batch.keys())
+        if missing:
+            raise ValueError(
+                f"future recurrent batch is missing aligned fields: {missing}"
+            )
+        timestamps = batch.get("t_end_us")
+        future_timestamps = batch["future_t_end_us"]
+        expected_delta_us = (
+            config.recurrent.prediction_horizon_steps
+            * milliseconds_to_microseconds(config.recurrent.stride_ms)
+        )
+        if (
+            not isinstance(timestamps, torch.Tensor)
+            or not isinstance(future_timestamps, torch.Tensor)
+            or future_timestamps.shape != timestamps.shape
+            or not bool(
+                (future_timestamps - timestamps == expected_delta_us).all()
+            )
+        ):
+            raise ValueError(
+                "future_t_end_us must be prediction_horizon_steps strides "
+                "after t_end_us"
+            )
     first_supervised = ranges[0][0]
     state = detach_recurrent_state(initial_state)
     if first_supervised:
@@ -670,7 +785,11 @@ def _recurrent_backward(
             state = core_model.recurrent_burn_in(
                 x=batch["x"][:, :first_supervised],
                 duration_ms=batch["dt_ms"][:, :first_supervised],
-                context_mask=batch["context_mask"][:, :first_supervised],
+                context_mask=(
+                    None
+                    if future_objective
+                    else batch["context_mask"][:, :first_supervised]
+                ),
                 online_state=state,
             )
     total_supervised = sum(end - start for start, end in ranges)
@@ -679,7 +798,9 @@ def _recurrent_backward(
             "dataset supervised length differs from recurrent.sequence_length"
         )
 
-    accumulated_metrics = torch.zeros(8, device=device, dtype=torch.float32)
+    accumulated_metrics = torch.zeros(
+        len(OUTPUT_METRIC_NAMES), device=device, dtype=torch.float32
+    )
     for chunk_index, (start, end) in enumerate(ranges):
         state = detach_recurrent_state(state)
         is_final_chunk = chunk_index + 1 == len(ranges)
@@ -692,13 +813,31 @@ def _recurrent_backward(
             with _autocast_context(device, config.optimization.precision):
                 output = model(
                     x_context=batch["x"][:, start:end],
-                    x_target=batch["x"][:, start:end],
+                    x_target=(
+                        batch["x_future"][:, start:end]
+                        if future_objective
+                        else batch["x"][:, start:end]
+                    ),
                     dt_context_ms=batch["dt_ms"][:, start:end],
-                    dt_target_ms=batch["dt_ms"][:, start:end],
+                    dt_target_ms=(
+                        batch["future_dt_ms"][:, start:end]
+                        if future_objective
+                        else batch["dt_ms"][:, start:end]
+                    ),
                     context_mask=batch["context_mask"][:, start:end],
                     target_mask=batch["target_mask"][:, start:end],
                     objective=config.optimization.objective,
                     online_state=state,
+                    context_event_activity=(
+                        batch["patch_event_activity"][:, start:end]
+                        if future_objective
+                        else None
+                    ),
+                    target_event_activity=(
+                        batch["future_patch_event_activity"][:, start:end]
+                        if future_objective
+                        else None
+                    ),
                 )
             finite_flag = torch.isfinite(output.loss).to(dtype=torch.int32)
             if world_size > 1:
@@ -903,6 +1042,7 @@ def train(
             input_frames = effective_clips * (
                 config.recurrent.burn_in_steps
                 + config.recurrent.sequence_length
+                + config.recurrent.prediction_horizon_steps
             )
             mixture = ""
             if mixed_batch_sampler is not None:
@@ -935,6 +1075,7 @@ def train(
                 f"window={config.recurrent.window_ms:g}ms, "
                 f"burn_in={config.recurrent.burn_in_steps}, "
                 f"supervised_steps={config.recurrent.sequence_length}, "
+                f"future_horizon={config.recurrent.prediction_horizon_steps}, "
                 f"{temporal_execution}"
                 f"cross_batch_state={cross_batch_state}, "
                 f"effective_clips_per_epoch={effective_clips}, "
@@ -1117,40 +1258,42 @@ def train(
                             )
                             metric_values /= world_size
                         if rank == 0:
+                            output_count = len(OUTPUT_METRIC_NAMES)
+                            gradient_index = output_count
+                            mask_start = gradient_index + 1
+                            recurrent_index = mask_start + 7
                             record = {
                                 "epoch": epoch,
                                 "step_in_epoch": step_in_epoch,
                                 "attempt_step": attempt_step,
                                 "global_step": global_step,
-                                "loss": float(metric_values[0]),
-                                "masked_loss": float(metric_values[1]),
-                                "canonical_loss": float(metric_values[2]),
-                                "dense_loss": float(metric_values[3]),
-                                "visible_loss": float(metric_values[4]),
-                                "deep_supervision_loss": float(metric_values[5]),
-                                "prediction_std": float(metric_values[6]),
-                                "target_std": float(metric_values[7]),
-                                "gradient_norm": float(metric_values[8]),
+                                **{
+                                    name: float(metric_values[index])
+                                    for index, name in enumerate(OUTPUT_METRIC_NAMES)
+                                },
+                                "gradient_norm": float(
+                                    metric_values[gradient_index]
+                                ),
                                 "mask_activity_aware_fraction": float(
-                                    metric_values[9]
+                                    metric_values[mask_start]
                                 ),
                                 "mask_activity_fallback_fraction": float(
-                                    metric_values[10]
+                                    metric_values[mask_start + 1]
                                 ),
                                 "mask_context_active_patch_ratio": float(
-                                    metric_values[11]
+                                    metric_values[mask_start + 2]
                                 ),
                                 "mask_context_event_mass_coverage": float(
-                                    metric_values[12]
+                                    metric_values[mask_start + 3]
                                 ),
                                 "mask_target_active_patch_ratio": float(
-                                    metric_values[13]
+                                    metric_values[mask_start + 4]
                                 ),
                                 "mask_target_event_mass_coverage": float(
-                                    metric_values[14]
+                                    metric_values[mask_start + 5]
                                 ),
                                 "mask_empty_target_fraction": float(
-                                    metric_values[15]
+                                    metric_values[mask_start + 6]
                                 ),
                                 "learning_rate": learning_rate,
                                 "ema_momentum": momentum,
@@ -1158,7 +1301,20 @@ def train(
                                 "optimizer_step_skipped": optimizer_step_skipped,
                             }
                             if config.recurrent.enabled:
-                                record["recurrent_state_rms"] = float(metric_values[16])
+                                record["recurrent_state_rms"] = float(
+                                    metric_values[recurrent_index]
+                                )
+                            if record["active_prediction_count"] > 0:
+                                record["active_prediction_loss"] = record[
+                                    "active_prediction_sum"
+                                ] / record["active_prediction_count"]
+                            if record["inactive_prediction_count"] > 0:
+                                record["inactive_prediction_loss"] = record[
+                                    "inactive_prediction_sum"
+                                ] / record["inactive_prediction_count"]
+                            record["sigreg_to_prediction_ratio"] = record[
+                                "sigreg_loss"
+                            ] / max(record["future_prediction_loss"], 1e-12)
                             _append_jsonl(metrics_path, record)
                             if writer is not None:
                                 _write_tensorboard_metrics(writer, record)
@@ -1166,8 +1322,11 @@ def train(
                                 loss=f"{record['loss']:.4f}",
                                 pred_std=f"{record['prediction_std']:.3f}",
                                 target_std=f"{record['target_std']:.3f}",
-                                mask_active=(
-                                    f"{record['mask_target_active_patch_ratio']:.2f}"
+                                active=(
+                                    f"{record['active_patch_fraction']:.2f}"
+                                    if config.optimization.objective
+                                    == "recurrent_future_jepa"
+                                    else f"{record['mask_target_active_patch_ratio']:.2f}"
                                 ),
                                 lr=f"{record['learning_rate']:.2e}",
                                 refresh=False,

@@ -17,6 +17,7 @@ from event_window_jepa.models.recurrent_vjepa21_event_vit import (
 
 def _encoder(
     recurrent_cell: Literal["convlstm", "convgru"] = "convlstm",
+    recurrent_placement: Literal["pre_encoder", "post_encoder"] = "pre_encoder",
 ) -> RecurrentVJEPA21EventVisionTransformer:
     return RecurrentVJEPA21EventVisionTransformer(
         image_size=(16, 16),
@@ -28,6 +29,7 @@ def _encoder(
         scale_dim=16,
         supervision_layers=(0, 1),
         recurrent_cell=recurrent_cell,
+        recurrent_placement=recurrent_placement,
     )
 
 
@@ -181,3 +183,113 @@ def test_feedforward_api_is_stateless_and_state_is_not_checkpointed() -> None:
     assert isinstance(target, RecurrentVJEPA21EventVisionTransformer)
     assert tuple(target.state_dict()) == state_dict_keys
     assert all(not parameter.requires_grad for parameter in target.parameters())
+
+
+def test_default_recurrent_placement_preserves_pre_encoder_path() -> None:
+    encoder = _encoder()
+    assert encoder.recurrent_placement == "pre_encoder"
+
+
+def test_post_encoder_fused_api_encodes_frame_once_and_returns_both_latents() -> None:
+    encoder = _encoder(recurrent_placement="post_encoder")
+    x = torch.randn(2, 10, 16, 16)
+    scale = torch.randn(2, 16)
+    frame_encoder_calls = 0
+
+    def count_frame_encoder_call(*_: object) -> None:
+        nonlocal frame_encoder_calls
+        frame_encoder_calls += 1
+
+    handle = encoder.blocks[-1].register_forward_hook(count_frame_encoder_call)
+    try:
+        frame_tokens, recurrent_tokens, state = encoder.forward_frame_and_recurrent(
+            x, scale
+        )
+    finally:
+        handle.remove()
+
+    assert frame_encoder_calls == 1
+    assert frame_tokens.shape == recurrent_tokens.shape == (2, 4, 32)
+    assert isinstance(state, tuple)
+    assert state[0].shape == state[1].shape == (2, 32, 2, 2)
+
+    expected_frame = encoder.forward_frame(x, scale)
+    expected_recurrent, expected_state = encoder.forward_recurrent(x, scale)
+    torch.testing.assert_close(frame_tokens, expected_frame)
+    torch.testing.assert_close(recurrent_tokens, expected_recurrent)
+    assert isinstance(expected_state, tuple)
+    torch.testing.assert_close(state[0], expected_state[0])
+    torch.testing.assert_close(state[1], expected_state[1])
+
+
+def test_frame_only_api_fully_bypasses_post_encoder_recurrent_cell() -> None:
+    encoder = _encoder(recurrent_placement="post_encoder")
+    x = torch.randn(1, 10, 16, 16)
+    scale = torch.randn(1, 16)
+
+    frame_before = encoder.forward_frame(x, scale)
+    _, recurrent_before, _ = encoder.forward_frame_and_recurrent(x, scale)
+    with torch.no_grad():
+        for parameter in encoder.recurrent_cell.parameters():
+            parameter.zero_()
+    frame_after = encoder.forward_frame(x, scale)
+    _, recurrent_after, _ = encoder.forward_frame_and_recurrent(x, scale)
+
+    assert torch.equal(frame_before, frame_after)
+    assert recurrent_before.abs().sum() > 0
+    assert torch.count_nonzero(recurrent_after) == 0
+
+
+def test_post_encoder_keep_mask_never_changes_full_grid_recurrent_state() -> None:
+    encoder = _encoder(recurrent_placement="post_encoder")
+    x = torch.randn(1, 10, 16, 16)
+    scale = torch.randn(1, 16)
+    first_mask = torch.tensor([[True, True, False, False]])
+    second_mask = torch.tensor([[False, False, True, True]])
+
+    first_tokens, first_state = encoder.forward_recurrent(x, scale, first_mask)
+    second_tokens, second_state = encoder.forward_recurrent(x, scale, second_mask)
+
+    assert first_tokens.shape == second_tokens.shape == (1, 2, 32)
+    assert isinstance(first_state, tuple)
+    assert isinstance(second_state, tuple)
+    assert torch.equal(first_state[0], second_state[0])
+    assert torch.equal(first_state[1], second_state[1])
+
+
+@pytest.mark.parametrize("placement", ["pre_encoder", "post_encoder"])
+def test_recurrent_feature_map_supports_dynamic_resolution_for_both_placements(
+    placement: Literal["pre_encoder", "post_encoder"],
+) -> None:
+    encoder = _encoder(recurrent_placement=placement)
+    feature_map, state = encoder.forward_feature_map_recurrent(
+        torch.randn(1, 10, 16, 24),
+        torch.randn(1, 16),
+    )
+
+    assert feature_map.shape == (1, 32, 2, 3)
+    assert isinstance(state, tuple)
+    assert state[0].shape == state[1].shape == (1, 32, 2, 3)
+
+
+def test_fused_frame_recurrent_api_rejects_pre_encoder_placement() -> None:
+    encoder = _encoder(recurrent_placement="pre_encoder")
+    with pytest.raises(ValueError, match="post_encoder"):
+        encoder.forward_frame_and_recurrent(
+            torch.randn(1, 10, 16, 16),
+            torch.randn(1, 16),
+        )
+
+
+def test_recurrent_encoder_rejects_unknown_placement() -> None:
+    with pytest.raises(ValueError, match="recurrent_placement"):
+        RecurrentVJEPA21EventVisionTransformer(
+            image_size=(16, 16),
+            patch_size=8,
+            input_channels=10,
+            embed_dim=32,
+            depth=2,
+            num_heads=4,
+            scale_dim=16,
+            recurrent_placement="between_blocks",  # type: ignore[arg-type]
+        )

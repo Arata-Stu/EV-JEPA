@@ -4,6 +4,7 @@ import pytest
 
 from event_window_jepa.config import (
     ExperimentConfig,
+    FuturePredictionConfig,
     MaskConfig,
     ModelConfig,
     RecurrentConfig,
@@ -80,6 +81,126 @@ def test_recurrent_config_validates_bptt_geometry() -> None:
         RecurrentConfig(kernel_size=4)
     with pytest.raises(ValueError, match="sequence_length"):
         RecurrentConfig(sequence_length=2, tbptt_steps=3)
+
+
+def test_future_prediction_configuration_requires_causal_post_encoder_data() -> None:
+    future = FuturePredictionConfig(
+        frame_sigreg_weight=0.02,
+        temporal_sigreg_weight=0.02,
+        sigreg_num_slices=32,
+    )
+    assert future.frame_sigreg_weight == 0.02
+    with pytest.raises(ValueError, match="projection_seed"):
+        FuturePredictionConfig(projection_seed=-1)
+
+    base = {
+        "data": {
+            "manifest": "events.jsonl",
+            "batch_size": 2,
+            "crop_size": [16, 16],
+        },
+        "representation": {"type": "event_image"},
+        "windows": {
+            "train_ms": [50],
+            "target_ms": [50],
+            "canonical_ms": 50,
+            "eval_ms": [25, 50],
+            "unseen_eval_ms": [25],
+            "minimum_ratio": 1.0,
+            "allow_equal": True,
+        },
+        "model": {
+            "architecture": "vjepa2_1",
+            "image_size": [16, 16],
+            "patch_size": 8,
+            "embed_dim": 32,
+            "encoder_depth": 2,
+            "encoder_heads": 4,
+            "predictor_dim": 16,
+            "predictor_heads": 4,
+            "scale_dim": 16,
+            "deep_supervision_layers": [1],
+        },
+        "recurrent": {
+            "sequence_loader": True,
+            "temporal_model": "conv_lstm",
+            "return_patch_event_activity": True,
+            "recurrent_placement": "post_encoder",
+            "prediction_horizon_steps": 1,
+            "window_ms": 50,
+            "stride_ms": 50,
+            "sequence_length": 2,
+            "burn_in_steps": 1,
+            "tbptt_steps": 2,
+        },
+        "optimization": {
+            "objective": "recurrent_future_jepa",
+            "canonical_query_weight": 0,
+        },
+        "future_prediction": {"frame_sigreg_weight": 0.02},
+    }
+    config = ExperimentConfig.from_mapping(base)
+    assert config.recurrent.prediction_horizon_steps == 1
+    assert config.recurrent.recurrent_placement == "post_encoder"
+
+    with pytest.raises(ValueError, match="post_encoder"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "recurrent": {
+                    **base["recurrent"],
+                    "recurrent_placement": "pre_encoder",
+                },
+            }
+        )
+    with pytest.raises(ValueError, match="return_patch_event_activity"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "recurrent": {
+                    **base["recurrent"],
+                    "return_patch_event_activity": False,
+                },
+            }
+        )
+    with pytest.raises(ValueError, match="allow_unregularized"):
+        ExperimentConfig.from_mapping(
+            {key: value for key, value in base.items() if key != "future_prediction"}
+        )
+    unregularized = ExperimentConfig.from_mapping(
+        {
+            **base,
+            "future_prediction": {"allow_unregularized": True},
+        }
+    )
+    assert unregularized.future_prediction.allow_unregularized
+
+    with pytest.raises(ValueError, match="final frame latent"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "model": {
+                    **base["model"],
+                    "deep_supervision_layers": [0, 1],
+                },
+            }
+        )
+
+    with pytest.raises(ValueError, match="only used by recurrent_future_jepa"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "recurrent": {
+                    **base["recurrent"],
+                    "recurrent_placement": "pre_encoder",
+                    "prediction_horizon_steps": 0,
+                },
+                "optimization": {
+                    **base["optimization"],
+                    "objective": "recurrent_window_jepa",
+                },
+            }
+        )
 
 
 def test_temporal_loader_and_model_switches_resolve_legacy_and_explicit_forms() -> None:
