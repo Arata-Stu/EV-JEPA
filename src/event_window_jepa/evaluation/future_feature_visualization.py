@@ -81,10 +81,23 @@ class FutureFeatureStepRecord:
     shuffled_prediction: torch.Tensor | None
     target_activity: torch.Tensor
     history_permutation: tuple[int, ...]
+    reversed_recurrent_tokens: torch.Tensor | None = None
+    reversed_prediction: torch.Tensor | None = None
+    replaced_recurrent_tokens: torch.Tensor | None = None
+    replaced_prediction: torch.Tensor | None = None
+    replacement_clip_position: int | None = None
 
     @property
     def history_shuffle_available(self) -> bool:
         return self.shuffled_prediction is not None
+
+    @property
+    def history_reverse_available(self) -> bool:
+        return self.reversed_prediction is not None
+
+    @property
+    def history_replacement_available(self) -> bool:
+        return self.replaced_prediction is not None
 
 
 def _token_layer_norm(features: torch.Tensor) -> torch.Tensor:
@@ -301,6 +314,35 @@ def make_unrelated_clip_permutation(clip_count: int, seed: int) -> tuple[int, ..
     return tuple((index + shift) % clip_count for index in range(clip_count))
 
 
+def make_history_replacement_clip_permutation(
+    clip_identities: Sequence[tuple[str, tuple[int, ...]]],
+    seed: int,
+) -> tuple[int, ...]:
+    """Map each clip to a distinct, non-duplicate history donor clip."""
+
+    if seed < 0:
+        raise ValueError("history-replacement seed cannot be negative")
+    clip_count = len(clip_identities)
+    if clip_count < 2:
+        raise ValueError("history replacement requires at least two clips")
+    first_shift = make_unrelated_clip_permutation(clip_count, seed)[0]
+    candidate_shifts = tuple(
+        1 + (first_shift - 1 + offset) % (clip_count - 1)
+        for offset in range(clip_count - 1)
+    )
+    for shift in candidate_shifts:
+        mapping = tuple((index + shift) % clip_count for index in range(clip_count))
+        if all(
+            clip_identities[source] != clip_identities[target]
+            for source, target in enumerate(mapping)
+        ):
+            return mapping
+    raise ValueError(
+        "calibration clips contain duplicate history anchors; select more samples "
+        "or change sample-index"
+    )
+
+
 def make_unrelated_record_permutation(
     records: Sequence[FutureFeatureStepRecord],
     seed: int,
@@ -399,14 +441,29 @@ def extract_future_feature_records(
     *,
     device: torch.device,
     history_shuffle_seed: int = 0,
+    history_replacement_seed: int = 0,
 ) -> tuple[FutureFeatureStepRecord, ...]:
-    """Replay each clip and extract paired correct/shuffled/reset latents."""
+    """Replay clips and extract paired history counterfactual latents."""
 
     if model.training:
         raise RuntimeError("feature extraction requires model.eval()")
     validate_future_feature_config(materialization.config)
     if history_shuffle_seed < 0:
         raise ValueError("history_shuffle_seed cannot be negative")
+    if history_replacement_seed < 0:
+        raise ValueError("history_replacement_seed cannot be negative")
+
+    clip_identities = tuple(
+        (
+            str(clip.sample["sequence_id"]),
+            tuple(int(value) for value in clip.sample["t_end_us"]),
+        )
+        for clip in materialization.clips
+    )
+    replacement_clip_permutation = make_history_replacement_clip_permutation(
+        clip_identities,
+        history_replacement_seed,
+    )
 
     records: list[FutureFeatureStepRecord] = []
     for clip_position, clip in enumerate(materialization.clips):
@@ -418,6 +475,22 @@ def extract_future_feature_records(
             device=device,
             dtype=torch.float32,
         )
+        replacement_clip_position = replacement_clip_permutation[clip_position]
+        replacement_sample = materialization.clips[
+            replacement_clip_position
+        ].sample
+        replacement_x = replacement_sample["x"].to(
+            device=device,
+            dtype=torch.float32,
+        )
+        replacement_duration = replacement_sample["dt_ms"].to(
+            device=device,
+            dtype=torch.float32,
+        )
+        if replacement_x.shape != x.shape or replacement_duration.shape != duration.shape:
+            raise ValueError(
+                "history replacement clips must share sequence and duration shapes"
+            )
         loss_mask = sample["loss_mask"].detach().cpu().bool()
         supervised = tuple(int(index) for index in loss_mask.nonzero().flatten())
         if not supervised:
@@ -428,10 +501,17 @@ def extract_future_feature_records(
             raise ValueError("future feature loss_mask must select one temporal suffix")
 
         state = None
+        replacement_state = None
         if first_supervised:
             state = model.recurrent_burn_in(
                 x[:first_supervised].unsqueeze(0),
                 duration[:first_supervised].unsqueeze(0),
+                None,
+                online_state=None,
+            )
+            replacement_state = model.recurrent_burn_in(
+                replacement_x[:first_supervised].unsqueeze(0),
+                replacement_duration[:first_supervised].unsqueeze(0),
                 None,
                 online_state=None,
             )
@@ -478,6 +558,33 @@ def extract_future_feature_records(
                     online_state=shuffled_state,
                 )
 
+            reversed_step = None
+            if online_step >= 2:
+                reverse_indices = torch.arange(
+                    online_step - 1,
+                    -1,
+                    -1,
+                    dtype=torch.long,
+                    device=device,
+                )
+                reversed_state = model.recurrent_burn_in(
+                    x.index_select(0, reverse_indices).unsqueeze(0),
+                    duration.index_select(0, reverse_indices).unsqueeze(0),
+                    None,
+                    online_state=None,
+                )
+                reversed_step = model.extract_recurrent_future_step(
+                    **step_arguments,
+                    online_state=reversed_state,
+                )
+
+            replaced = None
+            if online_step >= 1:
+                replaced = model.extract_recurrent_future_step(
+                    **step_arguments,
+                    online_state=replacement_state,
+                )
+
             correct_frame = _detached_tokens(correct.frame_tokens, "correct frame")
             correct_target = _detached_tokens(correct.target_tokens, "EMA target")
             _require_same_latent(
@@ -501,6 +608,34 @@ def extract_future_feature_records(
                     _detached_tokens(
                         shuffled.target_tokens,
                         "shuffled EMA target",
+                    ),
+                    "EMA target",
+                )
+            if reversed_step is not None:
+                _require_same_latent(
+                    correct_frame,
+                    _detached_tokens(reversed_step.frame_tokens, "reversed frame"),
+                    "frame latent",
+                )
+                _require_same_latent(
+                    correct_target,
+                    _detached_tokens(
+                        reversed_step.target_tokens,
+                        "reversed EMA target",
+                    ),
+                    "EMA target",
+                )
+            if replaced is not None:
+                _require_same_latent(
+                    correct_frame,
+                    _detached_tokens(replaced.frame_tokens, "replaced-history frame"),
+                    "frame latent",
+                )
+                _require_same_latent(
+                    correct_target,
+                    _detached_tokens(
+                        replaced.target_tokens,
+                        "replaced-history EMA target",
                     ),
                     "EMA target",
                 )
@@ -554,8 +689,52 @@ def extract_future_feature_records(
                     .detach()
                     .cpu(),
                     history_permutation=permutation,
+                    reversed_recurrent_tokens=(
+                        None
+                        if reversed_step is None
+                        else _detached_tokens(
+                            reversed_step.recurrent_tokens,
+                            "reversed recurrent state",
+                        )
+                    ),
+                    reversed_prediction=(
+                        None
+                        if reversed_step is None
+                        else _detached_tokens(
+                            reversed_step.prediction,
+                            "reversed prediction",
+                        )
+                    ),
+                    replaced_recurrent_tokens=(
+                        None
+                        if replaced is None
+                        else _detached_tokens(
+                            replaced.recurrent_tokens,
+                            "replaced-history recurrent state",
+                        )
+                    ),
+                    replaced_prediction=(
+                        None
+                        if replaced is None
+                        else _detached_tokens(
+                            replaced.prediction,
+                            "replaced-history prediction",
+                        )
+                    ),
+                    replacement_clip_position=(
+                        None if replaced is None else replacement_clip_position
+                    ),
                 )
             )
+            if online_step != supervised[-1]:
+                replacement_state = model.recurrent_burn_in(
+                    replacement_x[online_step : online_step + 1].unsqueeze(0),
+                    replacement_duration[
+                        online_step : online_step + 1
+                    ].unsqueeze(0),
+                    None,
+                    online_state=replacement_state,
+                )
     if len({record.clip_position for record in records}) < 2:
         raise ValueError(
             "at least two calibration clips are required for unrelated targets"
@@ -853,22 +1032,28 @@ def analyze_future_feature_records(
         conditions["unrelated_target"]["balanced_cosine_error"]
         - conditions["correct"]["balanced_cosine_error"]
     )
-    shuffled_records = [
-        (index, record)
-        for index, record in enumerate(records)
-        if record.shuffled_prediction is not None
-    ]
-    if shuffled_records:
+    history_controls: dict[
+        str,
+        tuple[list[tuple[int, FutureFeatureStepRecord]], torch.Tensor, torch.Tensor],
+    ] = {}
+    for condition_name, prediction_field in (
+        ("history_shuffled", "shuffled_prediction"),
+        ("history_reversed", "reversed_prediction"),
+        ("history_replaced", "replaced_prediction"),
+    ):
+        available = [
+            (index, record)
+            for index, record in enumerate(records)
+            if getattr(record, prediction_field) is not None
+        ]
+        if not available:
+            continue
         selected = torch.tensor(
-            [index for index, _ in shuffled_records],
+            [index for index, _ in available],
             dtype=torch.long,
         )
-        shuffled_prediction = torch.stack(
-            [
-                record.shuffled_prediction
-                for _, record in shuffled_records
-                if record.shuffled_prediction is not None
-            ]
+        control_prediction = torch.stack(
+            [getattr(record, prediction_field) for _, record in available]
         )
         selected_correct = summarize_prediction_condition(
             prediction.index_select(0, selected),
@@ -877,8 +1062,8 @@ def analyze_future_feature_records(
             active_min_events=config.future_prediction.active_min_events,
             loss_kind="smooth_l1",
         )
-        conditions["history_shuffled"] = summarize_prediction_condition(
-            shuffled_prediction,
+        conditions[condition_name] = summarize_prediction_condition(
+            control_prediction,
             target.index_select(0, selected),
             activity.index_select(0, selected),
             active_min_events=config.future_prediction.active_min_events,
@@ -886,9 +1071,14 @@ def analyze_future_feature_records(
             correct_prediction=prediction.index_select(0, selected),
             correct_target=target.index_select(0, selected),
         )
-        conditions["history_shuffled"]["paired_balanced_cosine_penalty"] = (
-            conditions["history_shuffled"]["balanced_cosine_error"]
+        conditions[condition_name]["paired_balanced_cosine_penalty"] = (
+            conditions[condition_name]["balanced_cosine_error"]
             - selected_correct["balanced_cosine_error"]
+        )
+        history_controls[condition_name] = (
+            available,
+            selected,
+            control_prediction,
         )
 
     all_steps = torch.tensor(
@@ -912,27 +1102,24 @@ def analyze_future_feature_records(
         ),
         "reset_prediction": (reset, all_steps),
     }
-    if shuffled_records:
-        shuffled_steps = all_steps.index_select(0, selected)
-        diagnostic_features["history_shuffled_recurrent"] = (
+    for condition_name, recurrent_field in (
+        ("history_shuffled", "shuffled_recurrent_tokens"),
+        ("history_reversed", "reversed_recurrent_tokens"),
+        ("history_replaced", "replaced_recurrent_tokens"),
+    ):
+        if condition_name not in history_controls:
+            continue
+        available, selected, control_prediction = history_controls[condition_name]
+        control_steps = all_steps.index_select(0, selected)
+        diagnostic_features[f"{condition_name}_recurrent"] = (
             torch.stack(
-                [
-                    record.shuffled_recurrent_tokens
-                    for _, record in shuffled_records
-                    if record.shuffled_recurrent_tokens is not None
-                ]
+                [getattr(record, recurrent_field) for _, record in available]
             ),
-            shuffled_steps,
+            control_steps,
         )
-        diagnostic_features["history_shuffled_prediction"] = (
-            torch.stack(
-                [
-                    record.shuffled_prediction
-                    for _, record in shuffled_records
-                    if record.shuffled_prediction is not None
-                ]
-            ),
-            shuffled_steps,
+        diagnostic_features[f"{condition_name}_prediction"] = (
+            control_prediction,
+            control_steps,
         )
     diagnostics = {
         name: _combined_latent_diagnostics(features, steps)
@@ -1071,6 +1258,29 @@ def _step_records(
                 record.shuffled_prediction,
                 record.target_tokens,
             )
+        reversed_error = float("nan")
+        if record.reversed_prediction is not None:
+            _, reversed_error = _condition_error(
+                record.reversed_prediction,
+                record.target_tokens,
+            )
+        replaced_error = float("nan")
+        replacement_sample_index: int | None = None
+        replacement_sequence_id: str | None = None
+        if record.replaced_prediction is not None:
+            _, replaced_error = _condition_error(
+                record.replaced_prediction,
+                record.target_tokens,
+            )
+            if record.replacement_clip_position is None:
+                raise RuntimeError("replaced history is missing its donor clip")
+            replacement_record = next(
+                donor
+                for donor in records
+                if donor.clip_position == record.replacement_clip_position
+            )
+            replacement_sample_index = replacement_record.sample_index
+            replacement_sequence_id = replacement_record.sequence_id
         rows.append(
             {
                 "record_index": record.record_index,
@@ -1088,12 +1298,24 @@ def _step_records(
                 "correct_cosine_error": correct_error,
                 "history_shuffled_cosine_error": shuffled_error,
                 "history_shuffle_penalty": shuffled_error - correct_error,
+                "history_reversed_cosine_error": reversed_error,
+                "history_reverse_penalty": reversed_error - correct_error,
+                "history_replaced_cosine_error": replaced_error,
+                "history_replacement_penalty": replaced_error - correct_error,
+                "history_replacement_clip_position": (
+                    record.replacement_clip_position
+                ),
+                "history_replacement_sample_index": replacement_sample_index,
+                "history_replacement_sequence_id": replacement_sequence_id,
                 "reset_cosine_error": reset_error,
                 "reset_penalty": reset_error - correct_error,
                 "unrelated_target_cosine_error": unrelated_error,
                 "unrelated_target_penalty": unrelated_error - correct_error,
                 "unrelated_record_index": unrelated.record_index,
                 "history_permutation": list(record.history_permutation),
+                "history_reverse_order": list(
+                    range(record.online_step - 1, -1, -1)
+                ),
             }
         )
     return rows
@@ -1123,6 +1345,10 @@ def _diagnostic_rows(diagnostics: dict[str, dict[str, float]]) -> str:
         "prediction": "prediction",
         "history_shuffled_recurrent": "history shuffled state",
         "history_shuffled_prediction": "history shuffled",
+        "history_reversed_recurrent": "history reversed state",
+        "history_reversed_prediction": "history reversed",
+        "history_replaced_recurrent": "history replaced state",
+        "history_replaced_prediction": "history replaced",
         "reset_recurrent": "state reset recurrent",
         "reset_prediction": "state reset",
     }
@@ -1165,6 +1391,8 @@ def _temporal_rows(
             f"<td>{int(record['context_t_end_us']):,}</td>"
             f"<td>{_format_metric(float(record['correct_cosine_error']))}</td>"
             f"<td>{_format_metric(float(record['history_shuffled_cosine_error']))}</td>"
+            f"<td>{_format_metric(float(record['history_reversed_cosine_error']))}</td>"
+            f"<td>{_format_metric(float(record['history_replaced_cosine_error']))}</td>"
             f"<td>{_format_metric(float(record['reset_cosine_error']))}</td>"
             f"<td>{_format_metric(float(record['unrelated_target_cosine_error']))}</td>"
             "</tr>"
@@ -1237,6 +1465,11 @@ def _render_visual_sections(
         unrelated = records[unrelated_permutation[record_index]]
         clip = materialization.clips[record.clip_position]
         unrelated_clip = materialization.clips[unrelated.clip_position]
+        replacement_clip = (
+            None
+            if record.replacement_clip_position is None
+            else materialization.clips[record.replacement_clip_position]
+        )
         horizon = materialization.dataset.lookahead_steps
         current_window = clip.debug.windows[record.online_step]
         future_window = clip.debug.windows[record.online_step + horizon]
@@ -1288,6 +1521,22 @@ def _render_visual_sections(
             f"sample={unrelated.sample_index}, step={unrelated.online_step}",
             _event_rgb(_event_counts(unrelated_window), event_scale),
         )
+        if replacement_clip is not None and record.online_step >= 1:
+            replacement_history_window = replacement_clip.debug.windows[
+                record.online_step - 1
+            ]
+            save_panel(
+                "replacement-history-events",
+                "別clip履歴の末尾events",
+                (
+                    f"sample={replacement_clip.sample_index}, "
+                    f"step={record.online_step - 1}"
+                ),
+                _event_rgb(
+                    _event_counts(replacement_history_window),
+                    event_scale,
+                ),
+            )
 
         feature_panels = (
             ("frame", "Frame ViT  f_t", record.frame_tokens),
@@ -1303,6 +1552,26 @@ def _render_visual_sections(
                 "history-shuffled-prediction",
                 "履歴順を崩した予測",
                 record.shuffled_prediction,
+            ),
+            (
+                "history-reversed-recurrent",
+                "履歴を逆順にした state",
+                record.reversed_recurrent_tokens,
+            ),
+            (
+                "history-reversed-prediction",
+                "履歴を逆順にした予測",
+                record.reversed_prediction,
+            ),
+            (
+                "history-replaced-recurrent",
+                "別clip履歴の state",
+                record.replaced_recurrent_tokens,
+            ),
+            (
+                "history-replaced-prediction",
+                "別clip履歴からの予測",
+                record.replaced_prediction,
             ),
             (
                 "reset-recurrent",
@@ -1335,23 +1604,10 @@ def _render_visual_sections(
                 "正しい予測の誤差",
                 record.prediction,
                 record.target_tokens,
-            ),
-            (
-                "reset-error",
-                "履歴なし予測の誤差",
-                record.reset_prediction,
-                record.target_tokens,
-            ),
-            (
-                "unrelated-error",
-                "無関係targetとの誤差",
-                record.prediction,
-                unrelated.target_tokens,
-            ),
+            )
         ]
         if record.shuffled_prediction is not None:
-            error_panels.insert(
-                1,
+            error_panels.append(
                 (
                     "history-shuffled-error",
                     "履歴順を崩した誤差",
@@ -1359,6 +1615,40 @@ def _render_visual_sections(
                     record.target_tokens,
                 ),
             )
+        if record.reversed_prediction is not None:
+            error_panels.append(
+                (
+                    "history-reversed-error",
+                    "履歴を逆順にした誤差",
+                    record.reversed_prediction,
+                    record.target_tokens,
+                ),
+            )
+        if record.replaced_prediction is not None:
+            error_panels.append(
+                (
+                    "history-replaced-error",
+                    "別clip履歴での誤差",
+                    record.replaced_prediction,
+                    record.target_tokens,
+                ),
+            )
+        error_panels.extend(
+            (
+                (
+                    "reset-error",
+                    "履歴なし予測の誤差",
+                    record.reset_prediction,
+                    record.target_tokens,
+                ),
+                (
+                    "unrelated-error",
+                    "無関係targetとの誤差",
+                    record.prediction,
+                    unrelated.target_tokens,
+                ),
+            )
+        )
         panel_errors: dict[str, float] = {}
         for key, label, prediction, target in error_panels:
             error, mean_error = _condition_error(prediction, target)
@@ -1413,6 +1703,8 @@ def _report_html(
     reset = conditions["reset"]
     unrelated = conditions["unrelated_target"]
     shuffled = conditions.get("history_shuffled", {})
+    reversed_condition = conditions.get("history_reversed", {})
+    replaced = conditions.get("history_replaced", {})
     pca_variance = 100.0 * float(basis.explained_variance_ratio.sum())
     return f"""<!doctype html>
 <html lang="ja">
@@ -1456,10 +1748,12 @@ figure img {{ display:block; width:100%; height:auto; image-rendering:pixelated;
 <div class="summary">
   <div class="stat"><span>correct balanced cosine error</span><strong>{_format_metric(float(correct['balanced_cosine_error']))}</strong></div>
   <div class="stat"><span>history shuffle penalty</span><strong>{_format_metric(float(shuffled.get('paired_balanced_cosine_penalty', float('nan'))))}</strong></div>
+  <div class="stat"><span>history reverse penalty</span><strong>{_format_metric(float(reversed_condition.get('paired_balanced_cosine_penalty', float('nan'))))}</strong></div>
+  <div class="stat"><span>history replacement penalty</span><strong>{_format_metric(float(replaced.get('paired_balanced_cosine_penalty', float('nan'))))}</strong></div>
   <div class="stat"><span>state reset penalty</span><strong>{_format_metric(float(reset['paired_balanced_cosine_penalty']))}</strong></div>
   <div class="stat"><span>unrelated target penalty</span><strong>{_format_metric(float(unrelated['paired_balanced_cosine_penalty']))}</strong></div>
 </div>
-<div class="explanation"><b>読み方:</b> penaltyが正なら、正しい履歴・順序・未来対応が
+<div class="explanation"><b>読み方:</b> penaltyが正なら、履歴内容・順序・state継続・未来対応が
   controlより予測に役立っています。色の違いだけで判断せず、誤差mapと数値を併用してください。</div>
 <p class="legend"><span>特徴RGB: EMA targetだけでfitした共通PCA
   （上位3成分の説明率={pca_variance:.1f}%、有効rank={basis.valid_rank}）</span>
@@ -1472,7 +1766,8 @@ figure img {{ display:block; width:100%; height:auto; image-rendering:pixelated;
 </tbody></table></div>
 <h2>sample {sample_index} の時間変化</h2>
 <div class="table-wrap"><table><thead><tr><th>online step</th><th>context t_end μs</th>
-<th>correct</th><th>history shuffled</th><th>state reset</th><th>unrelated target</th>
+<th>correct</th><th>history shuffled</th><th>history reversed</th>
+<th>history replaced</th><th>state reset</th><th>unrelated target</th>
 </tr></thead><tbody>{_temporal_rows(step_records, sample_index)}</tbody></table></div>
 {visual_sections}
 </main></body></html>
@@ -1490,6 +1785,7 @@ def write_future_feature_report(
     display_sample_index: int,
     all_steps: bool = False,
     history_shuffle_seed: int = 0,
+    history_replacement_seed: int = 0,
     unrelated_seed: int = 0,
 ) -> dict[str, Any]:
     """Generate a paired qualitative feature report plus machine-readable JSON."""
@@ -1500,6 +1796,8 @@ def write_future_feature_report(
         raise ValueError("future feature report output must use an .html suffix")
     if unrelated_seed < 0:
         raise ValueError("unrelated_seed cannot be negative")
+    if history_replacement_seed < 0:
+        raise ValueError("history_replacement_seed cannot be negative")
     validate_future_feature_config(checkpoint_config)
     _validate_report_compatibility(model, checkpoint_config, materialization)
     requested_device = torch.device(device)
@@ -1519,6 +1817,17 @@ def write_future_feature_report(
         materialization,
         device=model_device,
         history_shuffle_seed=history_shuffle_seed,
+        history_replacement_seed=history_replacement_seed,
+    )
+    replacement_clip_permutation = make_history_replacement_clip_permutation(
+        tuple(
+            (
+                str(clip.sample["sequence_id"]),
+                tuple(int(value) for value in clip.sample["t_end_us"]),
+            )
+            for clip in materialization.clips
+        ),
+        history_replacement_seed,
     )
     target_features = torch.stack([record.target_tokens for record in records])
     basis = fit_shared_target_pca(target_features)
@@ -1554,7 +1863,7 @@ def write_future_feature_report(
         visual_sections=visual_sections,
     )
     payload: dict[str, Any] = {
-        "schema": "event-window-jepa-future-feature-visualization-v1",
+        "schema": "event-window-jepa-future-feature-visualization-v2",
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_config_hash": config_hash(checkpoint_config),
         "effective_manifest": materialization.config.data.manifest,
@@ -1564,6 +1873,10 @@ def write_future_feature_report(
         "clips": _clip_sampling_records(materialization),
         "prediction_horizon_steps": materialization.dataset.lookahead_steps,
         "history_shuffle_seed": history_shuffle_seed,
+        "history_replacement_seed": history_replacement_seed,
+        "history_replacement_clip_permutation": list(
+            replacement_clip_permutation
+        ),
         "unrelated_seed": unrelated_seed,
         "unrelated_target_permutation": list(unrelated_permutation),
         "pca": basis.to_record(),
@@ -1602,6 +1915,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--epoch", type=int, default=0)
     parser.add_argument("--all-steps", action="store_true")
     parser.add_argument("--history-shuffle-seed", type=int, default=None)
+    parser.add_argument(
+        "--history-replacement-seed",
+        type=int,
+        default=0,
+        help="seed for the one-to-one donor-clip history mapping",
+    )
     parser.add_argument("--unrelated-seed", type=int, default=0)
     return parser.parse_args()
 
@@ -1647,15 +1966,29 @@ def main() -> None:
         display_sample_index=args.sample_index,
         all_steps=args.all_steps,
         history_shuffle_seed=history_seed,
+        history_replacement_seed=args.history_replacement_seed,
         unrelated_seed=args.unrelated_seed,
     )
     conditions = report["conditions"]
+    shuffled_penalty = conditions.get("history_shuffled", {}).get(
+        "paired_balanced_cosine_penalty",
+        float("nan"),
+    )
+    reversed_penalty = conditions.get("history_reversed", {}).get(
+        "paired_balanced_cosine_penalty",
+        float("nan"),
+    )
+    replacement_penalty = conditions.get("history_replaced", {}).get(
+        "paired_balanced_cosine_penalty",
+        float("nan"),
+    )
     print(f"[window-jepa] feature visualization: {Path(output).resolve()}")
     print(
         "[window-jepa] balanced cosine "
         f"correct={conditions['correct']['balanced_cosine_error']:.4f}, "
-        f"history-penalty="
-        f"{conditions.get('history_shuffled', {}).get('paired_balanced_cosine_penalty', float('nan')):.4f}, "
+        f"shuffle-penalty={shuffled_penalty:.4f}, "
+        f"reverse-penalty={reversed_penalty:.4f}, "
+        f"replacement-penalty={replacement_penalty:.4f}, "
         f"reset-penalty="
         f"{conditions['reset']['paired_balanced_cosine_penalty']:.4f}, "
         f"unrelated-penalty="
@@ -1676,6 +2009,7 @@ __all__ = [
     "fit_shared_target_pca",
     "fixed_support_latent_diagnostics",
     "make_history_permutation",
+    "make_history_replacement_clip_permutation",
     "make_unrelated_clip_permutation",
     "make_unrelated_record_permutation",
     "pca_patch_rgb",

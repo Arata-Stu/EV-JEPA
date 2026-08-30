@@ -266,15 +266,20 @@ def test_future_feature_report_runs_the_full_tiny_pipeline(tmp_path: Path) -> No
         display_sample_index=0,
     )
 
-    assert report["schema"] == "event-window-jepa-future-feature-visualization-v1"
+    assert report["schema"] == "event-window-jepa-future-feature-visualization-v2"
     assert set(report["conditions"]) == {
         "correct",
         "history_shuffled",
+        "history_reversed",
+        "history_replaced",
         "reset",
         "unrelated_target",
     }
     assert len(report["steps"]) == 8
     assert report["steps"][0]["history_shuffled_cosine_error"] is None
+    assert report["steps"][0]["history_reversed_cosine_error"] is None
+    assert report["steps"][0]["history_replaced_cosine_error"] is not None
+    assert sorted(report["history_replacement_clip_permutation"]) == [0, 1, 2, 3]
     assert output.is_file()
     assert "共通PCA" in output.read_text(encoding="utf-8")
     json_report = json.loads(output.with_suffix(".json").read_text(encoding="utf-8"))

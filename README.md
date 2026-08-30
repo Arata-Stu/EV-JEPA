@@ -296,9 +296,9 @@ torchrun --standalone --nproc-per-node=3 \
 ```
 
 学習済みcheckpointのFrame ViT、ConvLSTM、prediction、EMA future targetは、EMA targetから
-fitした共通PCA基底で可視化できます。正しい履歴、過去順序のshuffle、state resetでは同じ
-現在・未来を固定し、別clipのfuture targetとの対応も別controlで比較するため、時系列stateを
-実際に使っているかも同時に確認できます。
+fitした共通PCA基底で可視化できます。正しい履歴、過去順序のshuffle／reverse、別clip履歴への
+置換、state resetでは同じ現在・未来を固定します。さらに別clipのfuture targetとの対応も
+比較するため、時系列stateの内容・順序・継続を分けて確認できます。
 
 ```bash
 window-jepa-visualize-future \

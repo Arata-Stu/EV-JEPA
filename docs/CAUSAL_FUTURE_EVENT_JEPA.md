@@ -197,19 +197,26 @@ window-jepa-visualize-future \
 最終supervised stepだけを画像化します。全supervised stepを画像化する場合は`--all-steps`を
 追加してください。無関係targetを別clipの同じonline stepから選ぶため、calibration sample数は
 2以上が必須です。HTMLと同じ場所に完全な数値を含むJSON、`*_assets/`にPNGが保存されます。
+別clip履歴の対応を再現・変更する場合は`--history-replacement-seed`を指定します。対応表はJSONの
+`history_replacement_clip_permutation`へ保存されます。
 
-`correct`、`history shuffled`、`state reset`は同じ現在窓と正しいEMA future targetを共有します。
+`correct`、`history shuffled`、`history reversed`、`history replaced`、`state reset`は同じ現在窓と
+正しいEMA future targetを共有します。`history replaced`は別clipの同じ長さのprefixからstateを
+作るため、resetに含まれる立ち上がり状態の分布差と、履歴内容の寄与を切り分けられます。
 `unrelated target`だけはpredictionを固定し、比較先を別clipの同じonline stepへ交換します。
 
 | 条件 | 変更するもの | 主に確認すること |
 |---|---|---|
 | correct | なし | 基準となる未来予測 |
 | history shuffled | 現在窓を固定し、過去prefixだけ並べ替え | 時系列順序を利用しているか |
+| history reversed | 現在窓を固定し、過去prefixを完全な逆順で再生 | 動きの向き・因果順序を利用しているか |
+| history replaced | 現在窓を固定し、同じ長さの過去prefixだけ別clipへ交換 | scene固有の履歴内容を利用しているか |
 | state reset | 現在窓の直前でstateを初期化 | 過去そのものを利用しているか |
 | unrelated target | predictionを固定し、比較先だけ別anchorへ交換 | 時刻・sample固有の未来を予測しているか |
 
-`correct`より各controlのcosine errorが大きければ、その差は順に「順序」「履歴」「正しい未来対応」
-が役立つ証拠になります。未学習modelでも成立する大小関係ではないため、CLIは合否を決めず、paired
+`correct`より各controlのcosine errorが大きければ、その差は「順序」「履歴内容」「stateの継続」
+「正しい未来対応」が役立つ証拠になります。未学習modelでも成立する大小関係ではないため、CLIは
+合否を決めず、paired
 penaltyと固定位置centered effective rankを記録します。error heatmapはpanelごとのmin-maxを行わず、
 常にtoken LayerNorm後のcosine error `[0, 2]`を共通scaleで描画します。collapse表はraw latentと
 token LayerNorm後を分け、さらに同じonline stepのclip同士でstd/rankを計算します。これにより、

@@ -10,6 +10,7 @@ from event_window_jepa.evaluation.future_feature_visualization import (
     fit_shared_target_pca,
     fixed_support_latent_diagnostics,
     make_history_permutation,
+    make_history_replacement_clip_permutation,
     make_unrelated_clip_permutation,
     make_unrelated_record_permutation,
     pca_patch_rgb,
@@ -185,6 +186,23 @@ def test_history_and_unrelated_permutations_are_deterministic_derangements() -> 
     assert first != tuple(range(6))
     assert sorted(unrelated) == list(range(8))
     assert all(source != target for source, target in enumerate(unrelated))
+
+
+def test_history_replacement_avoids_duplicate_clip_anchors() -> None:
+    identities = (
+        ("sequence-a", (10, 20, 30)),
+        ("sequence-a", (10, 20, 30)),
+        ("sequence-b", (10, 20, 30)),
+        ("sequence-c", (40, 50, 60)),
+    )
+
+    permutation = make_history_replacement_clip_permutation(identities, seed=0)
+
+    assert sorted(permutation) == list(range(len(identities)))
+    assert all(
+        identities[source] != identities[target]
+        for source, target in enumerate(permutation)
+    )
 
 
 def test_unrelated_records_keep_online_step_and_change_clip() -> None:
