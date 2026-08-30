@@ -222,11 +222,11 @@ world size・batch・precisionで厳密resumeできます。`attempt_step`は処
 `global_step`は成功したoptimizer更新数として区別します。FP32経路はautocastなしで従来どおり
 動作します。
 
-runnerは再開用の`checkpoint-latest.pt`を毎epoch更新し、下流評価による重み選択用に
-`checkpoint-epoch0005.pt`, `checkpoint-epoch0010.pt`, ...を既定5 epoch間隔で保持します。
-最終epochも必ずnamed checkpointとして残します。間隔は`--keep-every-epochs N`で変更できます。
-named checkpointはoptimizer・EMA target・GradScalerも含む完全checkpointなので、保存容量を
-事前に確認してください。
+runnerは再開用の`checkpoint-latest.pt`を指定intervalで更新します。既定ではnamed checkpointを
+残さないため、下流評価で比較するepochは学習開始時に
+`--milestone-epochs 10 25 50 75 100`のように明示します。これにより
+`checkpoint-epoch0010.pt`などが保存されます。named checkpointはoptimizer・EMA target・
+GradScalerも含む完全checkpointなので、保存容量を事前に確認してください。
 
 feedforwardの時系列設定例は
 [sequence_r0_feedforward_vits_gen1.yaml](configs/pretrain/sequence_r0_feedforward_vits_gen1.yaml)

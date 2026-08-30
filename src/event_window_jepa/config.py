@@ -630,6 +630,7 @@ class OptimizationConfig:
             "recurrent_window_jepa",
             "recurrent_dense_window_jepa",
             "recurrent_future_jepa",
+            "frame_future_jepa",
             "feature_consistency",
         }:
             raise ValueError(
@@ -796,6 +797,7 @@ class ExperimentConfig:
             "recurrent_window_jepa",
             "recurrent_dense_window_jepa",
             "recurrent_future_jepa",
+            "frame_future_jepa",
         }:
             if self.optimization.covariance_weight:
                 raise ValueError("covariance_weight is only used by feature_consistency")
@@ -839,6 +841,7 @@ class ExperimentConfig:
         sequence_objectives = {
             "sequence_window_jepa",
             "sequence_dense_window_jepa",
+            "frame_future_jepa",
         }
         recurrent_objectives = {
             "recurrent_window_jepa",
@@ -851,7 +854,10 @@ class ExperimentConfig:
             "feature_consistency",
         }
         objective = self.optimization.objective
-        is_future_objective = objective == "recurrent_future_jepa"
+        is_future_objective = objective in {
+            "frame_future_jepa",
+            "recurrent_future_jepa",
+        }
         is_sequence_objective = objective in sequence_objectives
         is_recurrent_objective = self.optimization.objective in recurrent_objectives
         if objective in paired_objectives and self.recurrent.sequence_loader:
@@ -876,19 +882,27 @@ class ExperimentConfig:
             if self.model.architecture != "vjepa2_1":
                 raise ValueError("R0 recurrent pretraining requires model.architecture=vjepa2_1")
         if is_future_objective:
+            if self.model.architecture != "vjepa2_1":
+                raise ValueError("future JEPA requires model.architecture=vjepa2_1")
             if self.recurrent.prediction_horizon_steps < 1:
                 raise ValueError(
-                    "recurrent_future_jepa requires prediction_horizon_steps >= 1"
+                    "future JEPA requires prediction_horizon_steps >= 1"
                 )
-            if self.recurrent.recurrent_placement != "post_encoder":
+            if (
+                objective == "recurrent_future_jepa"
+                and self.recurrent.recurrent_placement != "post_encoder"
+            ):
                 raise ValueError(
                     "recurrent_future_jepa requires recurrent_placement=post_encoder"
                 )
             if not self.recurrent.return_patch_event_activity:
                 raise ValueError(
-                    "recurrent_future_jepa requires return_patch_event_activity=true"
+                    "future JEPA requires return_patch_event_activity=true"
                 )
-            if self.recurrent.burn_in_steps < 1:
+            if (
+                objective == "recurrent_future_jepa"
+                and self.recurrent.burn_in_steps < 1
+            ):
                 raise ValueError(
                     "recurrent_future_jepa requires at least one burn-in step"
                 )
@@ -896,8 +910,15 @@ class ExperimentConfig:
                 self.model.encoder_depth - 1,
             ):
                 raise ValueError(
-                    "recurrent_future_jepa supervises only the final frame latent; "
+                    "future JEPA supervises only the final frame latent; "
                     "model.deep_supervision_layers must contain only the final block"
+                )
+            if (
+                objective == "frame_future_jepa"
+                and self.future_prediction.temporal_sigreg_weight
+            ):
+                raise ValueError(
+                    "frame_future_jepa cannot use temporal_sigreg_weight"
                 )
             if not (
                 self.future_prediction.frame_sigreg_weight
@@ -905,7 +926,7 @@ class ExperimentConfig:
                 or self.future_prediction.allow_unregularized
             ):
                 raise ValueError(
-                    "recurrent_future_jepa requires SIGReg unless "
+                    "future JEPA requires SIGReg unless "
                     "future_prediction.allow_unregularized=true is set for an ablation"
                 )
         else:
@@ -914,11 +935,11 @@ class ExperimentConfig:
                 or self.future_prediction.temporal_sigreg_weight
             ):
                 raise ValueError(
-                    "future SIGReg weights are only used by recurrent_future_jepa"
+                    "future SIGReg weights are only used by future JEPA objectives"
                 )
             if self.recurrent.prediction_horizon_steps:
                 raise ValueError(
-                    "prediction_horizon_steps is only used by recurrent_future_jepa"
+                    "prediction_horizon_steps is only used by future JEPA objectives"
                 )
             if (
                 self.recurrent.enabled

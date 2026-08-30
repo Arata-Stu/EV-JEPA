@@ -128,8 +128,24 @@ V100 32 GB × 3向けの初期設定:
 ```bash
 torchrun --standalone --nproc-per-node=3 \
   -m event_window_jepa.train.pretrain \
-  --config configs/pretrain/recurrent_future_convlstm_vits_gen1.yaml
+  --config configs/pretrain/recurrent_future_convlstm_vits_gen1.yaml \
+  --milestone-epochs 10 25 50 75 100
 ```
+
+ConvLSTMの寄与を測るFrame-only baselineは、同じsequence clip、未来alignment、EMA teacher、
+balanced event-support loss、Frame/Support SIGRegを使い、online側だけを
+`Frame ViT → Predictor`とします。Temporal SIGRegは使いません。
+
+```bash
+torchrun --standalone --nproc-per-node=3 \
+  -m event_window_jepa.train.pretrain \
+  --config configs/pretrain/frame_future_vits_gen1.yaml \
+  --milestone-epochs 10 25 50 75 100
+```
+
+Frame-onlyでもsample matchingのためrecurrent runと同じburn-in prefixをdatasetから読みますが、
+loss対象外のprefixはencoderへ通しません。`recurrent_state_rms`とTemporal SIGReg診断は0／対象外で、
+それ以外のfuture loss・collapse診断は同じ名前で記録されます。
 
 標準設定はper-rank 8本、3 GPUで合計24本のstream laneを使うため、manifestには少なくとも
 24個の異なる`source_recording_id`が必要です。開始時に不足を検出した場合は、manifestを確認するか、

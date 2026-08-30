@@ -876,6 +876,7 @@ def _feedforward_sequence_backward(
 ) -> torch.Tensor:
     """Train independent clip frames with one DDP forward/backward operation."""
 
+    future_objective = config.optimization.objective == "frame_future_jepa"
     loss_mask = batch.get("loss_mask")
     if (
         not isinstance(loss_mask, torch.Tensor)
@@ -888,16 +889,57 @@ def _feedforward_sequence_backward(
         raise ValueError(
             "dataset supervised length differs from recurrent.sequence_length"
         )
+    if future_objective:
+        required_future = {
+            "x_future",
+            "future_dt_ms",
+            "future_t_end_us",
+            "patch_event_activity",
+            "future_patch_event_activity",
+        }
+        missing = sorted(required_future - batch.keys())
+        if missing:
+            raise ValueError(
+                f"frame future batch is missing aligned fields: {missing}"
+            )
+        timestamps = batch.get("t_end_us")
+        future_timestamps = batch["future_t_end_us"]
+        expected_delta_us = (
+            config.recurrent.prediction_horizon_steps
+            * milliseconds_to_microseconds(config.recurrent.stride_ms)
+        )
+        if (
+            not isinstance(timestamps, torch.Tensor)
+            or not isinstance(future_timestamps, torch.Tensor)
+            or future_timestamps.shape != timestamps.shape
+            or not bool(
+                (future_timestamps - timestamps == expected_delta_us).all()
+            )
+        ):
+            raise ValueError(
+                "future_t_end_us must be prediction_horizon_steps strides "
+                "after t_end_us"
+            )
     with _autocast_context(device, config.optimization.precision):
         output = model(
             x_context=batch["x"],
-            x_target=batch["x"],
+            x_target=(batch["x_future"] if future_objective else batch["x"]),
             dt_context_ms=batch["dt_ms"],
-            dt_target_ms=batch["dt_ms"],
+            dt_target_ms=(
+                batch["future_dt_ms"] if future_objective else batch["dt_ms"]
+            ),
             context_mask=batch["context_mask"],
             target_mask=batch["target_mask"],
             objective=config.optimization.objective,
             sequence_loss_mask=loss_mask,
+            context_event_activity=(
+                batch["patch_event_activity"] if future_objective else None
+            ),
+            target_event_activity=(
+                batch["future_patch_event_activity"]
+                if future_objective
+                else None
+            ),
         )
     finite_flag = torch.isfinite(output.loss).to(dtype=torch.int32)
     if world_size > 1:
@@ -1325,7 +1367,7 @@ def train(
                                 active=(
                                     f"{record['active_patch_fraction']:.2f}"
                                     if config.optimization.objective
-                                    == "recurrent_future_jepa"
+                                    in {"frame_future_jepa", "recurrent_future_jepa"}
                                     else f"{record['mask_target_active_patch_ratio']:.2f}"
                                 ),
                                 lr=f"{record['learning_rate']:.2e}",

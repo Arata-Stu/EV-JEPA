@@ -143,6 +143,47 @@ def test_future_prediction_configuration_requires_causal_post_encoder_data() -> 
     assert config.recurrent.prediction_horizon_steps == 1
     assert config.recurrent.recurrent_placement == "post_encoder"
 
+    frame_only = ExperimentConfig.from_mapping(
+        {
+            **base,
+            "recurrent": {
+                **base["recurrent"],
+                "temporal_model": "feedforward",
+                "recurrent_placement": "pre_encoder",
+            },
+            "optimization": {
+                **base["optimization"],
+                "objective": "frame_future_jepa",
+            },
+            "future_prediction": {
+                "frame_sigreg_weight": 0.02,
+                "temporal_sigreg_weight": 0.0,
+            },
+        }
+    )
+    assert frame_only.recurrent.enabled is False
+    assert frame_only.recurrent.prediction_horizon_steps == 1
+
+    with pytest.raises(ValueError, match="cannot use temporal_sigreg_weight"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "recurrent": {
+                    **base["recurrent"],
+                    "temporal_model": "feedforward",
+                    "recurrent_placement": "pre_encoder",
+                },
+                "optimization": {
+                    **base["optimization"],
+                    "objective": "frame_future_jepa",
+                },
+                "future_prediction": {
+                    "frame_sigreg_weight": 0.02,
+                    "temporal_sigreg_weight": 0.02,
+                },
+            }
+        )
+
     with pytest.raises(ValueError, match="post_encoder"):
         ExperimentConfig.from_mapping(
             {
@@ -186,7 +227,7 @@ def test_future_prediction_configuration_requires_causal_post_encoder_data() -> 
             }
         )
 
-    with pytest.raises(ValueError, match="only used by recurrent_future_jepa"):
+    with pytest.raises(ValueError, match="only used by future JEPA"):
         ExperimentConfig.from_mapping(
             {
                 **base,

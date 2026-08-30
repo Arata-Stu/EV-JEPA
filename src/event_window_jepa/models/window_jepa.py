@@ -81,6 +81,15 @@ class RecurrentFutureLatentStep:
     online_state: RecurrentState
 
 
+@dataclass(frozen=True)
+class FrameFutureLatentStep:
+    """Latents produced by one stateless frame-only future prediction step."""
+
+    frame_tokens: torch.Tensor
+    prediction: torch.Tensor
+    target_tokens: torch.Tensor
+
+
 class WindowJEPA(nn.Module):
     def __init__(
         self,
@@ -253,6 +262,22 @@ class WindowJEPA(nn.Module):
                 target_mask=target_mask,
                 online_state=online_state,
                 dense=objective == "recurrent_dense_window_jepa",
+            )
+        if objective == "frame_future_jepa":
+            if sequence_loss_mask is None:
+                raise ValueError("frame_future_jepa requires sequence_loss_mask [B,T]")
+            if context_event_activity is None or target_event_activity is None:
+                raise ValueError(
+                    "frame_future_jepa requires context and target event activity"
+                )
+            return self.frame_future_sequence(
+                x_context=x_context,
+                x_target=x_target,
+                context_duration_ms=dt_context_ms,
+                target_duration_ms=dt_target_ms,
+                context_event_activity=context_event_activity,
+                target_event_activity=target_event_activity,
+                loss_mask=sequence_loss_mask,
             )
         if objective == "recurrent_future_jepa":
             if context_event_activity is None or target_event_activity is None:
@@ -792,6 +817,294 @@ class WindowJEPA(nn.Module):
             target_duration_ms=target_duration_ms,
             online_state=online_state,
             detach_state=True,
+        )
+
+    def _frame_future_latent_step(
+        self,
+        x_context: torch.Tensor,
+        x_target: torch.Tensor,
+        context_duration_ms: torch.Tensor,
+        target_duration_ms: torch.Tensor,
+    ) -> FrameFutureLatentStep:
+        """Build one full-grid frame-only prediction and stateless EMA target."""
+
+        if isinstance(
+            self.online_encoder,
+            RecurrentVJEPA21EventVisionTransformer,
+        ) or isinstance(
+            self.target_encoder,
+            RecurrentVJEPA21EventVisionTransformer,
+        ):
+            raise ValueError("frame_future_jepa requires non-recurrent encoders")
+        if x_context.ndim != 4 or x_context.shape != x_target.shape:
+            raise ValueError("frame future inputs must share shape [B,C,H,W]")
+        batch_size = x_context.shape[0]
+        if (
+            context_duration_ms.numel() != batch_size
+            or target_duration_ms.numel() != batch_size
+        ):
+            raise ValueError("frame future durations require one value per sample")
+        context_ms = context_duration_ms.reshape(batch_size)
+        target_ms = target_duration_ms.reshape(batch_size)
+        source_scale, target_scale, ratio_scale = self._scale_features(
+            context_ms,
+            target_ms,
+        )
+        frame_tokens = self.online_encoder(x_context, source_scale, None)
+        with torch.no_grad():
+            ema_scale = self.target_scale_embedding(target_ms)
+            if not self.condition_on_scale:
+                ema_scale = torch.zeros_like(ema_scale)
+            target_tokens = self.target_encoder(x_target, ema_scale, None)
+        full_mask = torch.ones(
+            (batch_size, self.num_patches),
+            dtype=torch.bool,
+            device=x_context.device,
+        )
+        prediction = self.predictor(
+            context_tokens=frame_tokens,
+            context_keep_mask=full_mask,
+            target_mask=full_mask,
+            source_scale=source_scale,
+            target_scale=target_scale,
+            ratio_scale=ratio_scale,
+        )
+        return FrameFutureLatentStep(
+            frame_tokens=frame_tokens,
+            prediction=prediction,
+            target_tokens=target_tokens,
+        )
+
+    def frame_future_sequence(
+        self,
+        x_context: torch.Tensor,
+        x_target: torch.Tensor,
+        context_duration_ms: torch.Tensor,
+        target_duration_ms: torch.Tensor,
+        context_event_activity: torch.Tensor,
+        target_event_activity: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> WindowJEPAOutput:
+        """Predict future EMA frame latents without a recurrent temporal model."""
+
+        if isinstance(self.online_encoder, RecurrentVJEPA21EventVisionTransformer):
+            raise ValueError("frame_future_jepa requires a non-recurrent encoder")
+        if "temporal" in self.future_regularizers or self.temporal_sigreg_weight:
+            raise ValueError("frame_future_jepa cannot use temporal SIGReg")
+        if x_context.ndim != 5 or x_context.shape != x_target.shape:
+            raise ValueError("frame future inputs must share shape [B,T,C,H,W]")
+        batch_size, steps = x_context.shape[:2]
+        if steps <= 0:
+            raise ValueError("a frame future sequence requires at least one timestep")
+        if context_duration_ms.shape != (batch_size, steps) or (
+            target_duration_ms.shape != (batch_size, steps)
+        ):
+            raise ValueError("frame future durations must have shape [B,T]")
+        activity_shape = (batch_size, steps, self.num_patches)
+        if context_event_activity.shape != activity_shape or (
+            target_event_activity.shape != activity_shape
+        ):
+            raise ValueError("frame future event activity must have shape [B,T,N]")
+        if loss_mask.dtype != torch.bool or loss_mask.shape != (batch_size, steps):
+            raise ValueError("frame future loss_mask must be boolean with shape [B,T]")
+        if not bool((loss_mask == loss_mask[:1]).all()):
+            raise ValueError("all clips in a batch must share frame future loss_mask")
+        supervised_indices = torch.nonzero(
+            loss_mask[0],
+            as_tuple=False,
+        ).flatten()
+        if supervised_indices.numel() == 0:
+            raise ValueError("frame future sequence has no loss-bearing timestep")
+
+        outputs: list[WindowJEPAOutput] = []
+        for index_tensor in supervised_indices:
+            index = int(index_tensor)
+            latent_step = self._frame_future_latent_step(
+                x_context=x_context[:, index],
+                x_target=x_target[:, index],
+                context_duration_ms=context_duration_ms[:, index],
+                target_duration_ms=target_duration_ms[:, index],
+            )
+            frame_tokens = latent_step.frame_tokens
+            prediction = latent_step.prediction
+            target_tokens = latent_step.target_tokens
+            balanced = balanced_event_support_latent_prediction_loss(
+                prediction,
+                target_tokens,
+                target_event_activity[:, index],
+                active_threshold=float(self.future_active_min_events - 1),
+                kind=self.loss_kind,
+            )
+
+            zero = balanced.loss.new_zeros(())
+            frame_sigreg = zero
+            support_sigreg = zero
+            frame_samples = zero
+            support_samples = zero
+            frame_real = zero
+            frame_imaginary = zero
+            support_real = zero
+            support_imaginary = zero
+            context_activity = context_event_activity[:, index]
+            if "frame" in self.future_regularizers:
+                frame_vector, frame_valid = self._event_support_pool(
+                    frame_tokens,
+                    context_activity,
+                )
+                frame_output = self.future_regularizers["frame"](
+                    frame_vector,
+                    valid_mask=frame_valid,
+                )
+                frame_sigreg = frame_output.loss
+                frame_samples = frame_output.effective_samples
+                frame_real = frame_output.real_error
+                frame_imaginary = frame_output.imaginary_error
+                support_vector, support_valid = self._event_support_contrast(
+                    frame_tokens,
+                    context_activity,
+                )
+                support_output = self.future_regularizers["support"](
+                    support_vector,
+                    valid_mask=support_valid,
+                )
+                support_sigreg = support_output.loss
+                support_samples = support_output.effective_samples
+                support_real = support_output.real_error
+                support_imaginary = support_output.imaginary_error
+            support_available = (support_samples >= 2).to(
+                dtype=frame_sigreg.dtype
+            )
+            frame_regularization = (
+                frame_sigreg + support_sigreg
+            ) / (1.0 + support_available)
+            sigreg_loss = self.frame_sigreg_weight * frame_regularization
+            loss = balanced.loss + sigreg_loss
+            prediction_std, target_std = (
+                self._global_fixed_position_standard_deviations(
+                    prediction,
+                    target_tokens,
+                )
+            )
+            outputs.append(
+                WindowJEPAOutput(
+                    loss=loss,
+                    masked_loss=balanced.loss,
+                    canonical_loss=zero,
+                    dense_loss=balanced.loss,
+                    visible_loss=zero,
+                    deep_supervision_loss=zero,
+                    prediction=prediction,
+                    target=target_tokens,
+                    prediction_std=prediction_std,
+                    target_std=target_std,
+                    future_prediction_loss=balanced.loss,
+                    active_prediction_loss=balanced.active_loss,
+                    inactive_prediction_loss=balanced.inactive_loss,
+                    frame_sigreg_loss=frame_sigreg,
+                    support_sigreg_loss=support_sigreg,
+                    temporal_sigreg_loss=zero,
+                    sigreg_loss=sigreg_loss,
+                    active_patch_fraction=(
+                        target_event_activity[:, index]
+                        >= self.future_active_min_events
+                    ).float().mean(),
+                    context_active_patch_fraction=(
+                        context_activity >= self.future_active_min_events
+                    ).float().mean(),
+                    frame_sigreg_samples=frame_samples,
+                    support_sigreg_samples=support_samples,
+                    temporal_sigreg_samples=zero,
+                    frame_sigreg_real_error=frame_real,
+                    frame_sigreg_imaginary_error=frame_imaginary,
+                    support_sigreg_real_error=support_real,
+                    support_sigreg_imaginary_error=support_imaginary,
+                    temporal_sigreg_real_error=zero,
+                    temporal_sigreg_imaginary_error=zero,
+                    active_prediction_sum=(
+                        balanced.active_loss
+                        * balanced.active_sample_count.to(
+                            balanced.active_loss.dtype
+                        )
+                    ),
+                    active_prediction_count=(
+                        balanced.active_sample_count.float()
+                    ),
+                    inactive_prediction_sum=(
+                        balanced.inactive_loss
+                        * balanced.inactive_sample_count.to(
+                            balanced.inactive_loss.dtype
+                        )
+                    ),
+                    inactive_prediction_count=(
+                        balanced.inactive_sample_count.float()
+                    ),
+                )
+            )
+
+        prediction_sequence = torch.stack(
+            [output.prediction for output in outputs],
+            dim=1,
+        )
+        target_sequence = torch.stack(
+            [output.target for output in outputs],
+            dim=1,
+        )
+
+        def mean(name: str) -> torch.Tensor:
+            values = [getattr(output, name) for output in outputs]
+            if any(value is None for value in values):
+                raise RuntimeError(f"frame future objective metric {name} is missing")
+            return torch.stack(values).mean()  # type: ignore[arg-type]
+
+        active_sum = mean("active_prediction_sum")
+        active_count = mean("active_prediction_count")
+        inactive_sum = mean("inactive_prediction_sum")
+        inactive_count = mean("inactive_prediction_count")
+        return WindowJEPAOutput(
+            loss=mean("loss"),
+            masked_loss=mean("masked_loss"),
+            canonical_loss=mean("canonical_loss"),
+            dense_loss=mean("dense_loss"),
+            visible_loss=mean("visible_loss"),
+            deep_supervision_loss=mean("deep_supervision_loss"),
+            prediction=prediction_sequence.flatten(0, 1),
+            target=target_sequence.flatten(0, 1),
+            prediction_std=mean("prediction_std"),
+            target_std=mean("target_std"),
+            prediction_sequence=prediction_sequence,
+            target_sequence=target_sequence,
+            future_prediction_loss=mean("future_prediction_loss"),
+            active_prediction_loss=active_sum / active_count.clamp_min(1.0),
+            inactive_prediction_loss=(
+                inactive_sum / inactive_count.clamp_min(1.0)
+            ),
+            frame_sigreg_loss=mean("frame_sigreg_loss"),
+            support_sigreg_loss=mean("support_sigreg_loss"),
+            temporal_sigreg_loss=mean("temporal_sigreg_loss"),
+            sigreg_loss=mean("sigreg_loss"),
+            active_patch_fraction=mean("active_patch_fraction"),
+            context_active_patch_fraction=mean(
+                "context_active_patch_fraction"
+            ),
+            frame_sigreg_samples=mean("frame_sigreg_samples"),
+            support_sigreg_samples=mean("support_sigreg_samples"),
+            temporal_sigreg_samples=mean("temporal_sigreg_samples"),
+            frame_sigreg_real_error=mean("frame_sigreg_real_error"),
+            frame_sigreg_imaginary_error=mean(
+                "frame_sigreg_imaginary_error"
+            ),
+            support_sigreg_real_error=mean("support_sigreg_real_error"),
+            support_sigreg_imaginary_error=mean(
+                "support_sigreg_imaginary_error"
+            ),
+            temporal_sigreg_real_error=mean("temporal_sigreg_real_error"),
+            temporal_sigreg_imaginary_error=mean(
+                "temporal_sigreg_imaginary_error"
+            ),
+            active_prediction_sum=active_sum,
+            active_prediction_count=active_count,
+            inactive_prediction_sum=inactive_sum,
+            inactive_prediction_count=inactive_count,
         )
 
     def recurrent_future_sequence(
