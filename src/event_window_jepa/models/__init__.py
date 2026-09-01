@@ -1,3 +1,4 @@
+from event_window_jepa.models.cmax_flow import RecurrentTokenFlowHead
 from event_window_jepa.models.event_vit import EventVisionTransformer
 from event_window_jepa.models.recurrent_vjepa21_event_vit import (
     ConvGRUCell,
@@ -15,6 +16,7 @@ from event_window_jepa.models.window_jepa import WindowJEPA, WindowJEPAOutput
 from event_window_jepa.models.window_predictor import WindowPredictor
 
 __all__ = [
+    "RecurrentTokenFlowHead",
     "EventVisionTransformer",
     "ConvGRUCell",
     "ConvLSTMCell",

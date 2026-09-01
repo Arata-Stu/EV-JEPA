@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 import torch
@@ -7,6 +8,8 @@ import torch.distributed as distributed
 import torch.nn.functional as functional
 from torch import nn
 
+from event_window_jepa.data.packed_events import PackedEventBatch
+from event_window_jepa.losses.cmax import TamingCMaxLoss
 from event_window_jepa.losses.latent_prediction import (
     balanced_event_support_latent_prediction_loss,
     latent_prediction_loss,
@@ -19,6 +22,7 @@ from event_window_jepa.losses.variance_regularization import (
     masked_position_variance_regularization,
     variance_regularization,
 )
+from event_window_jepa.models.cmax_flow import RecurrentTokenFlowHead
 from event_window_jepa.models.ema_encoder import make_ema_copy, update_ema
 from event_window_jepa.models.event_vit import EventVisionTransformer
 from event_window_jepa.models.recurrent_vjepa21_event_vit import (
@@ -68,6 +72,18 @@ class WindowJEPAOutput:
     active_prediction_count: torch.Tensor | None = None
     inactive_prediction_sum: torch.Tensor | None = None
     inactive_prediction_count: torch.Tensor | None = None
+    cmax_loss: torch.Tensor | None = None
+    cmax_focus_loss: torch.Tensor | None = None
+    cmax_forward_loss: torch.Tensor | None = None
+    cmax_backward_loss: torch.Tensor | None = None
+    cmax_smoothness_loss: torch.Tensor | None = None
+    cmax_weighted_loss: torch.Tensor | None = None
+    cmax_valid_event_count: torch.Tensor | None = None
+    cmax_valid_partition_count: torch.Tensor | None = None
+    cmax_valid_window_fraction: torch.Tensor | None = None
+    cmax_mean_flow_magnitude: torch.Tensor | None = None
+    cmax_occupied_pixel_fraction: torch.Tensor | None = None
+    cmax_flow_saturation_fraction: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +131,15 @@ class WindowJEPA(nn.Module):
         sigreg_t_max: float = 3.0,
         sigreg_num_points: int = 17,
         sigreg_projection_seed: int = 0,
+        cmax_weight: float = 0.0,
+        cmax_smoothness_weight: float = 0.0,
+        cmax_flow_hidden_dim: int = 256,
+        cmax_flow_head_depth: int = 2,
+        cmax_reference_mode: str = "both",
+        cmax_temporal_scales: tuple[int, ...] = (1, 2, 4),
+        cmax_min_events: int = 128,
+        cmax_flow_scale: float = 0.01,
+        cmax_max_displacement: float = 32.0,
     ) -> None:
         super().__init__()
         if predictor.num_patches != encoder.num_patches:
@@ -135,6 +160,10 @@ class WindowJEPA(nn.Module):
             raise ValueError("future_activity_floor must lie inside (0, 1]")
         if frame_sigreg_weight < 0 or temporal_sigreg_weight < 0:
             raise ValueError("future SIGReg weights cannot be negative")
+        if not math.isfinite(cmax_weight) or cmax_weight < 0:
+            raise ValueError("CMax weight must be finite and non-negative")
+        if not cmax_weight and cmax_smoothness_weight:
+            raise ValueError("CMax smoothness requires a positive CMax weight")
         self.online_encoder = encoder
         self.target_encoder = make_ema_copy(encoder)
         self.predictor = predictor
@@ -179,6 +208,25 @@ class WindowJEPA(nn.Module):
                 maximum_frequency=sigreg_t_max,
                 seed=sigreg_projection_seed + 10_000,
             )
+        self.cmax_weight = float(cmax_weight)
+        self.cmax_flow_head: RecurrentTokenFlowHead | None = None
+        self.cmax_criterion: TamingCMaxLoss | None = None
+        if self.cmax_weight:
+            if not isinstance(encoder, RecurrentVJEPA21EventVisionTransformer):
+                raise ValueError("CMax requires a recurrent V-JEPA encoder")
+            self.cmax_flow_head = RecurrentTokenFlowHead(
+                encoder.embed_dim,
+                hidden_dim=cmax_flow_hidden_dim,
+                head_depth=cmax_flow_head_depth,
+                flow_scale=cmax_flow_scale,
+                max_displacement=cmax_max_displacement,
+            )
+            self.cmax_criterion = TamingCMaxLoss(
+                smoothness_weight=cmax_smoothness_weight,
+                reference_mode=cmax_reference_mode,
+                temporal_scales=cmax_temporal_scales,
+                min_events=cmax_min_events,
+            )
 
     @property
     def num_patches(self) -> int:
@@ -193,7 +241,10 @@ class WindowJEPA(nn.Module):
     def auxiliary_state_dict(self) -> dict[str, dict[str, torch.Tensor]]:
         """Return trainable future-objective state omitted by legacy checkpoints."""
 
-        return {"future_regularizers": self.future_regularizers.state_dict()}
+        state = {"future_regularizers": self.future_regularizers.state_dict()}
+        if self.cmax_flow_head is not None:
+            state["cmax_flow_head"] = self.cmax_flow_head.state_dict()
+        return state
 
     def load_auxiliary_state_dict(
         self,
@@ -208,10 +259,26 @@ class WindowJEPA(nn.Module):
                 raise ValueError(
                     "checkpoint is missing future SIGReg projector state"
                 )
-            return
-        if not isinstance(saved, dict):
-            raise TypeError("future_regularizers checkpoint state must be a mapping")
-        self.future_regularizers.load_state_dict(saved, strict=strict)
+        else:
+            if not isinstance(saved, dict):
+                raise TypeError("future_regularizers checkpoint state must be a mapping")
+            self.future_regularizers.load_state_dict(saved, strict=strict)
+
+        expected_cmax = self.cmax_flow_head is not None
+        saved_cmax = state.get("cmax_flow_head") if isinstance(state, dict) else None
+        if saved_cmax is None:
+            if strict and expected_cmax:
+                raise ValueError("checkpoint is missing the CMax flow head state")
+        else:
+            if not expected_cmax:
+                if strict:
+                    raise ValueError(
+                        "checkpoint contains a CMax flow head but the model disables CMax"
+                    )
+            elif not isinstance(saved_cmax, dict):
+                raise TypeError("cmax_flow_head checkpoint state must be a mapping")
+            else:
+                self.cmax_flow_head.load_state_dict(saved_cmax, strict=strict)
 
     def _scale_features(
         self, context_ms: torch.Tensor, target_ms: torch.Tensor
@@ -238,7 +305,12 @@ class WindowJEPA(nn.Module):
         sequence_loss_mask: torch.Tensor | None = None,
         context_event_activity: torch.Tensor | None = None,
         target_event_activity: torch.Tensor | None = None,
+        packed_events: PackedEventBatch | None = None,
     ) -> WindowJEPAOutput:
+        if packed_events is not None and objective != "recurrent_future_jepa":
+            raise ValueError(
+                "packed raw events are only consumed by recurrent_future_jepa"
+            )
         if objective in {"sequence_window_jepa", "sequence_dense_window_jepa"}:
             if sequence_loss_mask is None:
                 raise ValueError("sequence objectives require sequence_loss_mask [B,T]")
@@ -292,6 +364,7 @@ class WindowJEPA(nn.Module):
                 context_event_activity=context_event_activity,
                 target_event_activity=target_event_activity,
                 online_state=online_state,
+                packed_events=packed_events,
             )
         if objective == "feature_consistency":
             return self.feature_consistency(
@@ -1116,6 +1189,7 @@ class WindowJEPA(nn.Module):
         context_event_activity: torch.Tensor,
         target_event_activity: torch.Tensor,
         online_state: RecurrentState | None,
+        packed_events: PackedEventBatch | None = None,
     ) -> WindowJEPAOutput:
         """Predict full future EMA frame latents from causal post-ViT memory.
 
@@ -1143,9 +1217,26 @@ class WindowJEPA(nn.Module):
             target_event_activity.shape != activity_shape
         ):
             raise ValueError("future event activity must have shape [B,T,N]")
+        cmax_enabled = self.cmax_flow_head is not None
+        if cmax_enabled != (self.cmax_criterion is not None):
+            raise RuntimeError("CMax flow head and criterion must be enabled together")
+        if cmax_enabled and packed_events is None:
+            raise ValueError("CMax requires packed raw events for every recurrent chunk")
+        if not cmax_enabled and packed_events is not None:
+            raise ValueError("packed raw events were provided while CMax is disabled")
+        if packed_events is not None and (
+            packed_events.batch_size != batch_size
+            or packed_events.time_steps != steps
+            or (packed_events.height, packed_events.width)
+            != tuple(x_context.shape[-2:])
+        ):
+            raise ValueError(
+                "packed raw events do not match the recurrent chunk geometry"
+            )
 
         state = online_state
         outputs: list[WindowJEPAOutput] = []
+        cmax_flow_maps: list[torch.Tensor] = []
         for index in range(steps):
             previous_state = state
             latent_step = self._recurrent_future_latent_step(
@@ -1161,6 +1252,13 @@ class WindowJEPA(nn.Module):
             prediction = latent_step.prediction
             target_tokens = latent_step.target_tokens
             state = latent_step.online_state
+            if self.cmax_flow_head is not None:
+                cmax_flow_maps.append(
+                    self.cmax_flow_head(
+                        recurrent_tokens,
+                        online_encoder.grid_size,
+                    )
+                )
             balanced = balanced_event_support_latent_prediction_loss(
                 prediction,
                 target_tokens,
@@ -1303,9 +1401,45 @@ class WindowJEPA(nn.Module):
         active_count = mean("active_prediction_count")
         inactive_sum = mean("inactive_prediction_sum")
         inactive_count = mean("inactive_prediction_count")
+        base_loss = mean("loss")
+        cmax_zero = base_loss.new_zeros((), dtype=torch.float32)
+        cmax_loss = cmax_zero
+        cmax_focus = cmax_zero
+        cmax_forward = cmax_zero
+        cmax_backward = cmax_zero
+        cmax_smoothness = cmax_zero
+        cmax_weighted = cmax_zero
+        cmax_valid_events = cmax_zero
+        cmax_valid_partitions = cmax_zero
+        cmax_valid_window_fraction = cmax_zero
+        cmax_mean_flow = cmax_zero
+        cmax_occupied_fraction = cmax_zero
+        cmax_saturation_fraction = cmax_zero
+        if self.cmax_flow_head is not None:
+            if self.cmax_criterion is None or packed_events is None:
+                raise RuntimeError("enabled CMax modules require packed raw events")
+            if len(cmax_flow_maps) != steps:
+                raise RuntimeError("CMax flow sequence is incomplete")
+            flow_sequence = torch.stack(cmax_flow_maps, dim=1)
+            cmax_output = self.cmax_criterion(flow_sequence, packed_events)
+            cmax_loss = cmax_output.loss
+            cmax_focus = cmax_output.focus_loss
+            cmax_forward = cmax_output.forward_focus_loss
+            cmax_backward = cmax_output.backward_focus_loss
+            cmax_smoothness = cmax_output.smoothness_loss
+            cmax_weighted = self.cmax_weight * cmax_loss
+            cmax_valid_events = cmax_output.valid_event_count
+            cmax_valid_partitions = cmax_output.valid_partition_count
+            cmax_valid_window_fraction = cmax_output.valid_window_fraction
+            cmax_mean_flow = cmax_output.mean_flow_magnitude
+            cmax_occupied_fraction = cmax_output.occupied_pixel_fraction
+            cmax_saturation_fraction = (
+                flow_sequence.detach().float().abs().amax(dim=2)
+                >= 0.95 * self.cmax_flow_head.max_displacement
+            ).float().mean()
 
         return WindowJEPAOutput(
-            loss=mean("loss"),
+            loss=base_loss + cmax_weighted,
             masked_loss=mean("masked_loss"),
             canonical_loss=mean("canonical_loss"),
             dense_loss=mean("dense_loss"),
@@ -1348,6 +1482,18 @@ class WindowJEPA(nn.Module):
             active_prediction_count=active_count,
             inactive_prediction_sum=inactive_sum,
             inactive_prediction_count=inactive_count,
+            cmax_loss=cmax_loss,
+            cmax_focus_loss=cmax_focus,
+            cmax_forward_loss=cmax_forward,
+            cmax_backward_loss=cmax_backward,
+            cmax_smoothness_loss=cmax_smoothness,
+            cmax_weighted_loss=cmax_weighted,
+            cmax_valid_event_count=cmax_valid_events,
+            cmax_valid_partition_count=cmax_valid_partitions,
+            cmax_valid_window_fraction=cmax_valid_window_fraction,
+            cmax_mean_flow_magnitude=cmax_mean_flow,
+            cmax_occupied_pixel_fraction=cmax_occupied_fraction,
+            cmax_flow_saturation_fraction=cmax_saturation_fraction,
         )
 
     def _recurrent_step(

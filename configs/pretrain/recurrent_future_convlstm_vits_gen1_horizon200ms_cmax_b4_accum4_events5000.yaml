@@ -1,0 +1,124 @@
+data:
+  manifest: /home/iASL/Arata_repo/dataset/gen1_304x240/manifests/train.jsonl
+  store: hdf5
+  split: train
+  samples_per_epoch: 6250
+  # Physical microbatch per rank. With 3 GPUs and accumulation=4, the
+  # optimizer-effective global batch is 4 * 4 * 3 = 48.
+  batch_size: 4
+  workers: 4
+  sequence_sampling: sequence_balanced
+  crop_size: [240, 304]
+  horizontal_flip_probability: 0.5
+
+representation:
+  type: voxel_grid
+  temporal_bins: 5
+  split_polarity: true
+  normalization: log1p
+
+# Keep the established 200 ms latent-prediction comparison fixed: one 50 ms
+# online window predicts the EMA window whose end timestamp is four strides later.
+windows:
+  train_ms: [50]
+  eval_ms: [25, 50, 75, 100]
+  unseen_eval_ms: [25, 75, 100]
+  target_ms: [50]
+  canonical_ms: 50
+  minimum_ratio: 1.0
+  direction: any
+  allow_equal: true
+
+model:
+  architecture: vjepa2_1
+  image_size: [240, 304]
+  patch_size: 16
+  embed_dim: 384
+  encoder_depth: 12
+  encoder_heads: 6
+  deep_supervision_layers: [11]
+  predictor_dim: 256
+  predictor_depth: 4
+  predictor_heads: 8
+  scale_dim: 128
+  scale_fourier_bands: 16
+  condition_on_scale: true
+
+recurrent:
+  sequence_loader: true
+  temporal_model: conv_lstm
+  return_patch_event_activity: true
+  recurrent_placement: post_encoder
+  prediction_horizon_steps: 4
+  kernel_size: 3
+  sampling: mixed
+  stream_ratio: 0.5
+  window_ms: 50
+  stride_ms: 50
+  sequence_length: 8
+  burn_in_steps: 2
+  tbptt_steps: 8
+
+mask:
+  target_blocks: 4
+  target_area_range: [0.15, 0.25]
+  target_aspect_range: [0.5, 2.0]
+  context_keep_ratio: 0.60
+  activity_aware_probability: 0.0
+  activity_candidates: 32
+  minimum_active_target_ratio: 0.25
+
+future_prediction:
+  active_min_events: 1
+  activity_floor: 0.01
+  frame_sigreg_weight: 0.02
+  temporal_sigreg_weight: 0.0
+  projector_hidden_dim: 512
+  projector_output_dim: 256
+  sigreg_num_slices: 256
+  sigreg_t_max: 3.0
+  sigreg_num_points: 17
+  projection_seed: 17
+
+# Auxiliary raw-event motion supervision. temporal_scales are equal partition
+# counts over the eight supervised windows: 1x8, 2x4, and 4x2 windows.
+cmax:
+  enabled: true
+  weight: 0.05
+  smoothness_weight: 0.001
+  hidden_dim: 256
+  head_depth: 2
+  reference_mode: both
+  temporal_scales: [1, 2, 4]
+  min_events: 128
+  # Per rank and physical microbatch, the supervised CMax graph is bounded by
+  # 4 samples * 8 windows * 5,000 events = 160,000 events.
+  max_events_per_window: 5000
+  # u = max_displacement * tanh(flow_scale * raw_logits).
+  flow_scale: 0.01
+  max_displacement: 32.0
+
+optimization:
+  objective: recurrent_future_jepa
+  epochs: 100
+  learning_rate: 0.0003
+  minimum_learning_rate: 0.000001
+  warmup_epochs: 10
+  weight_decay: 0.05
+  target_ema_start: 0.996
+  target_ema_end: 0.9999
+  precision: fp16
+  gradient_clip: 1.0
+  # Three GPUs: optimizer-effective global batch = 4 * 4 * 3 = 48. SIGReg
+  # remains a nonlinear per-microbatch statistic with concurrent global B=12.
+  gradient_accumulation_steps: 4
+  variance_weight: 0.0
+  covariance_weight: 0.0
+  canonical_query_weight: 0.0
+
+runtime:
+  seed: 0
+  output_dir: outputs/pretrain/recurrent_future_convlstm_vits_gen1_horizon200ms_cmax_b4_accum4_events5000_seed0
+  log_every_steps: 20
+  checkpoint_every_epochs: 1
+  resume: null

@@ -10,11 +10,14 @@
 \mathcal L
 =\mathcal L_{\mathrm{future}}
 +\lambda_f\mathcal L_{\mathrm{frame/support\ SIGReg}}
-+\lambda_h\mathcal L_{\mathrm{temporal\ SIGReg}}.
++\lambda_h\mathcal L_{\mathrm{temporal\ SIGReg}}
++\lambda_c\mathcal L_{\mathrm{CMax}}.
 \]
 
 ここでframe/support項は、Supportがglobalで有効な時刻にはFrameとSupportの平均、無効な
-時刻にはFrame単独です。
+時刻にはFrame単独です。CMaxは既定OFFのraw-event motion補助目的であり、SIGRegの代替では
+ありません。設計、公式Taming実装との関係、設定制約、成功判定は
+[CMax補助目的の設計と評価契約](CMAX_AUXILIARY_OBJECTIVE.md)を参照してください。
 
 既存の`recurrent_window_jepa`を置換せず、独立した
 `recurrent_future_jepa` objectiveとして追加しています。旧checkpointと旧実験の意味は

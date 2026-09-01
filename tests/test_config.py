@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from event_window_jepa.config import (
+    CMaxConfig,
     ExperimentConfig,
     FuturePredictionConfig,
     MaskConfig,
@@ -10,6 +13,7 @@ from event_window_jepa.config import (
     RecurrentConfig,
     WindowsConfig,
 )
+from event_window_jepa.train.checkpoint import config_hash
 
 
 def test_unseen_windows_exclude_context_and_target_training_durations() -> None:
@@ -83,17 +87,8 @@ def test_recurrent_config_validates_bptt_geometry() -> None:
         RecurrentConfig(sequence_length=2, tbptt_steps=3)
 
 
-def test_future_prediction_configuration_requires_causal_post_encoder_data() -> None:
-    future = FuturePredictionConfig(
-        frame_sigreg_weight=0.02,
-        temporal_sigreg_weight=0.02,
-        sigreg_num_slices=32,
-    )
-    assert future.frame_sigreg_weight == 0.02
-    with pytest.raises(ValueError, match="projection_seed"):
-        FuturePredictionConfig(projection_seed=-1)
-
-    base = {
+def _future_recurrent_mapping() -> dict[str, object]:
+    return {
         "data": {
             "manifest": "events.jsonl",
             "batch_size": 2,
@@ -139,6 +134,19 @@ def test_future_prediction_configuration_requires_causal_post_encoder_data() -> 
         },
         "future_prediction": {"frame_sigreg_weight": 0.02},
     }
+
+
+def test_future_prediction_configuration_requires_causal_post_encoder_data() -> None:
+    future = FuturePredictionConfig(
+        frame_sigreg_weight=0.02,
+        temporal_sigreg_weight=0.02,
+        sigreg_num_slices=32,
+    )
+    assert future.frame_sigreg_weight == 0.02
+    with pytest.raises(ValueError, match="projection_seed"):
+        FuturePredictionConfig(projection_seed=-1)
+
+    base = _future_recurrent_mapping()
     config = ExperimentConfig.from_mapping(base)
     assert config.recurrent.prediction_horizon_steps == 1
     assert config.recurrent.recurrent_placement == "post_encoder"
@@ -242,6 +250,132 @@ def test_future_prediction_configuration_requires_causal_post_encoder_data() -> 
                 },
             }
         )
+
+
+def test_cmax_configuration_is_strict_and_legacy_default_is_off() -> None:
+    configured = CMaxConfig.from_mapping(
+        {
+            "enabled": True,
+            "weight": 0.05,
+            "smoothness_weight": 0.001,
+            "hidden_dim": 256,
+            "head_depth": 2,
+            "reference_mode": "both",
+            "temporal_scales": [1, 2, 4],
+            "min_events": 128,
+            "max_events_per_window": 10_000,
+            "flow_scale": 0.01,
+            "max_displacement": 32.0,
+        }
+    )
+    assert configured.enabled
+    assert configured.temporal_scales == (1, 2, 4)
+    assert configured.max_events_per_window == 10_000
+
+    base = _future_recurrent_mapping()
+    legacy = ExperimentConfig.from_mapping(base)
+    explicit_default = ExperimentConfig.from_mapping({**base, "cmax": {}})
+    assert legacy.cmax == CMaxConfig()
+    assert legacy.to_dict() == explicit_default.to_dict()
+    assert config_hash(legacy) == config_hash(explicit_default)
+
+    with pytest.raises(ValueError, match="positive cmax.weight"):
+        CMaxConfig(enabled=True)
+    with pytest.raises(ValueError, match="disabled cmax"):
+        CMaxConfig(weight=0.1)
+    with pytest.raises(ValueError, match="past, future, or both"):
+        CMaxConfig(reference_mode="middle")
+    with pytest.raises(ValueError, match="strictly increasing"):
+        CMaxConfig(temporal_scales=(1, 4, 2))
+    with pytest.raises(TypeError, match="only integers"):
+        CMaxConfig.from_mapping({"temporal_scales": [1, 2.0]})
+    with pytest.raises(ValueError, match="at least cmax.min_events"):
+        CMaxConfig(min_events=128, max_events_per_window=127)
+    with pytest.raises(ValueError, match="finite"):
+        CMaxConfig(flow_scale=float("inf"))
+
+
+def test_cmax_requires_future_recurrence_and_exact_temporal_partitions() -> None:
+    base = _future_recurrent_mapping()
+    cmax = {
+        "enabled": True,
+        "weight": 0.05,
+        "temporal_scales": [1, 2],
+    }
+    configured = ExperimentConfig.from_mapping({**base, "cmax": cmax})
+    assert configured.cmax.enabled
+    assert configured.optimization.objective == "recurrent_future_jepa"
+    assert configured.recurrent.recurrent_placement == "post_encoder"
+
+    with pytest.raises(ValueError, match="objective=recurrent_future_jepa"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "optimization": {
+                    **base["optimization"],
+                    "objective": "recurrent_window_jepa",
+                },
+                "cmax": cmax,
+            }
+        )
+    with pytest.raises(ValueError, match="recurrent_placement=post_encoder"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "recurrent": {
+                    **base["recurrent"],
+                    "recurrent_placement": "pre_encoder",
+                },
+                "cmax": cmax,
+            }
+        )
+    with pytest.raises(ValueError, match="tbptt_steps == sequence_length"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "recurrent": {
+                    **base["recurrent"],
+                    "sampling": "clip",
+                    "tbptt_steps": 1,
+                },
+                "cmax": cmax,
+            }
+        )
+    with pytest.raises(ValueError, match="stride_ms == recurrent.window_ms"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "recurrent": {
+                    **base["recurrent"],
+                    "stride_ms": 25,
+                },
+                "cmax": cmax,
+            }
+        )
+    with pytest.raises(ValueError, match="divide recurrent.sequence_length"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "cmax": {**cmax, "temporal_scales": [1, 3]},
+            }
+        )
+
+
+def test_gen1_cmax_yaml_keeps_the_200ms_future_baseline() -> None:
+    path = (
+        Path(__file__).parents[1]
+        / "configs"
+        / "pretrain"
+        / "recurrent_future_convlstm_vits_gen1_horizon200ms_cmax.yaml"
+    )
+    config = ExperimentConfig.from_yaml(path)
+
+    assert config.cmax.enabled
+    assert config.cmax.temporal_scales == (1, 2, 4)
+    assert config.cmax.max_events_per_window == 1024
+    assert config.recurrent.window_ms == 50
+    assert config.recurrent.prediction_horizon_steps == 4
+    assert config.future_prediction.temporal_sigreg_weight == 0.0
 
 
 def test_temporal_loader_and_model_switches_resolve_legacy_and_explicit_forms() -> None:

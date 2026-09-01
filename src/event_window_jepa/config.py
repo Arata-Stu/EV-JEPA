@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -45,6 +46,17 @@ def _tuple_of_nonnegative_ints(value: Any, name: str) -> tuple[int, ...]:
         raise ValueError(f"{name} cannot contain negative block indices")
     if len(result) != len(set(result)):
         raise ValueError(f"{name} cannot contain duplicate block indices")
+    return result
+
+
+def _tuple_of_positive_ints(value: Any, name: str) -> tuple[int, ...]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{name} must be a non-empty list of positive integers")
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        raise TypeError(f"{name} must contain only integers")
+    result = tuple(value)
+    if any(item <= 0 for item in result):
+        raise ValueError(f"{name} must contain only positive integers")
     return result
 
 
@@ -580,6 +592,7 @@ class OptimizationConfig:
     target_ema_end: float = 1.0
     precision: str = "bf16"
     gradient_clip: float = 1.0
+    gradient_accumulation_steps: int = 1
     variance_weight: float = 0.0
     covariance_weight: float = 0.0
     canonical_query_weight: float = 0.0
@@ -599,12 +612,20 @@ class OptimizationConfig:
                 "target_ema_end",
                 "precision",
                 "gradient_clip",
+                "gradient_accumulation_steps",
                 "variance_weight",
                 "covariance_weight",
                 "canonical_query_weight",
             },
             "optimization",
         )
+        gradient_accumulation_steps = values.get("gradient_accumulation_steps", 1)
+        if isinstance(gradient_accumulation_steps, bool) or not isinstance(
+            gradient_accumulation_steps, int
+        ):
+            raise TypeError(
+                "optimization.gradient_accumulation_steps must be an integer"
+            )
         return cls(
             objective=str(values.get("objective", "window_jepa")),
             epochs=int(values.get("epochs", 100)),
@@ -616,6 +637,7 @@ class OptimizationConfig:
             target_ema_end=float(values.get("target_ema_end", 1.0)),
             precision=str(values.get("precision", "bf16")),
             gradient_clip=float(values.get("gradient_clip", 1.0)),
+            gradient_accumulation_steps=gradient_accumulation_steps,
             variance_weight=float(values.get("variance_weight", 0.0)),
             covariance_weight=float(values.get("covariance_weight", 0.0)),
             canonical_query_weight=float(values.get("canonical_query_weight", 0.0)),
@@ -639,6 +661,14 @@ class OptimizationConfig:
             )
         if self.epochs <= 0 or self.warmup_epochs < 0:
             raise ValueError("epochs must be positive and warmup_epochs non-negative")
+        if (
+            isinstance(self.gradient_accumulation_steps, bool)
+            or not isinstance(self.gradient_accumulation_steps, int)
+            or self.gradient_accumulation_steps <= 0
+        ):
+            raise ValueError(
+                "optimization.gradient_accumulation_steps must be a positive integer"
+            )
         if self.learning_rate <= 0 or self.minimum_learning_rate < 0:
             raise ValueError("learning rates must be non-negative")
         if self.minimum_learning_rate > self.learning_rate:
@@ -735,6 +765,119 @@ class FuturePredictionConfig:
 
 
 @dataclass(frozen=True)
+class CMaxConfig:
+    """Optional raw-event contrast-maximization auxiliary for future JEPA.
+
+    ``temporal_scales`` stores the number of equal temporal partitions used at
+    each scale. The flow head uses ``u = max_displacement *
+    tanh(flow_scale * raw_logits)``: ``flow_scale`` controls its initial output,
+    while ``max_displacement`` is the hard bound in pixels per base event
+    window. Enabling this section is also the authoritative request for the
+    dataset to return packed raw events; a second data flag is deliberately
+    avoided.
+    """
+
+    enabled: bool = False
+    weight: float = 0.0
+    smoothness_weight: float = 0.0
+    hidden_dim: int = 256
+    head_depth: int = 2
+    reference_mode: str = "both"
+    temporal_scales: tuple[int, ...] = (1, 2, 4)
+    min_events: int = 128
+    max_events_per_window: int | None = None
+    flow_scale: float = 0.01
+    max_displacement: float = 32.0
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any]) -> CMaxConfig:
+        _reject_unknown(
+            values,
+            {
+                "enabled",
+                "weight",
+                "smoothness_weight",
+                "hidden_dim",
+                "head_depth",
+                "reference_mode",
+                "temporal_scales",
+                "min_events",
+                "max_events_per_window",
+                "flow_scale",
+                "max_displacement",
+            },
+            "cmax",
+        )
+        max_events = values.get("max_events_per_window")
+        if max_events is not None and (
+            isinstance(max_events, bool) or not isinstance(max_events, int)
+        ):
+            raise TypeError("cmax.max_events_per_window must be an integer or null")
+        return cls(
+            enabled=_boolean(values.get("enabled", False), "cmax.enabled"),
+            weight=float(values.get("weight", 0.0)),
+            smoothness_weight=float(values.get("smoothness_weight", 0.0)),
+            hidden_dim=int(values.get("hidden_dim", 256)),
+            head_depth=int(values.get("head_depth", 2)),
+            reference_mode=str(values.get("reference_mode", "both")),
+            temporal_scales=_tuple_of_positive_ints(
+                values.get("temporal_scales", [1, 2, 4]),
+                "cmax.temporal_scales",
+            ),
+            min_events=int(values.get("min_events", 128)),
+            max_events_per_window=max_events,
+            flow_scale=float(values.get("flow_scale", 0.01)),
+            max_displacement=float(values.get("max_displacement", 32.0)),
+        )
+
+    def __post_init__(self) -> None:
+        numeric = {
+            "weight": self.weight,
+            "smoothness_weight": self.smoothness_weight,
+            "flow_scale": self.flow_scale,
+            "max_displacement": self.max_displacement,
+        }
+        if any(not math.isfinite(value) for value in numeric.values()):
+            raise ValueError("cmax floating-point settings must be finite")
+        if self.weight < 0 or self.smoothness_weight < 0:
+            raise ValueError("cmax loss weights cannot be negative")
+        if self.enabled and self.weight <= 0:
+            raise ValueError("cmax.enabled=true requires a positive cmax.weight")
+        if not self.enabled and (self.weight or self.smoothness_weight):
+            raise ValueError("disabled cmax requires zero loss weights")
+        if self.hidden_dim <= 0 or self.head_depth <= 0:
+            raise ValueError("cmax flow-head dimensions must be positive")
+        if self.reference_mode not in {"past", "future", "both"}:
+            raise ValueError("cmax.reference_mode must be past, future, or both")
+        if not self.temporal_scales or any(
+            isinstance(scale, bool) or not isinstance(scale, int) or scale <= 0
+            for scale in self.temporal_scales
+        ):
+            raise ValueError(
+                "cmax.temporal_scales must contain positive integer partitions"
+            )
+        if tuple(sorted(set(self.temporal_scales))) != self.temporal_scales:
+            raise ValueError(
+                "cmax.temporal_scales must be strictly increasing and unique"
+            )
+        if self.min_events <= 0:
+            raise ValueError("cmax.min_events must be positive")
+        if self.max_events_per_window is not None and (
+            isinstance(self.max_events_per_window, bool)
+            or not isinstance(self.max_events_per_window, int)
+        ):
+            raise TypeError("cmax.max_events_per_window must be an integer or null")
+        if self.max_events_per_window is not None and (
+            self.max_events_per_window < self.min_events
+        ):
+            raise ValueError(
+                "cmax.max_events_per_window must be at least cmax.min_events"
+            )
+        if self.flow_scale <= 0 or self.max_displacement <= 0:
+            raise ValueError("cmax flow scale and maximum displacement must be positive")
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     seed: int = 0
     output_dir: str = "outputs/window_jepa"
@@ -780,6 +923,7 @@ class ExperimentConfig:
     future_prediction: FuturePredictionConfig = field(
         default_factory=FuturePredictionConfig
     )
+    cmax: CMaxConfig = field(default_factory=CMaxConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     def __post_init__(self) -> None:
@@ -860,6 +1004,41 @@ class ExperimentConfig:
         }
         is_sequence_objective = objective in sequence_objectives
         is_recurrent_objective = self.optimization.objective in recurrent_objectives
+        if self.cmax.enabled:
+            if objective != "recurrent_future_jepa":
+                raise ValueError(
+                    "cmax requires optimization.objective=recurrent_future_jepa"
+                )
+            if (
+                not self.recurrent.sequence_loader
+                or not self.recurrent.enabled
+                or self.recurrent.recurrent_placement != "post_encoder"
+            ):
+                raise ValueError(
+                    "cmax requires a recurrent sequence loader with "
+                    "recurrent_placement=post_encoder"
+                )
+            if self.recurrent.tbptt_steps != self.recurrent.sequence_length:
+                raise ValueError(
+                    "cmax requires tbptt_steps == sequence_length so every "
+                    "temporal scale sees the full supervised history"
+                )
+            if self.recurrent.stride_ms != self.recurrent.window_ms:
+                raise ValueError(
+                    "cmax requires recurrent.stride_ms == recurrent.window_ms "
+                    "for contiguous, non-overlapping base event windows"
+                )
+            incompatible_scales = tuple(
+                scale
+                for scale in self.cmax.temporal_scales
+                if self.recurrent.sequence_length % scale
+            )
+            if incompatible_scales:
+                raise ValueError(
+                    "each cmax.temporal_scales partition count must divide "
+                    "recurrent.sequence_length exactly; incompatible values: "
+                    f"{incompatible_scales}"
+                )
         if objective in paired_objectives and self.recurrent.sequence_loader:
             raise ValueError(
                 "paired objectives require recurrent.sequence_loader=false"
@@ -1016,6 +1195,7 @@ class ExperimentConfig:
                 "mask",
                 "optimization",
                 "future_prediction",
+                "cmax",
                 "runtime",
             },
             "configuration root",
@@ -1031,6 +1211,7 @@ class ExperimentConfig:
             future_prediction=FuturePredictionConfig.from_mapping(
                 values.get("future_prediction", {})
             ),
+            cmax=CMaxConfig.from_mapping(values.get("cmax", {})),
             runtime=RuntimeConfig.from_mapping(values.get("runtime", {})),
         )
 

@@ -63,6 +63,17 @@ def config_hash(config: ExperimentConfig) -> str:
         "projection_seed": 0,
     }:
         resolved.pop("future_prediction", None)
+    # CMax was added after checkpoint schema v2.  Its disabled section is
+    # operationally inert and must not change the identity of older runs.
+    # Once enabled, every CMax control remains part of the experiment hash.
+    if not resolved.get("cmax", {}).get("enabled", False):
+        resolved.pop("cmax", None)
+    # Gradient accumulation was added without bumping checkpoint schema v2.
+    # Its default is exactly the historical one-batch/one-update behavior, so
+    # omit it from the experiment identity to keep older checkpoints loadable.
+    optimization = resolved["optimization"]
+    if optimization.get("gradient_accumulation_steps", 1) == 1:
+        optimization.pop("gradient_accumulation_steps", None)
     # Keep schema-v2 checkpoints created before the optional V-JEPA 2.1
     # architecture fields loadable. Their implicit architecture is v1.
     model = resolved["model"]

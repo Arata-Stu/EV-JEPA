@@ -9,6 +9,13 @@ from event_window_jepa.data.event_store import (
     NpzEventStore,
 )
 from event_window_jepa.data.paired_window_dataset import PairedWindowDataset
+from event_window_jepa.data.packed_events import (
+    PACKED_EVENT_BATCH_KEY,
+    RAW_EVENT_WINDOWS_KEY,
+    PackedEventBatch,
+    collate_recurrent_samples,
+    pack_event_windows,
+)
 from event_window_jepa.data.recurrent_window_dataset import RecurrentWindowDataset
 from event_window_jepa.data.sequence_sampler import (
     MixedRecurrentBatchSampler,
@@ -25,7 +32,10 @@ __all__ = [
     "InMemoryEventStore",
     "MixedRecurrentBatchSampler",
     "NpzEventStore",
+    "PACKED_EVENT_BATCH_KEY",
     "PairedWindowDataset",
+    "PackedEventBatch",
+    "RAW_EVENT_WINDOWS_KEY",
     "RecurrentClipRequest",
     "RecurrentWindowDataset",
     "SequenceClip",
@@ -33,4 +43,6 @@ __all__ = [
     "UniformTimeAnchorSampler",
     "UniformSequenceClipSampler",
     "WindowPairSampler",
+    "collate_recurrent_samples",
+    "pack_event_windows",
 ]

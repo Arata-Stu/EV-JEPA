@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -14,6 +15,7 @@ from event_window_jepa.data.paired_window_dataset import (
     _masked_activity_metrics,
     _patch_event_activity,
 )
+from event_window_jepa.data.packed_events import RAW_EVENT_WINDOWS_KEY
 from event_window_jepa.data.sequence_sampler import (
     RecurrentClipRequest,
     SequenceClip,
@@ -73,6 +75,12 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
     It stores raw transformed-window event counts on the same flattened patch
     grid as ``context_mask`` and ``target_mask``.  The key is omitted when the
     option is disabled to avoid retaining an otherwise unused batch tensor.
+
+    ``return_packed_events`` is also opt-in. It retains the transformed raw
+    ``EventWindow`` objects for online timesteps only so
+    ``collate_recurrent_samples`` can concatenate variable event counts without
+    padding. ``max_events_per_window`` subsamples only this auxiliary payload;
+    representations, masks, and activity always use every transformed event.
     """
 
     def __init__(
@@ -85,12 +93,27 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
         *,
         tbptt_steps: int | None = None,
         return_patch_event_activity: bool = False,
+        return_packed_events: bool = False,
+        max_events_per_window: int | None = None,
         seed: int = 0,
     ) -> None:
         if tbptt_steps is not None and tbptt_steps <= 0:
             raise ValueError("tbptt_steps must be positive when provided")
         if not isinstance(return_patch_event_activity, bool):
             raise TypeError("return_patch_event_activity must be a boolean")
+        if not isinstance(return_packed_events, bool):
+            raise TypeError("return_packed_events must be a boolean")
+        if max_events_per_window is not None and (
+            isinstance(max_events_per_window, bool)
+            or not isinstance(max_events_per_window, int)
+        ):
+            raise TypeError("max_events_per_window must be an integer or null")
+        if max_events_per_window is not None and max_events_per_window <= 0:
+            raise ValueError("max_events_per_window must be a positive integer")
+        if max_events_per_window is not None and not return_packed_events:
+            raise ValueError(
+                "max_events_per_window requires return_packed_events=true"
+            )
         self.store = store
         self.clip_sampler = clip_sampler
         self.representation = representation
@@ -98,6 +121,8 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
         self.spatial_transform = spatial_transform
         self.tbptt_steps = tbptt_steps
         self.return_patch_event_activity = return_patch_event_activity
+        self.return_packed_events = return_packed_events
+        self.max_events_per_window = max_events_per_window
         self.seed = int(seed)
         self.epoch = 0
         self._metadata = {info.sequence_id: info for info in store.sequences()}
@@ -183,6 +208,49 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
                 f"augmentation-{augmentation_seed}"
             ),
             mask_seed=mask_seed,
+        )
+
+    def _packed_event_window(
+        self,
+        window: EventWindow,
+        *,
+        sequence_id: str,
+        step: int,
+    ) -> EventWindow:
+        """Deterministically cap only the auxiliary raw-event payload."""
+
+        limit = self.max_events_per_window
+        if limit is None or window.event_count <= limit:
+            return window
+        sequence_coordinate = int.from_bytes(
+            hashlib.blake2b(
+                sequence_id.encode("utf-8"),
+                digest_size=8,
+                person=b"event-cmax",
+            ).digest(),
+            byteorder="little",
+            signed=False,
+        )
+        sample_coordinate = sequence_coordinate ^ int(window.t_end_us)
+        subsample_seed = deterministic_seed(
+            self.seed,
+            self.epoch,
+            sample_coordinate,
+            stream=30_000 + step,
+        )
+        selected = np.asarray(
+            sorted(random.Random(subsample_seed).sample(range(window.event_count), limit)),
+            dtype=np.int64,
+        )
+        return EventWindow(
+            x=window.x[selected],
+            y=window.y[selected],
+            t_us=window.t_us[selected],
+            polarity=window.polarity[selected],
+            t_start_us=window.t_start_us,
+            t_end_us=window.t_end_us,
+            height=window.height,
+            width=window.width,
         )
 
     def _build_sample(
@@ -363,6 +431,15 @@ class RecurrentWindowDataset(Dataset[dict[str, Any]]):
                 sample["future_patch_event_activity"] = all_patch_event_activity[
                     future_slice
                 ]
+        if self.return_packed_events:
+            sample[RAW_EVENT_WINDOWS_KEY] = tuple(
+                self._packed_event_window(
+                    window,
+                    sequence_id=clip.sequence_id,
+                    step=step,
+                )
+                for step, window in enumerate(windows[online_slice])
+            )
         debug = RecurrentWindowDebugSample(
             request=request,
             clip=clip,

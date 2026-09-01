@@ -24,6 +24,11 @@ from event_window_jepa.data.anchor_sampler import (
 )
 from event_window_jepa.data.event_store import H5EventStore, NpzEventStore
 from event_window_jepa.data.paired_window_dataset import PairedWindowDataset
+from event_window_jepa.data.packed_events import (
+    PACKED_EVENT_BATCH_KEY,
+    PackedEventBatch,
+    collate_recurrent_samples,
+)
 from event_window_jepa.data.recurrent_window_dataset import RecurrentWindowDataset
 from event_window_jepa.data.sequence_sampler import (
     MixedRecurrentBatchSampler,
@@ -85,6 +90,18 @@ OUTPUT_METRIC_NAMES = (
     "active_prediction_count",
     "inactive_prediction_sum",
     "inactive_prediction_count",
+    "cmax_loss",
+    "cmax_focus_loss",
+    "cmax_forward_loss",
+    "cmax_backward_loss",
+    "cmax_smoothness_loss",
+    "cmax_weighted_loss",
+    "cmax_valid_event_count",
+    "cmax_valid_partition_count",
+    "cmax_valid_window_fraction",
+    "cmax_mean_flow_magnitude",
+    "cmax_occupied_pixel_fraction",
+    "cmax_flow_saturation_fraction",
 )
 
 
@@ -198,6 +215,15 @@ def build_model(config: ExperimentConfig) -> WindowJEPA:
         sigreg_t_max=config.future_prediction.sigreg_t_max,
         sigreg_num_points=config.future_prediction.sigreg_num_points,
         sigreg_projection_seed=config.future_prediction.projection_seed,
+        cmax_weight=config.cmax.weight if config.cmax.enabled else 0.0,
+        cmax_smoothness_weight=config.cmax.smoothness_weight,
+        cmax_flow_hidden_dim=config.cmax.hidden_dim,
+        cmax_flow_head_depth=config.cmax.head_depth,
+        cmax_reference_mode=config.cmax.reference_mode,
+        cmax_temporal_scales=config.cmax.temporal_scales,
+        cmax_min_events=config.cmax.min_events,
+        cmax_flow_scale=config.cmax.flow_scale,
+        cmax_max_displacement=config.cmax.max_displacement,
     )
     # Keep DDP's expected-gradient set exact for ablations that intentionally
     # remove a component from the objective.
@@ -279,6 +305,12 @@ def build_dataset(
             return_patch_event_activity=(
                 config.recurrent.return_patch_event_activity
             ),
+            return_packed_events=config.cmax.enabled,
+            max_events_per_window=(
+                config.cmax.max_events_per_window
+                if config.cmax.enabled
+                else None
+            ),
             seed=config.runtime.seed,
         )
 
@@ -348,7 +380,11 @@ def build_recurrent_batch_sampler(
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {
-        key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+        key: (
+            value.to(device, non_blocking=True)
+            if isinstance(value, (torch.Tensor, PackedEventBatch))
+            else value
+        )
         for key, value in batch.items()
     }
 
@@ -536,6 +572,51 @@ def _backward(loss: torch.Tensor, grad_scaler: Any | None) -> None:
         grad_scaler.scale(loss).backward()
 
 
+def _optimizer_updates_per_epoch(
+    micro_steps_per_epoch: int, gradient_accumulation_steps: int
+) -> int:
+    """Return update groups, including a correctly scaled final partial group."""
+
+    if micro_steps_per_epoch <= 0:
+        raise ValueError("micro_steps_per_epoch must be positive")
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    return (
+        micro_steps_per_epoch + gradient_accumulation_steps - 1
+    ) // gradient_accumulation_steps
+
+
+def _accumulation_group_geometry(
+    micro_step: int,
+    micro_steps_per_epoch: int,
+    gradient_accumulation_steps: int,
+) -> tuple[int, int, bool, bool]:
+    """Describe the update group containing one zero-based loader step.
+
+    The returned tuple is ``(group_index, group_size, is_first, is_last)``.
+    ``group_size`` is the actual size of the group, so an epoch-end remainder is
+    divided by its real number of microbatches instead of the configured upper
+    bound.
+    """
+
+    _optimizer_updates_per_epoch(
+        micro_steps_per_epoch, gradient_accumulation_steps
+    )
+    if not 0 <= micro_step < micro_steps_per_epoch:
+        raise ValueError("micro_step must lie inside the epoch")
+    group_index = micro_step // gradient_accumulation_steps
+    group_start = group_index * gradient_accumulation_steps
+    group_end = min(
+        group_start + gradient_accumulation_steps, micro_steps_per_epoch
+    )
+    return (
+        group_index,
+        group_end - group_start,
+        micro_step == group_start,
+        micro_step + 1 == group_end,
+    )
+
+
 def _step_optimizer(
     *,
     model: WindowJEPA | DistributedDataParallel,
@@ -643,6 +724,31 @@ def _write_tensorboard_metrics(writer: Any, record: dict[str, Any]) -> None:
             "future/temporal_sigreg_imaginary",
             record["temporal_sigreg_imaginary_error"],
         ),
+        ("cmax/loss", record["cmax_loss"]),
+        ("cmax/focus_loss", record["cmax_focus_loss"]),
+        ("cmax/forward_focus_loss", record["cmax_forward_loss"]),
+        ("cmax/backward_focus_loss", record["cmax_backward_loss"]),
+        ("cmax/spatial_smoothness_loss", record["cmax_smoothness_loss"]),
+        ("cmax/weighted_loss", record["cmax_weighted_loss"]),
+        ("cmax/to_prediction_ratio", record["cmax_to_prediction_ratio"]),
+        ("cmax/valid_event_count", record["cmax_valid_event_count"]),
+        (
+            "cmax/valid_partition_count",
+            record["cmax_valid_partition_count"],
+        ),
+        (
+            "cmax/valid_window_fraction",
+            record["cmax_valid_window_fraction"],
+        ),
+        ("cmax/mean_flow_magnitude", record["cmax_mean_flow_magnitude"]),
+        (
+            "cmax/occupied_pixel_fraction",
+            record["cmax_occupied_pixel_fraction"],
+        ),
+        (
+            "cmax/flow_saturation_fraction",
+            record["cmax_flow_saturation_fraction"],
+        ),
         ("mask/activity_aware_fraction", record["mask_activity_aware_fraction"]),
         ("mask/activity_fallback_fraction", record["mask_activity_fallback_fraction"]),
         ("mask/context_active_patch_ratio", record["mask_context_active_patch_ratio"]),
@@ -742,6 +848,7 @@ def _recurrent_backward(
     world_size: int,
     initial_state: RecurrentState | None = None,
     grad_scaler: Any | None = None,
+    loss_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, RecurrentState]:
     """Run BPTT inside a batch and return state for optional cross-batch TBPTT."""
 
@@ -778,6 +885,20 @@ def _recurrent_backward(
                 "future_t_end_us must be prediction_horizon_steps strides "
                 "after t_end_us"
             )
+    packed_events: PackedEventBatch | None = None
+    if config.cmax.enabled:
+        candidate = batch.get(PACKED_EVENT_BATCH_KEY)
+        if not isinstance(candidate, PackedEventBatch):
+            raise ValueError("CMax recurrent batches require packed raw events")
+        if (
+            candidate.batch_size != batch["x"].shape[0]
+            or candidate.time_steps != batch["x"].shape[1]
+            or (candidate.height, candidate.width) != tuple(batch["x"].shape[-2:])
+        ):
+            raise ValueError(
+                "packed raw-event geometry does not match the recurrent input batch"
+            )
+        packed_events = candidate
     first_supervised = ranges[0][0]
     state = detach_recurrent_state(initial_state)
     if first_supervised:
@@ -838,6 +959,11 @@ def _recurrent_backward(
                         if future_objective
                         else None
                     ),
+                    packed_events=(
+                        packed_events.select_time_range(start, end)
+                        if packed_events is not None
+                        else None
+                    ),
                 )
             finite_flag = torch.isfinite(output.loss).to(dtype=torch.int32)
             if world_size > 1:
@@ -846,7 +972,7 @@ def _recurrent_backward(
                 raise FloatingPointError("non-finite loss in recurrent BPTT chunk")
             chunk_steps = end - start
             weight = chunk_steps / total_supervised
-            _backward(output.loss * weight, grad_scaler)
+            _backward(output.loss * (weight * loss_scale), grad_scaler)
         state = output.online_state
         accumulated_metrics += _output_metric_tensor(output) * chunk_steps
 
@@ -873,6 +999,7 @@ def _feedforward_sequence_backward(
     device: torch.device,
     world_size: int,
     grad_scaler: Any | None = None,
+    loss_scale: float = 1.0,
 ) -> torch.Tensor:
     """Train independent clip frames with one DDP forward/backward operation."""
 
@@ -948,7 +1075,7 @@ def _feedforward_sequence_backward(
         raise FloatingPointError("non-finite loss in feedforward sequence batch")
     if output.prediction_sequence is None or output.target_sequence is None:
         raise RuntimeError("feedforward sequence objective did not retain latent sequences")
-    _backward(output.loss, grad_scaler)
+    _backward(output.loss * loss_scale, grad_scaler)
     return _output_metric_tensor(output)
 
 
@@ -977,6 +1104,10 @@ def train(
         "pin_memory": device.type == "cuda",
         "persistent_workers": False,
     }
+    if config.cmax.enabled:
+        if not isinstance(dataset, RecurrentWindowDataset):
+            raise ValueError("CMax requires a recurrent event-window dataset")
+        loader_options["collate_fn"] = collate_recurrent_samples
     if (
         config.recurrent.sequence_loader
         and config.recurrent.sampling in {"stream_reset", "stream", "mixed"}
@@ -1034,6 +1165,12 @@ def train(
 
     start_epoch = 0
     global_step = 0
+    gradient_accumulation_steps = (
+        config.optimization.gradient_accumulation_steps
+    )
+    updates_per_epoch = _optimizer_updates_per_epoch(
+        len(loader), gradient_accumulation_steps
+    )
     resume_path = resume_override or (
         Path(config.runtime.resume) if config.runtime.resume is not None else None
     )
@@ -1049,14 +1186,14 @@ def train(
             rank=rank,
             grad_scaler=grad_scaler,
         )
-        completed_attempts = start_epoch * len(loader)
+        completed_attempts = start_epoch * updates_per_epoch
         if not 0 <= global_step <= completed_attempts:
             raise ValueError(
                 "checkpoint optimizer-update count is incompatible with its epoch"
             )
 
-    total_steps = config.optimization.epochs * len(loader)
-    warmup_steps = config.optimization.warmup_epochs * len(loader)
+    total_steps = config.optimization.epochs * updates_per_epoch
+    warmup_steps = config.optimization.warmup_epochs * updates_per_epoch
     if warmup_steps >= total_steps:
         raise ValueError("warmup duration must be shorter than total training")
     metrics_path = output_dir / "train.jsonl"
@@ -1069,7 +1206,14 @@ def train(
             "[window-jepa] training ready: "
             f"device={device}, precision={config.optimization.precision}, "
             f"epochs={config.optimization.epochs}, "
-            f"steps_per_epoch={len(loader)}, trainable_parameters={trainable_parameters:,}, "
+            f"micro_steps_per_epoch={len(loader)}, "
+            f"updates_per_epoch={updates_per_epoch}, "
+            f"gradient_accumulation={gradient_accumulation_steps}, "
+            f"optimizer_effective_global_batch="
+            f"{config.data.batch_size * world_size * gradient_accumulation_steps}, "
+            f"simultaneous_global_batch={config.data.batch_size * world_size} "
+            "(SIGReg/CMax statistics), "
+            f"trainable_parameters={trainable_parameters:,}, "
             f"tensorboard={output_dir / 'tensorboard'}",
             flush=True,
         )
@@ -1097,7 +1241,7 @@ def train(
                     f", stream_per_rank=0, random_per_rank={config.data.batch_size}"
                 )
             temporal_execution = (
-                f"tbptt_chunks_per_update={chunks}, "
+                f"tbptt_chunks_per_microbatch={chunks}, "
                 if config.recurrent.enabled
                 else "independent_frame_forward=true, "
             )
@@ -1125,6 +1269,17 @@ def train(
                 f"supervised_frames_per_epoch={processed_frames}",
                 flush=True,
             )
+        if config.cmax.enabled:
+            print(
+                "[window-jepa] CMax auxiliary: "
+                f"weight={config.cmax.weight:g}, "
+                f"smoothness_weight={config.cmax.smoothness_weight:g}, "
+                f"temporal_partitions={config.cmax.temporal_scales}, "
+                f"reference={config.cmax.reference_mode}, "
+                f"max_events_per_window={config.cmax.max_events_per_window}, "
+                f"max_displacement={config.cmax.max_displacement:g}px/window",
+                flush=True,
+            )
 
     try:
         for epoch in range(start_epoch, config.optimization.epochs):
@@ -1144,9 +1299,48 @@ def train(
             )
             carried_recurrent_state: RecurrentState | None = None
             previous_stream_contract: MixedStreamContract | None = None
+            accumulated_output_metrics: torch.Tensor | None = None
+            accumulated_mask_metrics: torch.Tensor | None = None
+            accumulated_recurrent_state_rms: torch.Tensor | None = None
+            learning_rate = config.optimization.learning_rate
             try:
                 for step_in_epoch, raw_batch in enumerate(progress):
-                    attempt_step = epoch * len(loader) + step_in_epoch + 1
+                    (
+                        update_in_epoch,
+                        accumulation_group_size,
+                        is_group_start,
+                        is_group_end,
+                    ) = _accumulation_group_geometry(
+                        step_in_epoch,
+                        len(loader),
+                        gradient_accumulation_steps,
+                    )
+                    attempt_step = (
+                        epoch * updates_per_epoch + update_in_epoch + 1
+                    )
+                    micro_attempt_step = epoch * len(loader) + step_in_epoch + 1
+                    if is_group_start:
+                        learning_rate = learning_rate_at_step(
+                            global_step,
+                            total_steps,
+                            warmup_steps,
+                            config.optimization.learning_rate,
+                            config.optimization.minimum_learning_rate,
+                        )
+                        for group in optimizer.param_groups:
+                            group["lr"] = learning_rate
+                        optimizer.zero_grad(set_to_none=True)
+                        accumulated_output_metrics = torch.zeros(
+                            len(OUTPUT_METRIC_NAMES),
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        accumulated_mask_metrics = torch.zeros(
+                            7, device=device, dtype=torch.float32
+                        )
+                        accumulated_recurrent_state_rms = torch.zeros(
+                            (), device=device, dtype=torch.float32
+                        )
                     if mixed_batch_sampler is not None:
                         previous_stream_contract = _validate_mixed_recurrent_batch(
                             raw_batch,
@@ -1159,86 +1353,146 @@ def train(
                             ),
                         )
                     batch = _move_batch(raw_batch, device)
-                    learning_rate = learning_rate_at_step(
-                        global_step,
-                        total_steps,
-                        warmup_steps,
-                        config.optimization.learning_rate,
-                        config.optimization.minimum_learning_rate,
-                    )
-                    for group in optimizer.param_groups:
-                        group["lr"] = learning_rate
-                    optimizer.zero_grad(set_to_none=True)
                     recurrent_state_rms = torch.zeros((), device=device)
-                    if config.recurrent.enabled:
-                        initial_state = None
-                        if config.recurrent.sampling in {"stream", "mixed"}:
-                            reset_mask = batch.get("state_reset")
-                            if not isinstance(reset_mask, torch.Tensor):
-                                raise ValueError(
-                                    "stream-aware recurrent batches require state_reset [B]"
+                    synchronization = (
+                        model.no_sync()
+                        if isinstance(model, DistributedDataParallel)
+                        and not is_group_end
+                        else nullcontext()
+                    )
+                    # DDP no_sync suppresses only parameter-gradient reduction.
+                    # Explicit collectives inside SIGReg/CMax and finite checks
+                    # still execute on every rank for every microbatch.
+                    with synchronization:
+                        if config.recurrent.enabled:
+                            initial_state = None
+                            if config.recurrent.sampling in {"stream", "mixed"}:
+                                reset_mask = batch.get("state_reset")
+                                if not isinstance(reset_mask, torch.Tensor):
+                                    raise ValueError(
+                                        "stream-aware recurrent batches require "
+                                        "state_reset [B]"
+                                    )
+                                if carried_recurrent_state is None and not bool(
+                                    reset_mask.all()
+                                ):
+                                    raise ValueError(
+                                        "the first stream-aware batch of an epoch must "
+                                        "reset every stream and random lane"
+                                    )
+                                initial_state = reset_recurrent_state(
+                                    carried_recurrent_state,
+                                    reset_mask,
                                 )
-                            if carried_recurrent_state is None and not bool(
-                                reset_mask.all()
+                            (
+                                output_metrics,
+                                recurrent_state_rms,
+                                final_recurrent_state,
+                            ) = _recurrent_backward(
+                                model=model,
+                                core_model=core_model,
+                                batch=batch,
+                                config=config,
+                                device=device,
+                                world_size=world_size,
+                                initial_state=initial_state,
+                                grad_scaler=grad_scaler,
+                                loss_scale=1.0 / accumulation_group_size,
+                            )
+                            carried_recurrent_state = (
+                                detach_recurrent_state(final_recurrent_state)
+                                if config.recurrent.sampling in {"stream", "mixed"}
+                                else None
+                            )
+                        elif config.recurrent.sequence_loader:
+                            output_metrics = _feedforward_sequence_backward(
+                                model=model,
+                                batch=batch,
+                                config=config,
+                                device=device,
+                                world_size=world_size,
+                                grad_scaler=grad_scaler,
+                                loss_scale=1.0 / accumulation_group_size,
+                            )
+                        else:
+                            with _autocast_context(
+                                device, config.optimization.precision
                             ):
-                                raise ValueError(
-                                    "the first stream-aware batch of an epoch must reset every "
-                                    "stream and random lane"
+                                output = model(
+                                    x_context=batch["x_context"],
+                                    x_target=batch["x_target"],
+                                    dt_context_ms=batch["dt_context_ms"],
+                                    dt_target_ms=batch["dt_target_ms"],
+                                    context_mask=batch["context_mask"],
+                                    target_mask=batch["target_mask"],
+                                    objective=config.optimization.objective,
                                 )
-                            initial_state = reset_recurrent_state(
-                                carried_recurrent_state,
-                                reset_mask,
+                            finite_flag = torch.isfinite(output.loss).to(
+                                dtype=torch.int32
                             )
-                        (
-                            output_metrics,
-                            recurrent_state_rms,
-                            final_recurrent_state,
-                        ) = _recurrent_backward(
-                            model=model,
-                            core_model=core_model,
-                            batch=batch,
-                            config=config,
-                            device=device,
-                            world_size=world_size,
-                            initial_state=initial_state,
-                            grad_scaler=grad_scaler,
+                            if world_size > 1:
+                                distributed.all_reduce(
+                                    finite_flag, op=distributed.ReduceOp.MIN
+                                )
+                            if not bool(finite_flag):
+                                raise FloatingPointError(
+                                    f"non-finite loss at global step {global_step}"
+                                )
+                            _backward(
+                                output.loss / accumulation_group_size,
+                                grad_scaler,
+                            )
+                            output_metrics = _output_metric_tensor(output)
+
+                    temporal_selection = (
+                        batch["loss_mask"]
+                        if config.recurrent.sequence_loader
+                        else None
+                    )
+
+                    def mask_mean(name: str) -> torch.Tensor:
+                        values = batch[name]
+                        if temporal_selection is not None:
+                            values = values.masked_select(temporal_selection)
+                        return values.mean().detach().float()
+
+                    mask_metrics = torch.stack(
+                        [
+                            mask_mean("mask_activity_aware"),
+                            mask_mean("mask_activity_fallback"),
+                            mask_mean("mask_context_active_patch_ratio"),
+                            mask_mean("mask_context_event_mass_coverage"),
+                            mask_mean("mask_target_active_patch_ratio"),
+                            mask_mean("mask_target_event_mass_coverage"),
+                            mask_mean("mask_empty_target"),
+                        ]
+                    )
+                    if (
+                        accumulated_output_metrics is None
+                        or accumulated_mask_metrics is None
+                        or accumulated_recurrent_state_rms is None
+                    ):
+                        raise RuntimeError(
+                            "gradient-accumulation metrics were not initialized"
                         )
-                        carried_recurrent_state = (
-                            detach_recurrent_state(final_recurrent_state)
-                            if config.recurrent.sampling in {"stream", "mixed"}
-                            else None
-                        )
-                    elif config.recurrent.sequence_loader:
-                        output_metrics = _feedforward_sequence_backward(
-                            model=model,
-                            batch=batch,
-                            config=config,
-                            device=device,
-                            world_size=world_size,
-                            grad_scaler=grad_scaler,
-                        )
-                    else:
-                        with _autocast_context(device, config.optimization.precision):
-                            output = model(
-                                x_context=batch["x_context"],
-                                x_target=batch["x_target"],
-                                dt_context_ms=batch["dt_context_ms"],
-                                dt_target_ms=batch["dt_target_ms"],
-                                context_mask=batch["context_mask"],
-                                target_mask=batch["target_mask"],
-                                objective=config.optimization.objective,
-                            )
-                        finite_flag = torch.isfinite(output.loss).to(dtype=torch.int32)
-                        if world_size > 1:
-                            distributed.all_reduce(
-                                finite_flag, op=distributed.ReduceOp.MIN
-                            )
-                        if not bool(finite_flag):
-                            raise FloatingPointError(
-                                f"non-finite loss at global step {global_step}"
-                            )
-                        _backward(output.loss, grad_scaler)
-                        output_metrics = _output_metric_tensor(output)
+                    accumulated_output_metrics += output_metrics
+                    accumulated_mask_metrics += mask_metrics
+                    accumulated_recurrent_state_rms += (
+                        recurrent_state_rms.detach().float()
+                    )
+                    if not is_group_end:
+                        continue
+
+                    output_metrics = (
+                        accumulated_output_metrics / accumulation_group_size
+                    )
+                    mask_metrics = (
+                        accumulated_mask_metrics / accumulation_group_size
+                    )
+                    recurrent_state_rms = (
+                        accumulated_recurrent_state_rms
+                        / accumulation_group_size
+                    )
                     gradient_norm, optimizer_step_skipped = _step_optimizer(
                         model=model,
                         optimizer=optimizer,
@@ -1263,29 +1517,6 @@ def train(
                         or optimizer_step_skipped
                     )
                     if should_log:
-                        temporal_selection = (
-                            batch["loss_mask"]
-                            if config.recurrent.sequence_loader
-                            else None
-                        )
-
-                        def mask_mean(name: str) -> torch.Tensor:
-                            values = batch[name]
-                            if temporal_selection is not None:
-                                values = values.masked_select(temporal_selection)
-                            return values.mean().detach().float()
-
-                        mask_metrics = torch.stack(
-                            [
-                                mask_mean("mask_activity_aware"),
-                                mask_mean("mask_activity_fallback"),
-                                mask_mean("mask_context_active_patch_ratio"),
-                                mask_mean("mask_context_event_mass_coverage"),
-                                mask_mean("mask_target_active_patch_ratio"),
-                                mask_mean("mask_target_event_mass_coverage"),
-                                mask_mean("mask_empty_target"),
-                            ]
-                        )
                         metric_values = torch.cat(
                             (
                                 output_metrics,
@@ -1307,8 +1538,11 @@ def train(
                             record = {
                                 "epoch": epoch,
                                 "step_in_epoch": step_in_epoch,
+                                "update_in_epoch": update_in_epoch,
                                 "attempt_step": attempt_step,
+                                "micro_attempt_step": micro_attempt_step,
                                 "global_step": global_step,
+                                "accumulation_group_size": accumulation_group_size,
                                 **{
                                     name: float(metric_values[index])
                                     for index, name in enumerate(OUTPUT_METRIC_NAMES)
@@ -1356,6 +1590,9 @@ def train(
                                 ] / record["inactive_prediction_count"]
                             record["sigreg_to_prediction_ratio"] = record[
                                 "sigreg_loss"
+                            ] / max(record["future_prediction_loss"], 1e-12)
+                            record["cmax_to_prediction_ratio"] = record[
+                                "cmax_weighted_loss"
                             ] / max(record["future_prediction_loss"], 1e-12)
                             _append_jsonl(metrics_path, record)
                             if writer is not None:
