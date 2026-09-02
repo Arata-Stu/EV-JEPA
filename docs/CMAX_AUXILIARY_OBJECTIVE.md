@@ -170,6 +170,77 @@ batch、prediction horizon、SIGReg、event capを固定します。
 `16 * 8 * 1,024 = 131,072`です。V100 16 GBで最初の実行が厳しい場合は512でsmokeを行い、
 peak memoryとstep時間を確認してから1,024へ戻します。2,048以上は計測なしに上げません。
 
+## CMax flowの定性可視化
+
+CMax-enabled checkpointからonline Frame ViTとConvLSTMを因果順に実行し、flow headが出すdense
+flowと、そのflowでraw eventをwarpしたIWEを同じsample・同じstepで可視化できます。目的は、
+flow headが単に飽和した出力や一様な出力を返していないか、またlearned flowによるevent整列が
+zero-flowやsample間で入れ替えたshuffled-flowより改善しているかを診断することです。
+
+source checkoutからは、packageのconsole script状態に依存しないmodule形式を第一候補にします。
+
+```bash
+PYTHONPATH=src python -m event_window_jepa.evaluation.cmax_flow_visualization \
+  --checkpoint outputs/pretrain/recurrent_future_convlstm_vits_gen1_horizon200ms_cmax_b4_accum4_events5000_seed0/checkpoint-latest.pt \
+  --device cuda:0 \
+  --sample-index 0 \
+  --calibration-samples 4 \
+  --epoch 0 \
+  --all-steps \
+  --flow-shuffle-seed 0 \
+  --quiver-stride 1 \
+  --output outputs/flow-vis/cmax-flow-epoch100.html
+```
+
+editable installを更新済みなら、同じCLIをconsole commandでも実行できます。
+
+```bash
+window-jepa-visualize-flow \
+  --checkpoint outputs/pretrain/recurrent_future_convlstm_vits_gen1_horizon200ms_cmax_b4_accum4_events5000_seed0/checkpoint-latest.pt \
+  --device cuda:0 \
+  --sample-index 0 \
+  --calibration-samples 4 \
+  --all-steps \
+  --output outputs/flow-vis/cmax-flow-epoch100.html
+```
+
+checkpoint内のmanifest pathが可視化環境と異なる場合だけ`--manifest`で差し替えます。
+`--calibration-samples`は比較対象を含む固定sample集合の大きさで2以上、`--epoch`はdatasetの
+決定的augmentationへ使うepoch、`--flow-shuffle-seed`はshuffled-flow対照の対応、
+`--quiver-stride`はquiverで表示するflow vectorの間引き幅です。`--all-steps`を省略すると選択
+sampleの代表stepだけを描画します。
+
+flow headの出力単位は学習時と同じ`pixels / base-window`です。例えば`window_ms: 50`なら、
+HSV flow、magnitude、quiverの値は50 ms窓あたりのpixel変位を表します。JEPAの未来予測距離が
+200 msでも、flowは200 ms変位ではなく50 ms base-window変位です。
+`max_displacement`は`dx`と`dy`の各成分に対する上限であり、vector magnitudeは理論上
+`√2 * max_displacement`まで取り得ます。HSVとmagnitude画像は表示尺度を
+`max_displacement`で固定し、それ以上をclipします。
+
+sequence比較表は、学習時と同じ複数窓・multi-scale・past/future設定のCMax criterionで
+learned、zero、sample-shuffled flowを再計算したものです。`focus_loss`は小さいほどeventが
+時間的によく整列したことを示します。一方、stepごとのpast/future IWEはそのbase-windowだけを
+窓の両端へ線形warpするlocal診断で、sequence全体のiterative multi-window CMaxそのものでは
+ありません。複数窓を跨ぐsequence CMaxでは、各base-windowのflowをevent時刻に応じて
+比例配分しながら逐次適用します。IWEはsensor pixel grid上のwarped event蓄積であり、
+輝度値そのものはevent数、polarity、subsample上限の影響を受けます。
+
+このCLIは指定sampleをdirect random clipとしてstate resetから開始し、checkpoint設定の
+burn-in prefixを再生してからsupervised stepのflowを取り出します。学習時のstream samplingが前clipから
+引き継いだstateは再現しません。そのため、ここでの比較は同一条件のreset+burn-in診断です。
+
+出力は次の3要素です。
+
+- 指定した`<output>.html`: sample/stepごとのrawおよびsubsampled event、HSV flow、flow magnitude、
+  quiver、unwarped IWE、past/future参照へwarpしたIWEを並べた閲覧用report
+- 同じstemの`.json`: checkpoint・sample metadataと、learned/zero/shuffled flowのsequence CMax比較
+- `<stem>_assets/`: HTMLから参照する各panelのPNG
+
+このreportは**GT optical flow評価ではありません**。GT flowを読み込まず、learned flowが自己教師
+loss上でeventをどれだけ鋭く整列したかをzero/shuffled対照と比べる診断です。CMax値やIWEの見た目が
+改善しても、物理的に正しいflow、低いEPE/AEE、または下流representation性能の向上を意味しません。
+物理精度にはGT付きflow benchmark、表現価値にはLinear Probeやdetectionを別途使用します。
+
 ## 成功判定
 
 正式比較の前に、同じ3 GPU・batch・precisionで短いsmokeを行い、以下を全て確認します。
