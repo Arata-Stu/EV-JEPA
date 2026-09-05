@@ -22,6 +22,8 @@ MANIFEST_ARTIFACT_PATH_FIELDS = (
     "path",
     "bbox_path",
     "depth_path",
+    "flow_path",
+    "mvsec_gt_path",
     "semantics_path",
     "pose_path",
     "calibration_path",
@@ -651,13 +653,13 @@ def _preprocess_sequence_unlocked(
     try:
         h5py, hdf5plugin = _require_hdf5()
         metadata = source.metadata
-        if metadata.dataset == "dsec" and (
+        if metadata.dataset in {"dsec", "mvsec"} and (
             options.spatial_downsample != 1
             or options.spatial_downsample_method != "coordinate"
         ):
             raise ValueError(
-                "DSEC must remain at native resolution so its official label and "
-                "rectification coordinates remain recoverable"
+                f"{metadata.dataset.upper()} must remain at native resolution so its "
+                "official label and rectification coordinates remain recoverable"
             )
         output = Path(output_path).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)

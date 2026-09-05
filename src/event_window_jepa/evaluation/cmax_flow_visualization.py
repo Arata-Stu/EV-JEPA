@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -43,6 +44,108 @@ from event_window_jepa.losses.cmax import (
 )
 from event_window_jepa.models.window_jepa import WindowJEPA
 from event_window_jepa.train.checkpoint import config_hash, load_pretrained_model
+
+
+_FILE_STAT_KEYS = ("device", "inode", "bytes", "mtime_ns", "ctime_ns")
+
+
+def _file_stat_identity(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {
+        "device": int(stat.st_dev),
+        "inode": int(stat.st_ino),
+        "bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "ctime_ns": int(stat.st_ctime_ns),
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(8 * 1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _snapshot_file_identity(
+    path: str | Path,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    """Hash one regular file while proving its stat identity stayed stable."""
+
+    source = Path(path).expanduser().resolve(strict=True)
+    if not source.is_file():
+        raise ValueError(f"{label} must be a regular file: {source}")
+    before = _file_stat_identity(source)
+    sha256 = _sha256_file(source)
+    after = _file_stat_identity(source)
+    if after != before:
+        raise RuntimeError(f"{label} changed while its identity was captured: {source}")
+    return {"path": str(source), **before, "sha256": sha256}
+
+
+def _require_unchanged_stat_identity(
+    path: str | Path,
+    expected: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    try:
+        source = Path(path).expanduser().resolve(strict=True)
+        current = _file_stat_identity(source)
+    except OSError as error:
+        raise RuntimeError(f"{label} became unavailable during rendering") from error
+    expected_stat = {key: int(expected[key]) for key in _FILE_STAT_KEYS}
+    if str(source) != str(expected.get("path")) or current != expected_stat:
+        raise RuntimeError(f"{label} changed while the CMax report was active: {source}")
+
+
+def _require_unchanged_content_identity(
+    path: str | Path,
+    expected: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    current = _snapshot_file_identity(path, label=label)
+    if current != dict(expected):
+        raise RuntimeError(f"{label} content changed while it was being loaded")
+
+
+def _is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_output_input_collisions(
+    output: str | Path,
+    *,
+    checkpoint: str | Path,
+    manifest: str | Path,
+) -> None:
+    """Keep every HTML/JSON/asset output disjoint from immutable inputs."""
+
+    html_path = Path(output).expanduser().resolve(strict=False)
+    json_path = html_path.with_suffix(".json")
+    assets_path = (html_path.parent / f"{html_path.stem}_assets").resolve(
+        strict=False
+    )
+    output_paths = (html_path, json_path, assets_path)
+    for label, raw_input in (("checkpoint", checkpoint), ("manifest", manifest)):
+        input_path = Path(raw_input).expanduser().resolve(strict=True)
+        if (
+            input_path in output_paths
+            or _is_within(input_path, assets_path)
+            or any(_is_within(candidate, input_path) for candidate in output_paths)
+        ):
+            raise ValueError(
+                f"CMax HTML/JSON/assets would collide with the {label}: "
+                f"{input_path}"
+            )
 
 
 @dataclass(frozen=True)
@@ -1274,11 +1377,13 @@ def write_cmax_flow_report(
     all_steps: bool = False,
     flow_shuffle_seed: int = 0,
     quiver_stride: int = 1,
+    checkpoint_identity: Mapping[str, Any] | None = None,
+    manifest_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write an HTML+PNG+JSON flow/IWE report from a strict CMax checkpoint."""
 
-    checkpoint_path = Path(checkpoint)
-    output_path = Path(output)
+    checkpoint_path = Path(checkpoint).expanduser().resolve(strict=True)
+    output_path = Path(output).expanduser().resolve(strict=False)
     if output_path.suffix.lower() != ".html":
         raise ValueError("CMax flow report output must use an .html suffix")
     if display_sample_index < 0:
@@ -1287,6 +1392,30 @@ def write_cmax_flow_report(
         raise TypeError("quiver_stride must be an integer")
     if quiver_stride <= 0:
         raise ValueError("quiver_stride must be positive")
+    manifest_path = Path(
+        materialization.config.data.manifest
+    ).expanduser().resolve(strict=True)
+    checkpoint_artifact = (
+        _snapshot_file_identity(checkpoint_path, label="checkpoint")
+        if checkpoint_identity is None
+        else dict(checkpoint_identity)
+    )
+    manifest_artifact = (
+        _snapshot_file_identity(manifest_path, label="manifest")
+        if manifest_identity is None
+        else dict(manifest_identity)
+    )
+    _require_unchanged_stat_identity(
+        checkpoint_path, checkpoint_artifact, label="checkpoint"
+    )
+    _require_unchanged_stat_identity(
+        manifest_path, manifest_artifact, label="manifest"
+    )
+    _validate_output_input_collisions(
+        output_path,
+        checkpoint=checkpoint_path,
+        manifest=manifest_path,
+    )
     validate_cmax_flow_config(checkpoint_config, model)
     _validate_report_compatibility(model, checkpoint_config, materialization)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1312,11 +1441,21 @@ def write_cmax_flow_report(
         display_sample_index=display_sample_index,
         visual_sections=visual_sections,
     )
+    # Assets are now complete. Re-check both immutable inputs before binding
+    # their recorded identities to the machine-readable report.
+    _require_unchanged_stat_identity(
+        checkpoint_path, checkpoint_artifact, label="checkpoint"
+    )
+    _require_unchanged_stat_identity(
+        manifest_path, manifest_artifact, label="manifest"
+    )
     payload: dict[str, Any] = {
         "schema": "event-window-jepa-cmax-flow-visualization-v1",
-        "checkpoint": str(checkpoint_path.resolve()),
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_artifact": checkpoint_artifact,
         "checkpoint_config_hash": config_hash(checkpoint_config),
-        "effective_manifest": materialization.config.data.manifest,
+        "effective_manifest": str(manifest_path),
+        "manifest_artifact": manifest_artifact,
         "sampling_epoch": materialization.epoch,
         "sample_indices": [clip.sample_index for clip in materialization.clips],
         "flow_units": f"pixels/{checkpoint_config.recurrent.window_ms:g}ms_base_window",
@@ -1387,6 +1526,14 @@ def write_cmax_flow_report(
     serialized = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
     _write_text(output_path.with_suffix(".json"), serialized)
     _write_text(output_path, document)
+    # The report must describe the files used for the entire render, not just
+    # the identities observed before model/data loading.
+    _require_unchanged_stat_identity(
+        checkpoint_path, checkpoint_artifact, label="checkpoint"
+    )
+    _require_unchanged_stat_identity(
+        manifest_path, manifest_artifact, label="manifest"
+    )
     return payload
 
 
@@ -1425,28 +1572,54 @@ def main() -> None:
     if args.quiver_stride <= 0:
         raise ValueError("quiver-stride must be positive")
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model, checkpoint_config = load_pretrained_model(args.checkpoint, device=device)
+    checkpoint_artifact = _snapshot_file_identity(
+        args.checkpoint, label="checkpoint"
+    )
+    checkpoint_path = Path(str(checkpoint_artifact["path"]))
+    model, checkpoint_config = load_pretrained_model(checkpoint_path, device=device)
+    _require_unchanged_content_identity(
+        checkpoint_path, checkpoint_artifact, label="checkpoint"
+    )
     validate_cmax_flow_config(checkpoint_config, model)
+    manifest_path = Path(
+        args.manifest
+        if args.manifest is not None
+        else checkpoint_config.data.manifest
+    ).expanduser().resolve(strict=True)
+    manifest_artifact = _snapshot_file_identity(manifest_path, label="manifest")
+    output = args.output or checkpoint_path.with_name(
+        f"{checkpoint_path.stem}-cmax-flow.html"
+    )
+    _validate_output_input_collisions(
+        output,
+        checkpoint=checkpoint_path,
+        manifest=manifest_path,
+    )
     materialization = materialize_future_feature_samples(
         checkpoint_config,
         range(args.sample_index, args.sample_index + args.calibration_samples),
-        manifest_override=args.manifest,
+        manifest_override=manifest_path,
         epoch=args.epoch,
     )
-    output = args.output or args.checkpoint.with_name(
-        f"{args.checkpoint.stem}-cmax-flow.html"
+    _require_unchanged_stat_identity(
+        checkpoint_path, checkpoint_artifact, label="checkpoint"
+    )
+    _require_unchanged_content_identity(
+        manifest_path, manifest_artifact, label="manifest"
     )
     report = write_cmax_flow_report(
         model,
         checkpoint_config,
         materialization,
-        args.checkpoint,
+        checkpoint_path,
         output,
         device=device,
         display_sample_index=args.sample_index,
         all_steps=args.all_steps,
         flow_shuffle_seed=args.flow_shuffle_seed,
         quiver_stride=args.quiver_stride,
+        checkpoint_identity=checkpoint_artifact,
+        manifest_identity=manifest_artifact,
     )
     learned = report["conditions"]["learned"]
     zero = report["conditions"]["zero"]

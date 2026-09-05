@@ -24,6 +24,7 @@ class SharedRandomSpatialTransform:
         self,
         crop_size: tuple[int, int] | None = None,
         horizontal_flip_probability: float = 0.5,
+        allow_center_padding: bool = False,
     ) -> None:
         if crop_size is not None and min(crop_size) <= 0:
             raise ValueError("crop dimensions must be positive")
@@ -31,15 +32,29 @@ class SharedRandomSpatialTransform:
             raise ValueError("horizontal_flip_probability must lie in [0, 1]")
         self.crop_size = crop_size
         self.horizontal_flip_probability = horizontal_flip_probability
+        if not isinstance(allow_center_padding, bool):
+            raise TypeError("allow_center_padding must be boolean")
+        self.allow_center_padding = allow_center_padding
 
     def sample(
         self, rng: random.Random, input_height: int, input_width: int
     ) -> SpatialTransformParameters:
         output_height, output_width = self.crop_size or (input_height, input_width)
-        if output_height > input_height or output_width > input_width:
-            raise ValueError("crop cannot exceed the sensor resolution")
-        y0 = rng.randint(0, input_height - output_height)
-        x0 = rng.randint(0, input_width - output_width)
+        if (
+            (output_height > input_height or output_width > input_width)
+            and not self.allow_center_padding
+        ):
+            raise ValueError("crop cannot exceed the sensor resolution without padding")
+        y0 = (
+            rng.randint(0, input_height - output_height)
+            if output_height <= input_height
+            else -((output_height - input_height) // 2)
+        )
+        x0 = (
+            rng.randint(0, input_width - output_width)
+            if output_width <= input_width
+            else -((output_width - input_width) // 2)
+        )
         return SpatialTransformParameters(
             x0=x0,
             y0=y0,

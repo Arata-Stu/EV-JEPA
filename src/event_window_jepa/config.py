@@ -71,6 +71,7 @@ class DataConfig:
     sequence_sampling: str = "dataset_balanced"
     crop_size: tuple[int, int] | None = None
     horizontal_flip_probability: float = 0.5
+    allow_center_padding: bool = False
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> DataConfig:
@@ -85,6 +86,7 @@ class DataConfig:
                 "workers",
                 "sequence_sampling",
                 "crop_size",
+                "allow_center_padding",
                 "horizontal_flip_probability",
             },
             "data",
@@ -99,6 +101,10 @@ class DataConfig:
             workers=int(values.get("workers", 8)),
             sequence_sampling=str(values.get("sequence_sampling", "dataset_balanced")),
             crop_size=None if crop is None else _pair_of_ints(crop, "data.crop_size"),
+            allow_center_padding=_boolean(
+                values.get("allow_center_padding", False),
+                "data.allow_center_padding",
+            ),
             horizontal_flip_probability=float(
                 values.get("horizontal_flip_probability", 0.5)
             ),
@@ -689,7 +695,13 @@ class OptimizationConfig:
 
 @dataclass(frozen=True)
 class FuturePredictionConfig:
-    """Collapse control and event-support settings for causal future JEPA."""
+    """Collapse control and event-support settings for causal future JEPA.
+
+    Rate Alignment (RA) and Latent Straightening (LS) are a window-level
+    adaptation applied to recurrent patch-token trajectories.  They are not
+    event-level logit regularizers and they do not replace temporal SIGReg's
+    anti-collapse role.
+    """
 
     active_min_events: int = 1
     activity_floor: float = 0.01
@@ -702,6 +714,14 @@ class FuturePredictionConfig:
     sigreg_t_max: float = 3.0
     sigreg_num_points: int = 17
     projection_seed: int = 0
+    rate_alignment_weight: float = 0.0
+    rate_alignment_gamma: float = 1.0
+    rate_alignment_eps: float = 1e-6
+    rate_alignment_normalization: str = (
+        "per_clip_mean_supported_patch_rate"
+    )
+    latent_straightening_weight: float = 0.0
+    latent_straightening_eps: float = 1e-6
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> FuturePredictionConfig:
@@ -712,6 +732,12 @@ class FuturePredictionConfig:
                 "activity_floor",
                 "frame_sigreg_weight",
                 "temporal_sigreg_weight",
+                "rate_alignment_weight",
+                "rate_alignment_gamma",
+                "rate_alignment_eps",
+                "rate_alignment_normalization",
+                "latent_straightening_weight",
+                "latent_straightening_eps",
                 "allow_unregularized",
                 "projector_hidden_dim",
                 "projector_output_dim",
@@ -728,6 +754,27 @@ class FuturePredictionConfig:
             frame_sigreg_weight=float(values.get("frame_sigreg_weight", 0.0)),
             temporal_sigreg_weight=float(
                 values.get("temporal_sigreg_weight", 0.0)
+            ),
+            rate_alignment_weight=float(
+                values.get("rate_alignment_weight", 0.0)
+            ),
+            rate_alignment_gamma=float(
+                values.get("rate_alignment_gamma", 1.0)
+            ),
+            rate_alignment_eps=float(
+                values.get("rate_alignment_eps", 1e-6)
+            ),
+            rate_alignment_normalization=str(
+                values.get(
+                    "rate_alignment_normalization",
+                    "per_clip_mean_supported_patch_rate",
+                )
+            ),
+            latent_straightening_weight=float(
+                values.get("latent_straightening_weight", 0.0)
+            ),
+            latent_straightening_eps=float(
+                values.get("latent_straightening_eps", 1e-6)
             ),
             allow_unregularized=_boolean(
                 values.get("allow_unregularized", False),
@@ -750,6 +797,47 @@ class FuturePredictionConfig:
             )
         if self.frame_sigreg_weight < 0 or self.temporal_sigreg_weight < 0:
             raise ValueError("future_prediction SIGReg weights cannot be negative")
+        if not math.isfinite(self.rate_alignment_weight) or (
+            self.rate_alignment_weight < 0
+        ):
+            raise ValueError(
+                "future_prediction.rate_alignment_weight must be finite and "
+                "non-negative"
+            )
+        if not math.isfinite(self.rate_alignment_gamma) or (
+            self.rate_alignment_gamma < 0
+        ):
+            raise ValueError(
+                "future_prediction.rate_alignment_gamma must be finite and "
+                "non-negative"
+            )
+        if not math.isfinite(self.rate_alignment_eps) or (
+            self.rate_alignment_eps <= 0
+        ):
+            raise ValueError(
+                "future_prediction.rate_alignment_eps must be finite and positive"
+            )
+        if self.rate_alignment_normalization != (
+            "per_clip_mean_supported_patch_rate"
+        ):
+            raise ValueError(
+                "future_prediction.rate_alignment_normalization must be "
+                "per_clip_mean_supported_patch_rate"
+            )
+        if not math.isfinite(self.latent_straightening_weight) or (
+            self.latent_straightening_weight < 0
+        ):
+            raise ValueError(
+                "future_prediction.latent_straightening_weight must be finite "
+                "and non-negative"
+            )
+        if not math.isfinite(self.latent_straightening_eps) or (
+            self.latent_straightening_eps <= 0
+        ):
+            raise ValueError(
+                "future_prediction.latent_straightening_eps must be finite and "
+                "positive"
+            )
         if min(self.projector_hidden_dim, self.projector_output_dim) <= 0:
             raise ValueError("future_prediction projector dimensions must be positive")
         if self.sigreg_num_slices <= 0:
@@ -1002,6 +1090,15 @@ class ExperimentConfig:
             "frame_future_jepa",
             "recurrent_future_jepa",
         }
+        uses_rate_alignment = bool(
+            self.future_prediction.rate_alignment_weight
+        )
+        uses_latent_straightening = bool(
+            self.future_prediction.latent_straightening_weight
+        )
+        uses_latent_temporal_regularization = (
+            uses_rate_alignment or uses_latent_straightening
+        )
         is_sequence_objective = objective in sequence_objectives
         is_recurrent_objective = self.optimization.objective in recurrent_objectives
         if self.cmax.enabled:
@@ -1099,6 +1196,35 @@ class ExperimentConfig:
                 raise ValueError(
                     "frame_future_jepa cannot use temporal_sigreg_weight"
                 )
+            if (
+                objective != "recurrent_future_jepa"
+                and uses_latent_temporal_regularization
+            ):
+                raise ValueError(
+                    "Rate Alignment and Latent Straightening require "
+                    "optimization.objective=recurrent_future_jepa"
+                )
+            if uses_rate_alignment and self.recurrent.sequence_length < 2:
+                raise ValueError(
+                    "Rate Alignment requires recurrent.sequence_length >= 2"
+                )
+            if (
+                uses_latent_straightening
+                and self.recurrent.sequence_length < 3
+            ):
+                raise ValueError(
+                    "Latent Straightening requires recurrent.sequence_length >= 3"
+                )
+            if (
+                uses_latent_temporal_regularization
+                and self.recurrent.tbptt_steps
+                != self.recurrent.sequence_length
+            ):
+                raise ValueError(
+                    "Rate Alignment and Latent Straightening require "
+                    "tbptt_steps == sequence_length so adjacent supervised "
+                    "windows are not omitted at chunk boundaries"
+                )
             if not (
                 self.future_prediction.frame_sigreg_weight
                 or self.future_prediction.temporal_sigreg_weight
@@ -1112,9 +1238,11 @@ class ExperimentConfig:
             if (
                 self.future_prediction.frame_sigreg_weight
                 or self.future_prediction.temporal_sigreg_weight
+                or uses_latent_temporal_regularization
             ):
                 raise ValueError(
-                    "future SIGReg weights are only used by future JEPA objectives"
+                    "future SIGReg/RA/LS weights are only used by future JEPA "
+                    "objectives"
                 )
             if self.recurrent.prediction_horizon_steps:
                 raise ValueError(

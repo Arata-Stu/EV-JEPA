@@ -7,14 +7,15 @@
 | 段階 | データ | 役割 | 取得量の目安 | 初回の手動操作 |
 | --- | --- | --- | ---: | --- |
 | 0 | DSEC 1 sequence | downloader・前処理・時刻窓の確認 | sequence依存 | なし |
-| 1 | M3ED Phase 1 train+val | 異なる解像度を含む事前学習の成立確認 | 20,262,591,423 bytes | なし |
-| 2 | DSEC Detection train+val | driving domainと下流検出 | train全体131.9 GB相当 + extra val 21.9 GB | なし |
-| 3 | Gen1（RVT original-event HDF5） | 304×240での検出baseline | 約200 GB圧縮、展開量は要確認 | なし |
-| 4 | M3ED test / DSEC test | 最終評価 | M3ED候補137.1 GB、DSEC約36.0 GB | なし |
-| 5 | Gen4 / 1Mpx（RVT original-event HDF5） | 高解像度transferと検出 | 大容量。既存データの利用を優先 | なし |
+| 1 | MVSEC Stage 1 | JEPA+CMaxとflow/depth評価 | 102,646,291,553 bytes | なし |
+| 2 | M3ED Phase 1 train+val | 異なる解像度を含む事前学習の成立確認 | 20,262,591,423 bytes | なし |
+| 3 | DSEC Detection train+val | driving domainと下流検出 | train全体131.9 GB相当 + extra val 21.9 GB | なし |
+| 4 | Gen1（RVT original-event HDF5） | 304×240での検出baseline | 約200 GB圧縮、展開量は要確認 | なし |
+| 5 | M3ED test / DSEC test | 最終評価 | M3ED候補137.1 GB、DSEC約36.0 GB | なし |
+| 6 | Gen4 / 1Mpx（RVT original-event HDF5） | 高解像度transferと検出 | 大容量。既存データの利用を優先 | なし |
 
-主な事前学習データはM3EDとDSEC、下流の成立確認はDSEC DetectionとGen1、
-1Mpxは最後のscale-upとするのが現実的です。M3EDはcar/spot/falconを一度に
+最初の幾何検証はMVSEC Stage 1、より大規模な事前学習はM3EDとDSEC、検出の成立確認は
+DSEC DetectionとGen1、1Mpxは最後のscale-upとするのが現実的です。M3EDはcar/spot/falconを一度に
 取得せず、まず同じcar/urban/day条件のtrain/val 1本ずつから始めます。
 
 Gen1/Gen4はRVTが公開しているtrain/val/test単位のoriginal-event HDF5 tarを標準経路に
@@ -24,8 +25,9 @@ Gen1/Gen4はRVTが公開しているtrain/val/test単位のoriginal-event HDF5 t
 
 ## downloaderの共通仕様
 
-download script自体はBash、`curl`、Python標準ライブラリだけを使います。
-PyTorch、h5py、hdf5plugin、仮想環境はまだ不要です。
+通常のdownload scriptはBash、`curl`、Python標準ライブラリだけを使います。MVSECだけは
+Google Drive転送時に`gdown`を遅延importしますが、`--plan-only`とhelpは標準ライブラリだけで
+動きます。PyTorchは不要で、h5pyが既にあればMVSECのschema検査を追加で行います。
 
 ```bash
 chmod +x scripts/download/*.sh scripts/download/archive_tool.py
@@ -34,7 +36,7 @@ chmod +x scripts/download/*.sh scripts/download/archive_tool.py
 各scriptは次を共通に行います。
 
 - 未完了ファイルを`*.part`として残し、同じcommandでHTTP Range resume
-- resume前にstrong ETag、配布元checksum、または既知のpublisher SHA-256を
+- 配布元が提供する場合はresume前にstrong ETag、publisher checksum、または既知のSHA-256を
   必須とし、Content-LengthやLast-Modifiedもsidecarと照合
 - 保護URLをsidecarやログへ保存せず、`curl`のprocess引数にも直接置かない
 - HTMLのlogin/error pageをデータとして受理しない
@@ -145,6 +147,99 @@ bash scripts/download/download_m3ed.sh \
   --split test \
   --sequence-list configs/datasets/m3ed_phase2_test.txt
 ```
+
+## MVSEC
+
+MVSECは公式Google DriveのHDF5と生成済みflow GT NPZをfile IDと正確なbyte数で固定して
+取得します。まず書込み・通信を行わない計画表示を実行してください。
+
+```bash
+python scripts/download/download_mvsec.py \
+  --root /datasets/downloads/mvsec \
+  --profile stage1 \
+  --plan-only
+```
+
+profileは次の2つです。
+
+- `stage1`: `outdoor_day1`と`outdoor_day2`のdata HDF5、depth/pose GT HDF5、
+  `*_gt_flow_dist.npz`、102,646,291,553 bytes（約95.597 GiB）
+- `stage1-ood`: 上記に`outdoor_night1`のdata+depth/pose GT HDF5を追加、
+  122,227,194,379 bytes（約113.833 GiB）。night1 flowは含みません
+
+実取得時だけdownload extraを導入します。同じcommandを再実行すると`.part`から再開します。
+
+```bash
+python -m pip install -e '.[download]'
+
+python scripts/download/download_mvsec.py \
+  --root /datasets/downloads/mvsec \
+  --profile stage1
+```
+
+### GUIから取得済みの場合
+
+Google DriveのGUIでHDF5を展開済みなら、巨大fileを本script用の`raw/`配下へ移動する必要は
+ありません。次のdirect layoutをそのまま前処理へ渡せます。
+
+```text
+GUI_ROOT/
+├── indoor_flying/                 # Stage 1では未使用
+├── outdoor_day/
+│   ├── outdoor_day1_data.hdf5
+│   ├── outdoor_day1_gt.hdf5
+│   ├── outdoor_day1_gt_flow_dist.npz
+│   ├── outdoor_day2_data.hdf5
+│   ├── outdoor_day2_gt.hdf5
+│   └── outdoor_day2_gt_flow_dist.npz
+└── outdoor_night/                 # --include-night時だけ使用
+```
+
+表示される`*-20260905T....zip`のようなGoogle Drive分割archiveとcalibration ZIPは、event
+converterの探索対象ではないため、その場に残っていても入力へ混入しません。
+
+重要なのは、公式HDF5 folderにdense flowが含まれていないことです。別配布の
+[MVSEC Flow GT folder](https://drive.google.com/drive/folders/1XS0AQTuCwUaWOmtjyJWRHkbXjj_igJLp)
+から次の2本も取得し、`outdoor_day/`のdata/GT HDF5と同じdirectoryへ置きます。
+
+- `outdoor_day1_gt_flow_dist.npz`: 7,389,716,086 bytes
+- `outdoor_day2_gt_flow_dist.npz`: 17,555,972,270 bytes
+
+合計は24,945,688,356 bytes（約23.232 GiB）です。前処理wrapperはどちらか一方でも欠けると、
+flowなしで黙って続行せず、変換前に停止します。
+
+```bash
+bash scripts/preprocess/preprocess_mvsec.sh \
+  --python-bin python \
+  --raw-root /absolute/path/to/GUI_ROOT \
+  --bundle-root /datasets/evjepa/mvsec \
+  --plan-only
+```
+
+GUI取得物には本downloaderの`.verified.json` sidecarがありません。その場合もflow NPZは公式byte数、
+ZIP/NPY構造、CRC、SHA-256まで前処理時に検証します。一方、GT HDF5のmanifest provenanceは現在の
+size/mtimeが中心になるため、特にday1 depthはeventとの可視alignmentも確認してください。
+
+raw/distorted flow/depthを使うStage 1ではcalibrationは不要です。将来rectification、stereo、
+depth+poseからのrigid flow生成を行う場合は`--include-calibration`を付けます。配布元は各objectの
+暗号学的checksumを公開していないため、このscriptは固定Drive ID、byte数、HDF5 signature、
+利用可能ならHDF5 schema、およびNPZの固定key・shape・非圧縮NPY header・member CRCを検査し、ローカル
+SHA-256をsidecarへ残します。これはpublisher真正性の証明ではありません。flow NPZのkeyは
+`timestamps`、`x_flow_dist`、`y_flow_dist`です。前処理manifestはflow NPZとdepth/pose GT HDF5の
+sidecarが現在のfile ID・byte数・mtimeと一致する場合、そのSHA-256 provenanceも保持します。
+
+2018-09-26以前の`outdoor_day1_gt`にはdepth timestampが0.225 sずれる既知問題があります。
+一定offsetはbyte数やschemaの検査だけでは判定できません。本scriptは修正後の公式Drive objectを
+file IDとbyte数で固定しますが、配布元checksumがないため、別経路から入手したGTはevent/depthの
+可視alignmentも確認してください。
+
+canonical bundleのmanifestはraw HDF5/NPZをコピーせず相対参照します。前処理後も
+`raw/outdoor_day/*_{data,gt}.hdf5`と`raw/outdoor_day/*_gt_flow_dist.npz`を削除・移動しないで
+ください。移動するとflow/depth評価の参照が切れます。
+
+取得後の前処理、JEPA+CMax、flow/depth評価は
+[MVSEC_GEOMETRY.md](MVSEC_GEOMETRY.md)を参照してください。MVSECデータはCC BY-SA 4.0で、
+利用時にはMVSEC論文を、GT flowを使う場合はEV-FlowNet論文も引用してください。
 
 ## Gen1 / Gen4: RVT original-event HDF5（推奨）
 
@@ -296,8 +391,9 @@ canonical HDF5の作業領域まで
 
 ## 前処理への接続
 
-DSEC、RVT Gen1/Gen4、Prophesee DAT系は`ROOT/raw`、M3EDも同じく`ROOT/raw`を
-`window-jepa-preprocess --input`へ渡します。具体的な時刻補正、split、解像度、
+DSEC、RVT Gen1/Gen4、Prophesee DAT系、M3EDは`ROOT/raw`を前処理へ渡します。MVSECは
+downloader形式の`ROOT/raw`に加え、GUI形式の`ROOT/outdoor_day`もwrapperが自動解決します。
+具体的な時刻補正、split、解像度、
 Zstd HDF5変換は[DATA_PREPROCESSING.md](DATA_PREPROCESSING.md)を参照してください。
 
 容量が厳しい場合は、1 sequenceまたは1 archiveごとに
@@ -317,6 +413,8 @@ Zstd HDF5変換は[DATA_PREPROCESSING.md](DATA_PREPROCESSING.md)を参照して�
 - [DSEC-Detection](https://dsec.ifi.uzh.ch/dsec-detection/)
 - [M3ED Download](https://m3ed.io/download/)
 - [M3ED official dataset list（固定commit）](https://github.com/daniilidis-group/m3ed/blob/df739f20fba41ac6da8c22f4260c305875e391ed/dataset_list.yaml)
+- [MVSEC Download](https://daniilidis-group.github.io/mvsec/download/)
+- [MVSEC Data Format](https://daniilidis-group.github.io/mvsec/data_format/)
 - [RVT original Gen1/Gen4 download・CRC32・前処理手順](https://github.com/uzh-rpg/RVT/blob/master/scripts/genx/README.md)
 - [RVT README（固定表現済みtarとの区別）](https://github.com/uzh-rpg/RVT#required-data)
 - [Prophesee dataset formats and sizes](https://docs.prophesee.ai/stable/datasets.html)

@@ -1,0 +1,3 @@
+# Optional night-domain depth evaluation recording.
+outdoor_night1
+

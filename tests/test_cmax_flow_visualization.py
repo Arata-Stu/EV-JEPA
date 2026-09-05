@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -11,6 +12,9 @@ import torch
 from event_window_jepa.config import ExperimentConfig
 from event_window_jepa.data.packed_events import PackedEventBatch
 from event_window_jepa.evaluation.cmax_flow_visualization import (
+    _require_unchanged_content_identity,
+    _snapshot_file_identity,
+    _validate_output_input_collisions,
     compare_cmax_flow_conditions,
     compute_step_warp_iwes,
     extract_cmax_flow_records,
@@ -78,6 +82,43 @@ def _write_manifest(root: Path) -> Path:
         encoding="utf-8",
     )
     return manifest
+
+
+def test_cmax_report_identity_and_input_collision_guards(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint-v1")
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text("{}\n", encoding="utf-8")
+
+    identity = _snapshot_file_identity(checkpoint, label="checkpoint")
+    _require_unchanged_content_identity(
+        checkpoint, identity, label="checkpoint"
+    )
+    checkpoint.write_bytes(b"checkpoint-v2")
+    with pytest.raises(RuntimeError, match="content changed"):
+        _require_unchanged_content_identity(
+            checkpoint, identity, label="checkpoint"
+        )
+
+    checkpoint_json = tmp_path / "report.json"
+    checkpoint_json.write_bytes(b"checkpoint")
+    with pytest.raises(ValueError, match="collide with the checkpoint"):
+        _validate_output_input_collisions(
+            tmp_path / "report.html",
+            checkpoint=checkpoint_json,
+            manifest=manifest,
+        )
+
+    assets = tmp_path / "qualitative_assets"
+    assets.mkdir()
+    nested_manifest = assets / "manifest.jsonl"
+    nested_manifest.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="collide with the manifest"):
+        _validate_output_input_collisions(
+            tmp_path / "qualitative.html",
+            checkpoint=checkpoint,
+            manifest=nested_manifest,
+        )
 
 
 def _config(manifest: str = "/checkpoint/host/original.jsonl") -> ExperimentConfig:
@@ -393,12 +434,14 @@ def test_cmax_flow_report_runs_tiny_pipeline_and_preserves_alignment(
             reversed_flow[sample_index],
         )
 
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"fixed checkpoint identity for report test")
     output = tmp_path / "cmax-flow.html"
     report = write_cmax_flow_report(
         model,
         checkpoint_config,
         materialization,
-        tmp_path / "checkpoint.pt",
+        checkpoint,
         output,
         device="cpu",
         display_sample_index=0,
@@ -407,6 +450,17 @@ def test_cmax_flow_report_runs_tiny_pipeline_and_preserves_alignment(
     )
 
     assert report["schema"] == "event-window-jepa-cmax-flow-visualization-v1"
+    assert report["checkpoint_artifact"]["path"] == str(checkpoint.resolve())
+    assert report["checkpoint_artifact"]["bytes"] == checkpoint.stat().st_size
+    assert report["checkpoint_artifact"]["sha256"] == hashlib.sha256(
+        checkpoint.read_bytes()
+    ).hexdigest()
+    manifest = Path(materialization.config.data.manifest).resolve()
+    assert report["manifest_artifact"]["path"] == str(manifest)
+    assert report["manifest_artifact"]["bytes"] == manifest.stat().st_size
+    assert report["manifest_artifact"]["sha256"] == hashlib.sha256(
+        manifest.read_bytes()
+    ).hexdigest()
     assert report["sample_indices"] == [0, 1]
     assert set(report["conditions"]) == {"learned", "zero", "sample_shuffled"}
     assert report["focus_improvements"]["zero_minus_learned"] == pytest.approx(

@@ -17,6 +17,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+download = [
+  "gdown>=5.2,<7",
+]
 hdf5 = [
   "h5py>=3.10",
   "hdf5plugin>=4.4",
@@ -44,6 +47,9 @@ window-jepa-gen1-detect = "event_window_jepa.downstream.gen1_detection:main"
 window-jepa-mask-audit = "event_window_jepa.evaluation.mask_strategy_audit:main"
 window-jepa-visualize-future = "event_window_jepa.evaluation.future_feature_visualization:main"
 window-jepa-visualize-flow = "event_window_jepa.evaluation.cmax_flow_visualization:main"
+window-jepa-mvsec-flow = "event_window_jepa.downstream.mvsec_flow:main"
+window-jepa-mvsec-depth-probe = "event_window_jepa.downstream.mvsec_depth:main"
+window-jepa-mvsec-visualize = "event_window_jepa.downstream.mvsec_visualize:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

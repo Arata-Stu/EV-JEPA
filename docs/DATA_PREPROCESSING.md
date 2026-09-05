@@ -213,6 +213,84 @@ train/val/testの変換後に3 manifestを`window-jepa-merge-manifests`で一度
 同一source recordingが複数splitへ入っていないことも検査できます。統合manifestは
 各行にsplitを保持するため、そのままloaderからsplit別に選択できます。
 
+## MVSEC
+
+公式`*_data.hdf5`の`/davis/{left,right}/events`は、`[x,y,t_seconds,p]`の`N×4`配列です。
+MVSEC adapterは原本をread-onlyでchunk読込し、同期source clockをinteger microsecondへ一度だけ
+丸めます。left/rightを別々に変換してもcameraごとの絶対originをmanifestへ保持するため、単一属性を
+上書きしません。極性は配布物で見られる`{0,1}`と`{-1,+1}`の双方を受理し、sequence内での
+encoding混在を拒否してcanonicalな`0=OFF, 1=ON`へ変換します。座標はnative `346×260`の
+raw/distorted frameとして全件検査します。
+
+left cameraへ`--mvsec-gt reference --mvsec-flow official-npz`を指定すると、同じdirectoryの
+`*_gt.hdf5`と公式`*_gt_flow_dist.npz`を検査し、次をmanifestへ相対参照として保存します。
+
+- distorted flow: NPZの`x_flow_dist`、`y_flow_dist`、`timestamps`
+- raw depth: `/davis/left/depth_image_raw`と`depth_image_raw_ts`
+- 存在する場合はposeまたはodometryとtimestamp
+
+flow NPZのformat、固定Drive file ID、正確なbyte数、ローカルSHA-256、metadata versionも
+manifestへ保存します。GT HDF5についても、download sidecarが現在のfile ID・byte数・mtimeと
+一致すればSHA-256をmanifestへ伝播し、一致しない場合でも現在のsizeとmtimeを残します。
+HDF5内の代替`flow_dist`は自動採用せず、必要な場合だけ
+`--mvsec-flow embedded-hdf5`で明示します。推奨wrapperのplanもday1/day2のNPZ欠落時に失敗します。
+
+イベントもGTもこの段階ではresize、rectify、cropしません。ViT-S/16用の`352×272`中央zero-padと
+valid maskは学習・評価adapterが同じ変換として適用します。flow/depthをrectifyする場合は、画像を
+warpするだけでなくflow endpointも同じcamera mapで再投影する必要があります。
+
+推奨wrapperはrecording splitを固定します。day2のleft+rightがtrain、day1 leftがfinal test、
+night1 leftは任意のOOD testです。directory入力では意図しないrecording混入を防ぐため
+`--sequence-list`なしの変換を拒否します。
+
+`preprocess_mvsec.sh`の`--raw-root`は次の2配置を自動判定します。
+
+- GUI/direct: `ROOT/outdoor_day/outdoor_day1_data.hdf5`
+- downloader container: `ROOT/raw/outdoor_day/outdoor_day1_data.hdf5`
+
+したがって、Google Drive GUIで展開した`indoor_flying/`、`outdoor_day/`、`outdoor_night/`が
+直下にあるrootを、そのまま指定できます。トップ階層の分割ZIPやcalibration ZIPは無視されます。
+両方の配置が同時に存在する曖昧なrootはfail-closedで拒否します。wrapperは解決したsource rootと、
+不足しているdata/GT/flow fileを変換開始前に表示します。
+
+```bash
+bash scripts/preprocess/preprocess_mvsec.sh \
+  --python-bin python \
+  --raw-root /datasets/downloads/mvsec/raw \
+  --bundle-root /datasets/evjepa/mvsec \
+  --plan-only
+
+bash scripts/preprocess/preprocess_mvsec.sh \
+  --python-bin python \
+  --raw-root /datasets/downloads/mvsec/raw \
+  --bundle-root /datasets/evjepa/mvsec \
+  --include-night
+```
+
+GUI/direct layoutの例は次です。
+
+```bash
+bash scripts/preprocess/preprocess_mvsec.sh \
+  --python-bin python \
+  --raw-root /absolute/path/to/gui-downloaded-mvsec \
+  --bundle-root /datasets/evjepa/mvsec \
+  --plan-only
+```
+
+このrootの`outdoor_day/`には、HDF5とは別配布の
+`outdoor_day1_gt_flow_dist.npz`と`outdoor_day2_gt_flow_dist.npz`も必要です。directory単位の
+symlinkは解決できますが、data HDF5だけを別場所へsymlinkしてGT/flowをlink元に残す構成は避け、
+同一recordingのdata/GT/flowを同じ物理directoryに置いてください。
+
+`outdoor_day1`のflowはmanifest全体の割合で切らず、評価時に内部時刻
+`222.4 s <= t < 240.4 s`からGT indexを解決します。古い`outdoor_day1_gt`にはdepth timestampが
+0.225 sずれる既知問題があります。一定offsetはschema/range検査では検出できないため、downloaderが
+固定した現行公式Drive file ID・正確なbyte数を使い、ローカルSHA-256を記録してください。別入手物は
+event/depthの可視alignmentも確認します。学習・評価protocolとcommandは
+[MVSEC_GEOMETRY.md](MVSEC_GEOMETRY.md)にあります。
+manifestはrawラベルをコピーせず相対参照するため、変換後も元のdata/GT HDF5とflow NPZを
+削除・移動しないでください。
+
 ## RVT original-event HDF5（Gen1 / Gen4、推奨）
 
 RVT配布版は、Gen4が`*_td.h5`、Gen1が`*_td.dat.h5`で、どちらも

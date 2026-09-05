@@ -102,6 +102,14 @@ OUTPUT_METRIC_NAMES = (
     "cmax_mean_flow_magnitude",
     "cmax_occupied_pixel_fraction",
     "cmax_flow_saturation_fraction",
+    "rate_alignment_loss",
+    "rate_alignment_weighted_loss",
+    "rate_alignment_pairs",
+    "rate_alignment_mean_weight",
+    "latent_straightening_loss",
+    "latent_straightening_weighted_loss",
+    "latent_straightening_pairs",
+    "latent_dynamics_weighted_loss",
 )
 
 
@@ -205,6 +213,20 @@ def build_model(config: ExperimentConfig) -> WindowJEPA:
         future_activity_floor=config.future_prediction.activity_floor,
         frame_sigreg_weight=config.future_prediction.frame_sigreg_weight,
         temporal_sigreg_weight=config.future_prediction.temporal_sigreg_weight,
+        rate_alignment_weight=(
+            config.future_prediction.rate_alignment_weight
+        ),
+        rate_alignment_gamma=config.future_prediction.rate_alignment_gamma,
+        rate_alignment_eps=config.future_prediction.rate_alignment_eps,
+        rate_alignment_normalization=(
+            config.future_prediction.rate_alignment_normalization
+        ),
+        latent_straightening_weight=(
+            config.future_prediction.latent_straightening_weight
+        ),
+        latent_straightening_eps=(
+            config.future_prediction.latent_straightening_eps
+        ),
         sigreg_projector_hidden_dim=(
             config.future_prediction.projector_hidden_dim
         ),
@@ -251,10 +273,11 @@ def build_dataset(
         for info in sequences
         if info.height < crop_height or info.width < crop_width
     ]
-    if too_small:
+    if too_small and not config.data.allow_center_padding:
         raise ValueError(
             "preprocessed resolutions are smaller than data.crop_size: "
-            f"{too_small[:5]}"
+            f"{too_small[:5]}; set data.allow_center_padding=true only when "
+            "zero-padding is part of the documented evaluation protocol"
         )
     if config.representation.kind == "voxel_grid":
         representation = VoxelGrid(
@@ -266,6 +289,7 @@ def build_dataset(
     transform = SharedRandomSpatialTransform(
         crop_size=config.data.crop_size,
         horizontal_flip_probability=config.data.horizontal_flip_probability,
+        allow_center_padding=config.data.allow_center_padding,
     )
     grid_size = (
         config.model.image_size[0] // config.model.patch_size,
@@ -700,6 +724,47 @@ def _write_tensorboard_metrics(writer: Any, record: dict[str, Any]) -> None:
         (
             "future/sigreg_to_prediction_ratio",
             record["sigreg_to_prediction_ratio"],
+        ),
+        ("latent_dynamics/rate_alignment_loss", record["rate_alignment_loss"]),
+        (
+            "latent_dynamics/rate_alignment_weighted_loss",
+            record["rate_alignment_weighted_loss"],
+        ),
+        (
+            "latent_dynamics/rate_alignment_to_prediction_ratio",
+            record["rate_alignment_to_prediction_ratio"],
+        ),
+        (
+            "latent_dynamics/rate_alignment_pairs",
+            record["rate_alignment_pairs"],
+        ),
+        (
+            "latent_dynamics/rate_alignment_mean_weight",
+            record["rate_alignment_mean_weight"],
+        ),
+        (
+            "latent_dynamics/straightening_loss",
+            record["latent_straightening_loss"],
+        ),
+        (
+            "latent_dynamics/straightening_weighted_loss",
+            record["latent_straightening_weighted_loss"],
+        ),
+        (
+            "latent_dynamics/straightening_to_prediction_ratio",
+            record["latent_straightening_to_prediction_ratio"],
+        ),
+        (
+            "latent_dynamics/straightening_pairs",
+            record["latent_straightening_pairs"],
+        ),
+        (
+            "latent_dynamics/weighted_loss",
+            record["latent_dynamics_weighted_loss"],
+        ),
+        (
+            "latent_dynamics/to_prediction_ratio",
+            record["latent_dynamics_to_prediction_ratio"],
         ),
         ("future/active_patch_fraction", record["active_patch_fraction"]),
         (
@@ -1269,6 +1334,26 @@ def train(
                 f"supervised_frames_per_epoch={processed_frames}",
                 flush=True,
             )
+        if (
+            config.future_prediction.rate_alignment_weight
+            or config.future_prediction.latent_straightening_weight
+        ):
+            print(
+                "[window-jepa] latent dynamics (window-level adaptation; "
+                "not an event-level reproduction): "
+                f"rate_alignment_weight="
+                f"{config.future_prediction.rate_alignment_weight:g}, "
+                f"rate_gamma={config.future_prediction.rate_alignment_gamma:g}, "
+                f"rate_eps={config.future_prediction.rate_alignment_eps:g}, "
+                f"rate_normalization="
+                f"{config.future_prediction.rate_alignment_normalization}, "
+                f"latent_straightening_weight="
+                f"{config.future_prediction.latent_straightening_weight:g}, "
+                f"straightening_eps="
+                f"{config.future_prediction.latent_straightening_eps:g}; "
+                "temporal_sigreg_is_separate=true",
+                flush=True,
+            )
         if config.cmax.enabled:
             print(
                 "[window-jepa] CMax auxiliary: "
@@ -1590,6 +1675,17 @@ def train(
                                 ] / record["inactive_prediction_count"]
                             record["sigreg_to_prediction_ratio"] = record[
                                 "sigreg_loss"
+                            ] / max(record["future_prediction_loss"], 1e-12)
+                            record["rate_alignment_to_prediction_ratio"] = record[
+                                "rate_alignment_weighted_loss"
+                            ] / max(record["future_prediction_loss"], 1e-12)
+                            record[
+                                "latent_straightening_to_prediction_ratio"
+                            ] = record[
+                                "latent_straightening_weighted_loss"
+                            ] / max(record["future_prediction_loss"], 1e-12)
+                            record["latent_dynamics_to_prediction_ratio"] = record[
+                                "latent_dynamics_weighted_loss"
                             ] / max(record["future_prediction_loss"], 1e-12)
                             record["cmax_to_prediction_ratio"] = record[
                                 "cmax_weighted_loss"

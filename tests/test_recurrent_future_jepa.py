@@ -17,7 +17,11 @@ from event_window_jepa.train.checkpoint import (
 )
 
 
-def _future_model() -> WindowJEPA:
+def _future_model(
+    *,
+    rate_alignment_weight: float = 0.0,
+    latent_straightening_weight: float = 0.0,
+) -> WindowJEPA:
     encoder = RecurrentVJEPA21EventVisionTransformer(
         image_size=(16, 16),
         patch_size=8,
@@ -44,6 +48,8 @@ def _future_model() -> WindowJEPA:
         LogFourierScaleEmbedding(output_dim=16, num_bands=2),
         frame_sigreg_weight=0.02,
         temporal_sigreg_weight=0.02,
+        rate_alignment_weight=rate_alignment_weight,
+        latent_straightening_weight=latent_straightening_weight,
         sigreg_projector_hidden_dim=32,
         sigreg_projector_output_dim=16,
         sigreg_num_slices=8,
@@ -220,6 +226,61 @@ def test_future_input_changes_teacher_only_and_sigreg_backpropagates_online() ->
     assert model.future_regularizers["frame"].projector.network[0].weight.grad is not None
     assert model.future_regularizers["support"].projector.network[0].weight.grad is not None
     assert model.future_regularizers["temporal"].projector.network[0].weight.grad is not None
+    assert all(parameter.grad is None for parameter in model.target_encoder.parameters())
+
+
+def test_window_level_rate_alignment_and_straightening_join_recurrent_loss() -> None:
+    torch.manual_seed(30)
+    model = _future_model(
+        rate_alignment_weight=0.01,
+        latent_straightening_weight=0.02,
+    )
+    batch_size, steps = 2, 3
+    context = torch.randn(batch_size, steps, 2, 16, 16)
+    future = torch.randn_like(context)
+    duration = torch.full((batch_size, steps), 50.0)
+    mask = torch.tensor([True, False, True, False]).reshape(1, 1, 4)
+    context_mask = mask.expand(batch_size, steps, -1).clone()
+    target_mask = ~context_mask
+    context_activity = torch.tensor(
+        [
+            [[4, 3, 2, 1], [5, 3, 2, 1], [6, 4, 2, 1]],
+            [[2, 2, 1, 1], [3, 2, 1, 1], [4, 3, 2, 1]],
+        ]
+    )
+    future_activity = context_activity.roll(shifts=-1, dims=1)
+
+    output = model(
+        context,
+        future,
+        duration,
+        duration,
+        context_mask,
+        target_mask,
+        objective="recurrent_future_jepa",
+        context_event_activity=context_activity,
+        target_event_activity=future_activity,
+    )
+
+    assert output.rate_alignment_loss is not None
+    assert output.rate_alignment_weighted_loss is not None
+    assert output.rate_alignment_pairs == batch_size * (steps - 1) * 4
+    assert output.rate_alignment_mean_weight is not None
+    assert 0 < output.rate_alignment_mean_weight <= 1
+    assert output.latent_straightening_loss is not None
+    assert output.latent_straightening_weighted_loss is not None
+    assert output.latent_straightening_pairs is not None
+    assert output.latent_dynamics_weighted_loss is not None
+    expected = (
+        output.future_prediction_loss
+        + output.sigreg_loss
+        + output.rate_alignment_weighted_loss
+        + output.latent_straightening_weighted_loss
+    )
+    torch.testing.assert_close(output.loss, expected)
+
+    output.loss.backward()
+    assert model.online_encoder.patch_embed.weight.grad is not None
     assert all(parameter.grad is None for parameter in model.target_encoder.parameters())
 
 

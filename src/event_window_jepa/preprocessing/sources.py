@@ -260,6 +260,144 @@ class M3EDEventSource:
             self._handle = None
 
 
+class MVSECEventSource:
+    """Read one camera from an official MVSEC ``*_data.hdf5`` file.
+
+    MVSEC stores events as an ``[N, 4]`` floating-point matrix containing
+    ``x, y, timestamp_seconds, polarity``.  The source file is kept strictly
+    read-only and timestamps are rounded once onto the repository-wide integer
+    microsecond clock.  Left and right cameras therefore retain their common
+    recording clock; each canonical output records its own first timestamp as
+    ``source_time_origin_us``.
+    """
+
+    _WIDTH = 346
+    _HEIGHT = 260
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        camera: str = "left",
+        sequence_name: str | None = None,
+    ) -> None:
+        if camera not in {"left", "right"}:
+            raise ValueError("MVSEC camera must be left or right")
+        h5py = _require_hdf5()
+        self.path = Path(path).expanduser().resolve()
+        self._handle = h5py.File(self.path, "r")
+        try:
+            event_path = f"davis/{camera}/events"
+            if event_path not in self._handle:
+                raise KeyError(f"official MVSEC data has no /{event_path}")
+            self._events = self._handle[event_path]
+            if self._events.ndim != 2 or self._events.shape[1] != 4:
+                raise ValueError(
+                    f"MVSEC /{event_path} must have shape [N,4] (x,y,t_seconds,p)"
+                )
+            if not np.issubdtype(self._events.dtype, np.number):
+                raise TypeError(f"MVSEC /{event_path} must be numeric")
+            event_count = len(self._events)
+            if event_count <= 0:
+                raise ValueError("MVSEC event stream is empty")
+            endpoints = np.asarray(self._events[[0, event_count - 1], 2], dtype=np.float64)
+            if not bool(np.isfinite(endpoints).all()) or endpoints[1] < endpoints[0]:
+                raise ValueError("MVSEC event timestamps are not finite and monotonic")
+            first, last = np.rint(endpoints * 1_000_000.0).astype(np.int64).tolist()
+        except BaseException:
+            self._handle.close()
+            raise
+
+        if sequence_name is None:
+            name = self.path.name
+            if name.endswith("_data.hdf5"):
+                sequence_name = name.removesuffix("_data.hdf5")
+            elif name.endswith("_data.h5"):
+                sequence_name = name.removesuffix("_data.h5")
+            else:
+                sequence_name = self.path.stem.removesuffix("_data")
+        self.metadata = EventSourceMetadata(
+            sequence_id=sequence_identifier("mvsec", sequence_name, camera),
+            dataset="mvsec",
+            source_path=self.path,
+            camera=camera,
+            width=self._WIDTH,
+            height=self._HEIGHT,
+            event_count=event_count,
+            first_timestamp_us=int(first),
+            last_timestamp_us=int(last),
+            coordinate_frame="distorted",
+            attributes={
+                "timestamp_reference": "MVSEC synchronized recording clock (seconds)",
+                "timestamp_synchronized": True,
+                "source_format": "official MVSEC Nx4 DAVIS events",
+                "source_events_dataset": f"/{event_path}",
+                "timestamp_conversion": "round(seconds * 1e6)",
+            },
+        )
+
+    def iter_event_chunks(
+        self, chunk_events: int, start_event: int = 0
+    ) -> Iterator[Mapping[str, np.ndarray]]:
+        if chunk_events <= 0:
+            raise ValueError("chunk_events must be positive")
+        if not 0 <= start_event <= self.metadata.event_count:
+            raise ValueError("start_event is outside the source event stream")
+        previous_timestamp: float | None = None
+        seen_polarities: set[int] = set()
+        for start in range(start_event, self.metadata.event_count, chunk_events):
+            stop = min(start + chunk_events, self.metadata.event_count)
+            values = np.asarray(self._events[start:stop], dtype=np.float64)
+            if not bool(np.isfinite(values).all()):
+                raise ValueError("MVSEC events contain NaN or infinity")
+            x_raw, y_raw, timestamps_seconds, polarity_raw = values.T
+            if (
+                np.any(x_raw != np.rint(x_raw))
+                or np.any(y_raw != np.rint(y_raw))
+                or np.any(polarity_raw != np.rint(polarity_raw))
+            ):
+                raise ValueError("MVSEC x, y, and polarity values must be integral")
+            if (
+                np.any(x_raw < 0)
+                or np.any(x_raw >= self._WIDTH)
+                or np.any(y_raw < 0)
+                or np.any(y_raw >= self._HEIGHT)
+            ):
+                raise ValueError("MVSEC event coordinates exceed the 346x260 sensor")
+            seen_polarities.update(
+                int(value) for value in np.unique(polarity_raw).tolist()
+            )
+            if not seen_polarities.issubset({-1, 0, 1}):
+                raise ValueError("MVSEC polarity must use {-1,+1} or {0,1}")
+            if -1 in seen_polarities and 0 in seen_polarities:
+                raise ValueError("MVSEC event stream mixes polarity encodings")
+            if (
+                np.any(timestamps_seconds[1:] < timestamps_seconds[:-1])
+                or (
+                    previous_timestamp is not None
+                    and len(timestamps_seconds)
+                    and timestamps_seconds[0] < previous_timestamp
+                )
+            ):
+                raise ValueError("MVSEC event timestamps decrease")
+            if len(timestamps_seconds):
+                previous_timestamp = float(timestamps_seconds[-1])
+            timestamps_us = np.rint(timestamps_seconds * 1_000_000.0)
+            if np.any(np.abs(timestamps_us) > np.iinfo(np.int64).max):
+                raise OverflowError("MVSEC timestamps do not fit signed microseconds")
+            yield {
+                "x": np.rint(x_raw).astype(np.int64),
+                "y": np.rint(y_raw).astype(np.int64),
+                "t_us": timestamps_us.astype(np.int64),
+                "polarity": np.rint(polarity_raw).astype(np.int8),
+            }
+
+    def close(self) -> None:
+        if self._handle:
+            self._handle.close()
+            self._handle = None
+
+
 class RVTGenXH5EventSource:
     """Streaming adapter for RVT's original-event Gen1/Gen4 HDF5 files."""
 
@@ -562,6 +700,10 @@ def discover_sequence_paths(dataset: str, input_path: str | Path, camera: str) -
                         paths.append(candidate)
             except OSError:
                 continue
+    elif dataset == "mvsec":
+        paths = sorted(root.glob("**/*_data.hdf5"))
+        paths.extend(sorted(root.glob("**/*_data.h5")))
+        paths = sorted(set(paths))
     elif dataset == "gen4":
         paths = sorted(root.glob("**/*_td.h5"))
     elif dataset == "prophesee_1mpx":
@@ -590,7 +732,13 @@ def make_event_source(
     camera: str,
     width: int | None = None,
     height: int | None = None,
-) -> DSECEventSource | M3EDEventSource | RVTGenXH5EventSource | PropheseeDatEventSource:
+) -> (
+    DSECEventSource
+    | M3EDEventSource
+    | MVSECEventSource
+    | RVTGenXH5EventSource
+    | PropheseeDatEventSource
+):
     if dataset == "dsec":
         if width is not None or height is not None:
             raise ValueError("DSEC resolution is fixed at 640x480")
@@ -599,6 +747,10 @@ def make_event_source(
         return M3EDEventSource(
             path, camera=camera, width=width, height=height
         )
+    if dataset == "mvsec":
+        if width is not None or height is not None:
+            raise ValueError("MVSEC resolution is fixed at 346x260")
+        return MVSECEventSource(path, camera=camera)
     source_path = Path(path)
     if dataset == "gen4" or (dataset == "gen1" and source_path.suffix == ".h5"):
         return RVTGenXH5EventSource(

@@ -2,7 +2,7 @@
 
 異なるイベント蓄積時間の間を潜在空間で予測し、未学習の蓄積時間にも頑健なイベント表現を学習するための独立実装です。
 
-この版の成果物は、研究全体を完了したend-to-end実装ではなく、**Window-JEPA事前学習コアとmatched-window評価protocolのscaffold**です。Gen1/DSEC/MVSECの公式下流pipelineが未接続のため、現時点のコードだけで論文の成立条件を実証したとは扱いません。
+この版は、**Window-JEPA事前学習コア、Gen1検出、MVSEC flow/depth probe**までを接続した研究実装です。DSEC segmentation、depth+ego-motionによるrigid flow、dynamic-object評価は未接続であり、実データでの数値再現を行うまでは論文の成立条件を実証したとは扱いません。
 
 中心となる処理は次のとおりです。
 
@@ -41,9 +41,13 @@
 - atomic checkpoint、厳密resume、collapse診断値のJSONL記録
 - higher-is-better / lower-is-better双方に対応したwindow robustness集計
 - fixed-window JEPA、直接feature consistency、Window-JEPAの設定例
-- DSEC・M3ED・RVT Gen1/Gen4・Prophesee DATからZstd HDF5へのstreaming前処理
+- DSEC・M3ED・MVSEC・RVT Gen1/Gen4・Prophesee DATからZstd HDF5へのstreaming前処理
+- MVSEC公式HDF5/flow NPZの再開可能download、raw座標flow/depth参照、full-FOV zero-padding
+- MVSEC CMax flowのGT評価、frozen flow probe、frozen metric-depth probe
+- recurrent patch token用のwindow-level Rate Alignment / Latent Straighteningと個別loss記録
+- day2 dev・day1 sealed finalを分離したMVSEC ablation runnerとflow/depth/CMax可視化
 
-下流タスク固有のデータ変換・head・公式evaluatorは、このリポジトリへ外部コードを直接コピーせず、`event_window_jepa.downstream.features`の共通feature境界へ接続する設計です。Gen1検出、DSEC segmentation、MVSEC depth/flowの統合は各データセットを用意した段階で追加します。
+下流タスク固有のデータ変換・head・evaluatorは、このリポジトリへ外部コードを直接コピーせず、共通feature境界へ接続します。現時点ではGen1検出とMVSEC depth/flowを実装済みで、DSEC segmentationは未実装です。
 
 ## セットアップ
 
@@ -82,13 +86,17 @@ dtypeを要求します。converterは配列長、時刻の全体昇順、座標
 変換時に全件検証します。学習時は完了schemaを軽量検査し、1 ms coarse index内だけを
 厳密検索します。ファイルhandleとindexはDataLoader workerごとのLRUです。
 
-DSEC・M3ED・Gen1・Prophesee 1Mpxの具体的な変換方法、解像度、時計、座標系、
+DSEC・M3ED・MVSEC・Gen1・Prophesee 1Mpxの具体的な変換方法、解像度、時計、座標系、
 storage上の注意は[docs/DATA_PREPROCESSING.md](docs/DATA_PREPROCESSING.md)を参照してください。
 既に1Mpx raw DATを持っている場合は、factor 2を固定し、event・bbox・相対manifestを
 移動可能なbundleへまとめる
 [1Mpx portable wrapper](scripts/preprocess/preprocess_prophesee_1mpx.sh)を使えます。
 データセットの段階的な選定、公式配布元、再開可能なdataset別download script、
 手動フォームが必要なケースは[docs/DATA_DOWNLOAD.md](docs/DATA_DOWNLOAD.md)にまとめています。
+MVSECでのJEPA/CMax比較、flow/depth protocol、実行順は
+[docs/MVSEC_GEOMETRY.md](docs/MVSEC_GEOMETRY.md)を参照してください。複数seed・損失weight・
+context・CMax設定を安全に比較するrunnerと可視化手順は
+[docs/MVSEC_ABLATIONS.md](docs/MVSEC_ABLATIONS.md)に分離しています。
 
 ### NPZ（小規模確認用）
 
@@ -668,6 +676,21 @@ python -m event_window_jepa.downstream.gen1_detection \
   --eval-every 5
 ```
 
+### MVSEC JEPA+CMax / flow / depth
+
+`outdoor_day2`のevent-only事前学習、JEPA-only対JEPA+CMax、`outdoor_day1`での
+CMax headおよびfrozen flow probe、day1/night1でのfrozen metric-depth probeを接続しています。
+native `346×260`のraw/distorted座標を保持し、ViTへ入れる箇所だけ全視野を`352×272`へ中央
+zero-padします。取得容量、前処理、厳密split、flow mask、実行commandは
+[MVSEC実験ガイド](docs/MVSEC_GEOMETRY.md)にまとめています。
+
+多数の条件を比較する場合は、day2内のguard付きlabel-holdout devで選択し、選択後の単一runだけを
+day1 final testへ進めます。計画表示を既定にしたtrain/eval/visualization runnerは
+[MVSEC ablationガイド](docs/MVSEC_ABLATIONS.md)を参照してください。
+
+主比較ではJEPA-onlyとJEPA+CMaxの両方へ同じrandom-init probeを学習し、CMax headの直接評価を
+別に報告します。F³互換診断の`f3_centered`は未来eventを含むため、既定の主結果は`causal`です。
+
 ## Window sweepの集計
 
 下流evaluatorが次のJSONLを出力するものとします。
@@ -712,7 +735,8 @@ pytest
 3. `direct_consistency.yaml`による直接feature一致
 4. 40 ms固定targetの最小Window-JEPA
 5. random target・patch masking・canonical latent
-6. Gen1/DSEC/MVSECの2データセット・2タスク以上で比較
+6. MVSECでJEPA-only対JEPA+CMaxを同一flow/depth probe契約で比較
+7. Gen1/DSEC/MVSECの2データセット・2タスク以上へ拡張
 
 主KPIは全窓平均だけでなく、未学習窓でのworst性能と40 msからの最大悪化です。補間窓（15/30/60 ms）と外挿窓（5/120 ms）は分けて報告してください。
 

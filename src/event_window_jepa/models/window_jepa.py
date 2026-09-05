@@ -14,6 +14,10 @@ from event_window_jepa.losses.latent_prediction import (
     balanced_event_support_latent_prediction_loss,
     latent_prediction_loss,
 )
+from event_window_jepa.losses.latent_temporal import (
+    RATE_NORMALIZATION,
+    window_level_latent_temporal_regularization,
+)
 from event_window_jepa.losses.sigreg import ProjectedSIGReg
 from event_window_jepa.losses.variance_regularization import (
     covariance_regularization,
@@ -84,6 +88,14 @@ class WindowJEPAOutput:
     cmax_mean_flow_magnitude: torch.Tensor | None = None
     cmax_occupied_pixel_fraction: torch.Tensor | None = None
     cmax_flow_saturation_fraction: torch.Tensor | None = None
+    rate_alignment_loss: torch.Tensor | None = None
+    rate_alignment_weighted_loss: torch.Tensor | None = None
+    rate_alignment_pairs: torch.Tensor | None = None
+    rate_alignment_mean_weight: torch.Tensor | None = None
+    latent_straightening_loss: torch.Tensor | None = None
+    latent_straightening_weighted_loss: torch.Tensor | None = None
+    latent_straightening_pairs: torch.Tensor | None = None
+    latent_dynamics_weighted_loss: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +152,12 @@ class WindowJEPA(nn.Module):
         cmax_min_events: int = 128,
         cmax_flow_scale: float = 0.01,
         cmax_max_displacement: float = 32.0,
+        rate_alignment_weight: float = 0.0,
+        rate_alignment_gamma: float = 1.0,
+        rate_alignment_eps: float = 1e-6,
+        rate_alignment_normalization: str = RATE_NORMALIZATION,
+        latent_straightening_weight: float = 0.0,
+        latent_straightening_eps: float = 1e-6,
     ) -> None:
         super().__init__()
         if predictor.num_patches != encoder.num_patches:
@@ -160,6 +178,34 @@ class WindowJEPA(nn.Module):
             raise ValueError("future_activity_floor must lie inside (0, 1]")
         if frame_sigreg_weight < 0 or temporal_sigreg_weight < 0:
             raise ValueError("future SIGReg weights cannot be negative")
+        if not math.isfinite(rate_alignment_weight) or rate_alignment_weight < 0:
+            raise ValueError(
+                "rate_alignment_weight must be finite and non-negative"
+            )
+        if not math.isfinite(rate_alignment_gamma) or rate_alignment_gamma < 0:
+            raise ValueError(
+                "rate_alignment_gamma must be finite and non-negative"
+            )
+        if not math.isfinite(rate_alignment_eps) or rate_alignment_eps <= 0:
+            raise ValueError("rate_alignment_eps must be finite and positive")
+        if rate_alignment_normalization != RATE_NORMALIZATION:
+            raise ValueError(
+                f"rate_alignment_normalization must be {RATE_NORMALIZATION!r}"
+            )
+        if (
+            not math.isfinite(latent_straightening_weight)
+            or latent_straightening_weight < 0
+        ):
+            raise ValueError(
+                "latent_straightening_weight must be finite and non-negative"
+            )
+        if (
+            not math.isfinite(latent_straightening_eps)
+            or latent_straightening_eps <= 0
+        ):
+            raise ValueError(
+                "latent_straightening_eps must be finite and positive"
+            )
         if not math.isfinite(cmax_weight) or cmax_weight < 0:
             raise ValueError("CMax weight must be finite and non-negative")
         if not cmax_weight and cmax_smoothness_weight:
@@ -178,6 +224,14 @@ class WindowJEPA(nn.Module):
         self.future_activity_floor = float(future_activity_floor)
         self.frame_sigreg_weight = float(frame_sigreg_weight)
         self.temporal_sigreg_weight = float(temporal_sigreg_weight)
+        self.rate_alignment_weight = float(rate_alignment_weight)
+        self.rate_alignment_gamma = float(rate_alignment_gamma)
+        self.rate_alignment_eps = float(rate_alignment_eps)
+        self.rate_alignment_normalization = rate_alignment_normalization
+        self.latent_straightening_weight = float(
+            latent_straightening_weight
+        )
+        self.latent_straightening_eps = float(latent_straightening_eps)
         self.future_regularizers = nn.ModuleDict()
         if self.frame_sigreg_weight:
             self.future_regularizers["frame"] = ProjectedSIGReg(
@@ -1236,6 +1290,10 @@ class WindowJEPA(nn.Module):
 
         state = online_state
         outputs: list[WindowJEPAOutput] = []
+        recurrent_token_steps: list[torch.Tensor] = []
+        latent_dynamics_enabled = bool(
+            self.rate_alignment_weight or self.latent_straightening_weight
+        )
         cmax_flow_maps: list[torch.Tensor] = []
         for index in range(steps):
             previous_state = state
@@ -1252,6 +1310,8 @@ class WindowJEPA(nn.Module):
             prediction = latent_step.prediction
             target_tokens = latent_step.target_tokens
             state = latent_step.online_state
+            if latent_dynamics_enabled:
+                recurrent_token_steps.append(recurrent_tokens)
             if self.cmax_flow_head is not None:
                 cmax_flow_maps.append(
                     self.cmax_flow_head(
@@ -1402,6 +1462,50 @@ class WindowJEPA(nn.Module):
         inactive_sum = mean("inactive_prediction_sum")
         inactive_count = mean("inactive_prediction_count")
         base_loss = mean("loss")
+        latent_zero = base_loss.new_zeros((), dtype=torch.float32)
+        rate_alignment_loss = latent_zero
+        rate_alignment_weighted = latent_zero
+        rate_alignment_pairs = latent_zero
+        rate_alignment_mean_weight = latent_zero
+        latent_straightening_loss = latent_zero
+        latent_straightening_weighted = latent_zero
+        latent_straightening_pairs = latent_zero
+        if latent_dynamics_enabled:
+            if len(recurrent_token_steps) != steps:
+                raise RuntimeError("recurrent latent sequence is incomplete")
+            latent_temporal = window_level_latent_temporal_regularization(
+                torch.stack(recurrent_token_steps, dim=1),
+                context_event_activity,
+                context_duration_ms,
+                minimum_events=self.future_active_min_events,
+                rate_gamma=self.rate_alignment_gamma,
+                rate_eps=self.rate_alignment_eps,
+                straightening_eps=self.latent_straightening_eps,
+                rate_normalization=self.rate_alignment_normalization,
+            )
+            if self.rate_alignment_weight:
+                rate_alignment_loss = latent_temporal.rate_alignment_loss
+                rate_alignment_weighted = (
+                    self.rate_alignment_weight * rate_alignment_loss
+                )
+                rate_alignment_pairs = latent_temporal.rate_alignment_pairs
+                rate_alignment_mean_weight = (
+                    latent_temporal.rate_alignment_mean_weight
+                )
+            if self.latent_straightening_weight:
+                latent_straightening_loss = (
+                    latent_temporal.latent_straightening_loss
+                )
+                latent_straightening_weighted = (
+                    self.latent_straightening_weight
+                    * latent_straightening_loss
+                )
+                latent_straightening_pairs = (
+                    latent_temporal.latent_straightening_pairs
+                )
+        latent_dynamics_weighted = (
+            rate_alignment_weighted + latent_straightening_weighted
+        )
         cmax_zero = base_loss.new_zeros((), dtype=torch.float32)
         cmax_loss = cmax_zero
         cmax_focus = cmax_zero
@@ -1439,7 +1543,7 @@ class WindowJEPA(nn.Module):
             ).float().mean()
 
         return WindowJEPAOutput(
-            loss=base_loss + cmax_weighted,
+            loss=base_loss + cmax_weighted + latent_dynamics_weighted,
             masked_loss=mean("masked_loss"),
             canonical_loss=mean("canonical_loss"),
             dense_loss=mean("dense_loss"),
@@ -1459,6 +1563,16 @@ class WindowJEPA(nn.Module):
             support_sigreg_loss=mean("support_sigreg_loss"),
             temporal_sigreg_loss=mean("temporal_sigreg_loss"),
             sigreg_loss=mean("sigreg_loss"),
+            rate_alignment_loss=rate_alignment_loss,
+            rate_alignment_weighted_loss=rate_alignment_weighted,
+            rate_alignment_pairs=rate_alignment_pairs,
+            rate_alignment_mean_weight=rate_alignment_mean_weight,
+            latent_straightening_loss=latent_straightening_loss,
+            latent_straightening_weighted_loss=(
+                latent_straightening_weighted
+            ),
+            latent_straightening_pairs=latent_straightening_pairs,
+            latent_dynamics_weighted_loss=latent_dynamics_weighted,
             active_patch_fraction=mean("active_patch_fraction"),
             context_active_patch_fraction=mean(
                 "context_active_patch_fraction"

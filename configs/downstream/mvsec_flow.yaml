@@ -1,0 +1,35 @@
+task: optical_flow
+dataset: mvsec
+protocol: frozen_recurrent_mvsec_native_flow_labels_v1
+protocol_stages: [dev, final]
+default_direct_cli_stage: final
+dev_recording: outdoor_day2
+dev_fraction: 0.2
+dev_guard_ms: auto_history_span_plus_alignment_rounding
+train_recordings: [outdoor_day2]
+final_test_recordings: [outdoor_day1]
+final_test_interval_s: [222.4, 240.4]
+coordinate_frame: distorted
+native_image_size: [260, 346]
+model_image_size: [272, 352]
+spatial_transform: center_zero_pad
+representation_modes: [final_recurrent_patch_tokens]
+direct_cli_history_steps: checkpoint_burn_in_plus_sequence_length
+ablation_runner_history_steps: 10
+random_probe_head:
+  architecture_contract: canonical_random_mvsec_flow_probe_v1
+  hidden_dim: 256
+  head_depth: 2
+  flow_scale: 0.01
+  max_displacement_pixels_per_base_window: 32.0
+cmax_initialized_probe_head:
+  architecture_contract: checkpoint_cmax_head_spec
+alignment: causal
+flow_rates: [native, dt1]
+dt1_semantics: native_flow_scalar_to_22222us_without_temporal_resampling
+exact_evflownet_800_frame_protocol: false
+unsupported_flow_rates: [dt4]
+mask: [finite_gt, nonzero_gt, event_support, source_row_lt_193]
+metrics: [AEPE, 1PE_percent, 2PE_percent, 3PE_percent, AAE_degrees]
+higher_is_better: false
+seeds: [0, 1, 2]

@@ -241,6 +241,18 @@ loss上でeventをどれだけ鋭く整列したかをzero/shuffled対照と比�
 改善しても、物理的に正しいflow、低いEPE/AEE、または下流representation性能の向上を意味しません。
 物理精度にはGT付きflow benchmark、表現価値にはLinear Probeやdetectionを別途使用します。
 
+## MVSECでのGT評価
+
+MVSEC用のmatched ablationは
+`recurrent_future_convlstm_vits_mvsec.yaml`と
+`recurrent_future_convlstm_vits_mvsec_cmax.yaml`です。CMax checkpointのheadを
+`window-jepa-mvsec-flow cmax-eval`で直接GT評価でき、同じencoderへrandom-init flow probeを
+学習する`window-jepa-mvsec-flow probe`もあります。主比較ではJEPA-onlyとJEPA+CMaxの双方で
+random-init probeを使い、CMax head初期値の効果と表現の効果を分けます。
+
+MVSECの取得、native座標前処理、day2/day1 split、flow/depth評価の完全なcommandは
+[MVSEC_GEOMETRY.md](MVSEC_GEOMETRY.md)を参照してください。
+
 ## 成功判定
 
 正式比較の前に、同じ3 GPU・batch・precisionで短いsmokeを行い、以下を全て確認します。

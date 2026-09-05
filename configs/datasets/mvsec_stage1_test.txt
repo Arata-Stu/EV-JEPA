@@ -1,0 +1,3 @@
+# Final flow/depth test recording. Flow metrics select 222.4s <= t < 240.4s.
+outdoor_day1
+

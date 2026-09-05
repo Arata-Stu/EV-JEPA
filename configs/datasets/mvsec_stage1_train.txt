@@ -1,0 +1,3 @@
+# Recording-level train split. Both cameras remain in this same logical split.
+outdoor_day2
+

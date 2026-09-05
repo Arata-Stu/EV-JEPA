@@ -1,11 +1,44 @@
 task: monocular_depth
 dataset: mvsec
-representation_modes: [encoder_only, canonical]
-canonical_ms: 40
-head_training_windows_ms: [40]
-evaluation_windows_ms: [5, 10, 15, 20, 30, 40, 60, 80, 120]
-unseen_windows_ms: [5, 15, 30, 60, 120]
-metrics: [AbsRel, RMSE]
-higher_is_better: false
+protocol: frozen_recurrent_raw_metric_depth_v1
+protocol_stages: [dev, final]
+default_direct_cli_stage: final
+dev_recording: outdoor_day2
+dev_fraction: 0.2
+dev_guard_ms: auto_history_span_plus_alignment_rounding
+train_recordings: [outdoor_day2]
+final_test_recordings: [outdoor_day1]
+ood_test_recordings: [outdoor_night1]
+coordinate_frame: distorted
+native_image_size: [260, 346]
+model_image_size: [272, 352]
+spatial_transform: center_zero_pad
+alignment: causal
+valid_depth_m: [0.1, 80.0]
+representation_modes: [final_recurrent_patch_tokens]
+direct_cli_history_steps: checkpoint_burn_in_plus_sequence_length
+ablation_runner_history_steps: 10
+canonical_ms: 50
+head_training_windows_ms: [50]
+evaluation_windows_ms: [50]
+unseen_windows_ms: []
+metrics: [AbsRel, SqRel, RMSE, RMSE_log, SILog, log10]
+additional_reported_metrics:
+  [delta1, delta2, delta3, F3_SqRel, F3_SILog,
+   MAE_depth_lt_10m, MAE_depth_lt_20m, MAE_depth_lt_30m]
+metric_directions:
+  AbsRel: minimize
+  SqRel: minimize
+  RMSE: minimize
+  RMSE_log: minimize
+  SILog: minimize
+  log10: minimize
+  F3_SqRel: minimize
+  F3_SILog: minimize
+  MAE_depth_lt_10m: minimize
+  MAE_depth_lt_20m: minimize
+  MAE_depth_lt_30m: minimize
+  delta1: maximize
+  delta2: maximize
+  delta3: maximize
 seeds: [0, 1, 2]
-

@@ -49,7 +49,26 @@ def config_hash(config: ExperimentConfig) -> str:
             recurrent.pop("recurrent_placement", None)
     # Future-prediction controls were added after schema v2. Their inert
     # defaults must not change the identity of older checkpoints.
-    if resolved.get("future_prediction") == {
+    future_prediction = resolved.get("future_prediction", {})
+    # RA/LS were added later still.  Remove each complete parameter family
+    # while its weight is zero, including non-default inert controls.  This is
+    # required for old future-JEPA checkpoints with non-default SIGReg settings
+    # to retain their historical identity.
+    if future_prediction.get("rate_alignment_weight", 0.0) == 0.0:
+        for key in (
+            "rate_alignment_weight",
+            "rate_alignment_gamma",
+            "rate_alignment_eps",
+            "rate_alignment_normalization",
+        ):
+            future_prediction.pop(key, None)
+    if future_prediction.get("latent_straightening_weight", 0.0) == 0.0:
+        for key in (
+            "latent_straightening_weight",
+            "latent_straightening_eps",
+        ):
+            future_prediction.pop(key, None)
+    if future_prediction == {
         "active_min_events": 1,
         "activity_floor": 0.01,
         "frame_sigreg_weight": 0.0,
@@ -68,6 +87,12 @@ def config_hash(config: ExperimentConfig) -> str:
     # Once enabled, every CMax control remains part of the experiment hash.
     if not resolved.get("cmax", {}).get("enabled", False):
         resolved.pop("cmax", None)
+    # Center padding was added for native MVSEC frames after checkpoint schema
+    # v2.  Its default keeps the historical crop-only behavior, so omit the
+    # explicit false value to preserve existing checkpoint identities.
+    data = resolved["data"]
+    if data.get("allow_center_padding") is False:
+        data.pop("allow_center_padding", None)
     # Gradient accumulation was added without bumping checkpoint schema v2.
     # Its default is exactly the historical one-batch/one-update behavior, so
     # omit it from the experiment identity to keep older checkpoints loadable.

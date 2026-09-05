@@ -22,6 +22,12 @@ from event_window_jepa.preprocessing.m3ed_labels import (
     discover_m3ed_labels,
     inspect_m3ed_label,
 )
+from event_window_jepa.preprocessing.mvsec_labels import (
+    inspect_mvsec_flow_ground_truth,
+    inspect_mvsec_ground_truth,
+    matching_mvsec_flow_ground_truth,
+    matching_mvsec_ground_truth,
+)
 from event_window_jepa.preprocessing.sources import (
     discover_sequence_paths,
     make_event_source,
@@ -32,14 +38,14 @@ from event_window_jepa.preprocessing.sources import (
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert raw DSEC, M3ED, Gen1, or Gen4/1Mpx event streams into "
+            "Convert raw DSEC, M3ED, MVSEC, Gen1, or Gen4/1Mpx event streams into "
             "arbitrary-window Zstd HDF5 files"
         )
     )
     parser.add_argument(
         "--dataset",
         required=True,
-        choices=("dsec", "m3ed", "prophesee_1mpx", "gen1", "gen4"),
+        choices=("dsec", "m3ed", "mvsec", "prophesee_1mpx", "gen1", "gen4"),
     )
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
@@ -73,6 +79,24 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Destination containing depth/, semantics/, and pose/; required when "
             "--m3ed-labels=copy"
+        ),
+    )
+    parser.add_argument(
+        "--mvsec-gt",
+        choices=("none", "reference"),
+        default="none",
+        help=(
+            "For MVSEC, validate the sibling *_gt.hdf5 and place native raw-depth "
+            "and pose dataset references in the manifest"
+        ),
+    )
+    parser.add_argument(
+        "--mvsec-flow",
+        choices=("none", "official-npz", "embedded-hdf5"),
+        default="none",
+        help=(
+            "For MVSEC left-camera rows, require and validate the official sibling "
+            "*_gt_flow_dist.npz, or explicitly opt into alternate embedded HDF5 flow"
         ),
     )
     parser.add_argument(
@@ -165,6 +189,8 @@ def _source_sequence_name(dataset: str, path: Path) -> str:
     if dataset == "dsec" and path.parent.name in {"left", "right"}:
         return path.parents[2].name
     if dataset == "m3ed":
+        return path.stem.removesuffix("_data")
+    if dataset == "mvsec":
         return path.stem.removesuffix("_data")
     if dataset == "gen4" and path.name.endswith("_td.h5"):
         return path.name.removesuffix("_td.h5")
@@ -334,12 +360,12 @@ def main() -> None:
         raise ValueError("--width and --height must be provided together")
     if args.limit is not None and args.limit <= 0:
         raise ValueError("--limit must be positive")
-    if args.dataset == "dsec" and (
+    if args.dataset in {"dsec", "mvsec"} and (
         spatial_downsample != 1 or spatial_downsample_method != "coordinate"
     ):
         raise ValueError(
-            "DSEC must remain at native resolution; apply rectification or label-aware "
-            "resizing in the downstream adapter"
+            f"{args.dataset.upper()} must remain at native resolution; apply matching "
+            "crop/rectification in the downstream adapter"
         )
     if args.bbox_output_root is not None and args.dataset not in {
         "prophesee_1mpx",
@@ -362,6 +388,16 @@ def main() -> None:
     if args.m3ed_labels == "copy" and args.m3ed_label_output_root is None:
         raise ValueError(
             "--m3ed-label-output-root is required with --m3ed-labels copy"
+        )
+    if args.dataset != "mvsec" and (
+        args.mvsec_gt != "none" or args.mvsec_flow != "none"
+    ):
+        raise ValueError("MVSEC label options require --dataset mvsec")
+    if args.mvsec_flow != "none" and args.camera != "left":
+        raise ValueError("official MVSEC flow GT is supported only for --camera left")
+    if args.mvsec_flow == "embedded-hdf5" and args.mvsec_gt != "reference":
+        raise ValueError(
+            "--mvsec-flow embedded-hdf5 requires --mvsec-gt reference"
         )
 
     input_path = args.input.expanduser().resolve()
@@ -386,10 +422,10 @@ def main() -> None:
                 raise ValueError(
                     f"source path belongs to {declared_split}, not requested {args.split}"
                 )
-    if args.dataset == "dsec" and input_path.is_dir() and args.sequence_list is None:
+    if args.dataset in {"dsec", "mvsec"} and input_path.is_dir() and args.sequence_list is None:
         raise ValueError(
-            "directory-wide DSEC conversion requires --sequence-list so logical "
-            "validation sequences cannot leak into train"
+            f"directory-wide {args.dataset.upper()} conversion requires "
+            "--sequence-list so logical validation sequences cannot leak into train"
         )
     if args.dataset != "m3ed" and args.m3ed_dataset_list is not None:
         raise ValueError("--m3ed-dataset-list can only be used with --dataset m3ed")
@@ -541,6 +577,18 @@ def main() -> None:
             if args.dataset == "m3ed" and args.m3ed_labels == "copy"
             else {}
         )
+        mvsec_gt_metadata: dict[str, object] = {}
+        if args.dataset == "mvsec" and args.mvsec_gt == "reference":
+            mvsec_gt_metadata = inspect_mvsec_ground_truth(
+                matching_mvsec_ground_truth(path),
+                camera=args.camera,
+                include_embedded_flow=args.mvsec_flow == "embedded-hdf5",
+            )
+        mvsec_flow_metadata: dict[str, object] = {}
+        if args.dataset == "mvsec" and args.mvsec_flow == "official-npz":
+            mvsec_flow_metadata = inspect_mvsec_flow_ground_truth(
+                matching_mvsec_flow_ground_truth(path)
+            )
         if args.plan_only:
             planned_source_bytes += path.stat().st_size
             planned_events += source.metadata.event_count
@@ -585,6 +633,8 @@ def main() -> None:
                             }
                             for kind, label_path in m3ed_label_sources.items()
                         },
+                        "mvsec_gt": mvsec_gt_metadata,
+                        "mvsec_flow": mvsec_flow_metadata,
                     },
                     sort_keys=True,
                 ),
@@ -659,6 +709,15 @@ def main() -> None:
                         path, m3ed_label_output_root.parent / "calibration"
                     )
                 )
+        if args.dataset == "mvsec":
+            record.update(
+                {
+                    "source_sequence_name": _source_sequence_name(args.dataset, path),
+                    "storage_split": args.split,
+                    **mvsec_gt_metadata,
+                    **mvsec_flow_metadata,
+                }
+            )
         records.append(record)
         print(
             json.dumps(

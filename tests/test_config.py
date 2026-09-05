@@ -252,6 +252,145 @@ def test_future_prediction_configuration_requires_causal_post_encoder_data() -> 
         )
 
 
+def test_window_level_rate_alignment_and_straightening_configuration() -> None:
+    defaults = FuturePredictionConfig()
+    assert defaults.rate_alignment_weight == 0.0
+    assert defaults.rate_alignment_gamma == 1.0
+    assert defaults.rate_alignment_eps == 1e-6
+    assert (
+        defaults.rate_alignment_normalization
+        == "per_clip_mean_supported_patch_rate"
+    )
+    assert defaults.latent_straightening_weight == 0.0
+    assert defaults.latent_straightening_eps == 1e-6
+
+    with pytest.raises(ValueError, match="rate_alignment_weight"):
+        FuturePredictionConfig(rate_alignment_weight=-0.1)
+    with pytest.raises(ValueError, match="rate_alignment_gamma"):
+        FuturePredictionConfig(rate_alignment_gamma=float("nan"))
+    with pytest.raises(ValueError, match="rate_alignment_eps"):
+        FuturePredictionConfig(rate_alignment_eps=0.0)
+    with pytest.raises(ValueError, match="rate_alignment_normalization"):
+        FuturePredictionConfig(rate_alignment_normalization="raw_hz")
+    with pytest.raises(ValueError, match="latent_straightening_weight"):
+        FuturePredictionConfig(latent_straightening_weight=float("inf"))
+    with pytest.raises(ValueError, match="latent_straightening_eps"):
+        FuturePredictionConfig(latent_straightening_eps=-1e-6)
+
+    base = _future_recurrent_mapping()
+    rate_aligned = ExperimentConfig.from_mapping(
+        {
+            **base,
+            "future_prediction": {
+                **base["future_prediction"],
+                "rate_alignment_weight": 0.01,
+            },
+        }
+    )
+    assert rate_aligned.future_prediction.rate_alignment_weight == 0.01
+
+    with pytest.raises(ValueError, match="requires SIGReg"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "future_prediction": {
+                    "rate_alignment_weight": 0.01,
+                },
+            }
+        )
+
+    with pytest.raises(ValueError, match="sequence_length >= 3"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "future_prediction": {
+                    **base["future_prediction"],
+                    "latent_straightening_weight": 0.01,
+                },
+            }
+        )
+
+    three_steps = {
+        **base,
+        "recurrent": {
+            **base["recurrent"],
+            "sequence_length": 3,
+            "tbptt_steps": 3,
+        },
+        "future_prediction": {
+            **base["future_prediction"],
+            "latent_straightening_weight": 0.01,
+        },
+    }
+    straightened = ExperimentConfig.from_mapping(three_steps)
+    assert straightened.future_prediction.latent_straightening_weight == 0.01
+
+    with pytest.raises(ValueError, match="tbptt_steps == sequence_length"):
+        ExperimentConfig.from_mapping(
+            {
+                **three_steps,
+                "recurrent": {
+                    **three_steps["recurrent"],
+                    "sampling": "clip",
+                    "tbptt_steps": 2,
+                },
+            }
+        )
+
+    with pytest.raises(ValueError, match="require optimization.objective"):
+        ExperimentConfig.from_mapping(
+            {
+                **base,
+                "recurrent": {
+                    **base["recurrent"],
+                    "temporal_model": "feedforward",
+                    "recurrent_placement": "pre_encoder",
+                },
+                "optimization": {
+                    **base["optimization"],
+                    "objective": "frame_future_jepa",
+                },
+                "future_prediction": {
+                    **base["future_prediction"],
+                    "rate_alignment_weight": 0.01,
+                },
+            }
+        )
+
+
+def test_inert_latent_dynamics_fields_preserve_old_checkpoint_hashes() -> None:
+    base = _future_recurrent_mapping()
+    historical = ExperimentConfig.from_mapping(base)
+    explicit_inert = ExperimentConfig.from_mapping(
+        {
+            **base,
+            "future_prediction": {
+                **base["future_prediction"],
+                "rate_alignment_weight": 0.0,
+                "rate_alignment_gamma": 2.0,
+                "rate_alignment_eps": 1e-5,
+                "rate_alignment_normalization": (
+                    "per_clip_mean_supported_patch_rate"
+                ),
+                "latent_straightening_weight": 0.0,
+                "latent_straightening_eps": 1e-5,
+            },
+        }
+    )
+    enabled = ExperimentConfig.from_mapping(
+        {
+            **base,
+            "future_prediction": {
+                **base["future_prediction"],
+                "rate_alignment_weight": 0.01,
+            },
+        }
+    )
+
+    assert config_hash(historical) == config_hash(explicit_inert)
+    assert config_hash(historical) != config_hash(enabled)
+
+
 def test_cmax_configuration_is_strict_and_legacy_default_is_off() -> None:
     configured = CMaxConfig.from_mapping(
         {
@@ -278,7 +417,6 @@ def test_cmax_configuration_is_strict_and_legacy_default_is_off() -> None:
     assert legacy.cmax == CMaxConfig()
     assert legacy.to_dict() == explicit_default.to_dict()
     assert config_hash(legacy) == config_hash(explicit_default)
-
     with pytest.raises(ValueError, match="positive cmax.weight"):
         CMaxConfig(enabled=True)
     with pytest.raises(ValueError, match="disabled cmax"):
@@ -293,6 +431,29 @@ def test_cmax_configuration_is_strict_and_legacy_default_is_off() -> None:
         CMaxConfig(min_events=128, max_events_per_window=127)
     with pytest.raises(ValueError, match="finite"):
         CMaxConfig(flow_scale=float("inf"))
+
+
+def test_center_padding_default_preserves_checkpoint_identity() -> None:
+    base = _future_recurrent_mapping()
+    implicit = ExperimentConfig.from_mapping(base)
+    explicit = ExperimentConfig.from_mapping(
+        {
+            **base,
+            "data": {**base["data"], "allow_center_padding": False},
+        }
+    )
+
+    assert implicit.data.allow_center_padding is False
+    assert explicit.data.allow_center_padding is False
+    assert config_hash(implicit) == config_hash(explicit)
+
+    padded = ExperimentConfig.from_mapping(
+        {
+            **base,
+            "data": {**base["data"], "allow_center_padding": True},
+        }
+    )
+    assert config_hash(implicit) != config_hash(padded)
 
 
 def test_cmax_requires_future_recurrence_and_exact_temporal_partitions() -> None:
