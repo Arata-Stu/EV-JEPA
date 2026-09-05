@@ -650,6 +650,41 @@ class MVSECAblationShellTests(unittest.TestCase):
         run("bash", "-n", EVAL)
         run("bash", "-n", VISUALIZE)
 
+    def test_plans_preserve_virtual_environment_python_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            virtual_python = root / "env/bin/python"
+            virtual_python.parent.mkdir(parents=True)
+            virtual_python.symlink_to(sys.executable)
+            artifact_root = root / "artifacts"
+            commands = (
+                (
+                    TRAIN,
+                    "--action", "plan", "--suite", "core", "--seeds", "0",
+                    "--python-bin", virtual_python,
+                    "--output-root", artifact_root,
+                ),
+                (
+                    EVAL,
+                    "--action", "plan", "--suite", "core", "--seeds", "0",
+                    "--tasks", "primary", "--protocol-suite", "primary",
+                    "--python-bin", virtual_python,
+                    "--artifact-root", artifact_root,
+                ),
+                (
+                    VISUALIZE,
+                    "--action", "plan", "--mode", "compare", "--suite", "core",
+                    "--seeds", "0", "--probe-seeds", "0",
+                    "--python-bin", virtual_python,
+                    "--artifact-root", artifact_root,
+                ),
+            )
+            for command in commands:
+                with self.subTest(script=Path(command[0]).name):
+                    result = run("bash", *command)
+                    self.assertIn(str(virtual_python), result.stdout)
+                    self.assertFalse(artifact_root.exists())
+
     def test_train_plan_has_no_writes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "artifacts"

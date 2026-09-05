@@ -147,7 +147,10 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 PYTHON_BIN=$(command -v "$PYTHON_BIN")
-PYTHON_BIN=$("$PYTHON_BIN" "$HELPER" path "$PYTHON_BIN")
+# Preserve an env/bin/python symlink so Python retains virtual-environment
+# discovery instead of being invoked through its base interpreter path.
+PYTHON_BIN_DIR=$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)
+PYTHON_BIN="$PYTHON_BIN_DIR/$(basename "$PYTHON_BIN")"
 
 absolute_path() { "$PYTHON_BIN" "$HELPER" path "$1"; }
 DATA_ROOT=$(absolute_path "$DATA_ROOT")
