@@ -15,6 +15,7 @@ Required:
 Options:
   --include-night       Also convert outdoor_night1 left as ood_test
   --plan-only           Validate sources/GT and print the conversion plan only
+  --progress MODE       auto, tqdm, json, or none (default: auto)
   --python-bin PATH     Python from the target environment (default: python)
   -h, --help            Show this help
 
@@ -32,6 +33,7 @@ EOF
 raw_root=""
 bundle_root=""
 python_bin="python"
+progress="auto"
 include_night=0
 plan_only=0
 
@@ -50,6 +52,11 @@ while (($#)); do
     --python-bin)
       (($# >= 2)) || { echo "missing value for --python-bin" >&2; exit 2; }
       python_bin=$2
+      shift 2
+      ;;
+    --progress)
+      (($# >= 2)) || { echo "missing value for --progress" >&2; exit 2; }
+      progress=$2
       shift 2
       ;;
     --include-night)
@@ -71,6 +78,11 @@ while (($#)); do
       ;;
   esac
 done
+
+case "$progress" in
+  auto|tqdm|json|none) ;;
+  *) echo "invalid --progress mode: $progress" >&2; exit 2 ;;
+esac
 
 [[ -n "$raw_root" ]] || { echo "--raw-root is required" >&2; exit 2; }
 [[ -n "$bundle_root" ]] || { echo "--bundle-root is required" >&2; exit 2; }
@@ -145,6 +157,7 @@ common=(
   --spatial-downsample 1
   --spatial-downsample-method coordinate
   --zstd-level 5
+  --progress "$progress"
   --skip-existing
   --merge-manifest
 )

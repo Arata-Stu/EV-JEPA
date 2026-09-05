@@ -137,8 +137,29 @@ class PreprocessWrapperStdlibTests(unittest.TestCase):
             for call in calls:
                 input_index = call.index("--input")
                 self.assertEqual(call[input_index + 1], str(root.resolve()))
+                progress_index = call.index("--progress")
+                self.assertEqual(call[progress_index + 1], "auto")
             for archive in archives:
                 self.assertEqual(archive.read_bytes(), b"GUI archive residue")
+
+    def test_mvsec_wrapper_rejects_an_unknown_progress_mode(self) -> None:
+        completed = subprocess.run(
+            [
+                "bash",
+                str(MVSEC_WRAPPER),
+                "--raw-root",
+                "/does/not/matter",
+                "--bundle-root",
+                "/does/not/matter-either",
+                "--progress",
+                "spinner",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("invalid --progress mode: spinner", completed.stderr)
 
     def test_mvsec_downloader_container_layout_resolves_to_raw(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

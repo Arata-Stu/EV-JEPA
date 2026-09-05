@@ -111,8 +111,13 @@ bash scripts/preprocess/preprocess_mvsec.sh \
   --python-bin python \
   --raw-root /datasets/downloads/mvsec/raw \
   --bundle-root /datasets/evjepa/mvsec \
+  --progress tqdm \
   --include-night
 ```
+
+対話terminalでは`--progress auto`（既定）も`tqdm`を選びます。明示したい場合は上のように
+`--progress tqdm`を指定します。変換はevent chunkごとに`.partial` HDF5とcheckpointをflushするため、
+`Ctrl+C`後も同じcommandを再実行すれば最後にcommit済みのevent位置から再開します。
 
 出力は次の構成です。
 

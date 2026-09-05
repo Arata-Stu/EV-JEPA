@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -125,7 +126,19 @@ def _parse_args() -> argparse.Namespace:
         "--progress-interval-seconds",
         type=float,
         default=10.0,
-        help="Emit per-sequence JSON progress at this interval; 0 disables it",
+        help=(
+            "JSON progress interval; 0 disables periodic progress in every mode "
+            "(default: 10)"
+        ),
+    )
+    parser.add_argument(
+        "--progress",
+        choices=("auto", "tqdm", "json", "none"),
+        default="auto",
+        help=(
+            "Progress display: auto uses tqdm on an interactive terminal and JSON "
+            "otherwise (default: auto)"
+        ),
     )
     parser.add_argument("--index-step-us", type=int, default=1_000)
     parser.add_argument(
@@ -197,6 +210,21 @@ def _source_sequence_name(dataset: str, path: Path) -> str:
     if dataset == "gen1" and path.name.endswith("_td.dat.h5"):
         return path.name.removesuffix("_td.dat.h5")
     return path.stem
+
+
+def _resolved_progress_mode(
+    requested: str,
+    *,
+    stderr_isatty: bool,
+    interval_seconds: float,
+) -> str:
+    if interval_seconds < 0:
+        raise ValueError("--progress-interval-seconds cannot be negative")
+    if interval_seconds == 0 or requested == "none":
+        return "none"
+    if requested == "auto":
+        return "tqdm" if stderr_isatty else "json"
+    return requested
 
 
 def _resolved_spatial_downsample(dataset: str, requested: int | None) -> int:
@@ -348,6 +376,11 @@ def _m3ed_official_names(path: Path, logical_split: str) -> set[str]:
 
 def main() -> None:
     args = _parse_args()
+    progress_mode = _resolved_progress_mode(
+        args.progress,
+        stderr_isatty=sys.stderr.isatty(),
+        interval_seconds=args.progress_interval_seconds,
+    )
     spatial_downsample = _resolved_spatial_downsample(
         args.dataset, args.spatial_downsample
     )
@@ -550,6 +583,7 @@ def main() -> None:
         skip_existing=args.skip_existing,
         resume_partial=not args.no_resume_partial,
         progress_interval_seconds=args.progress_interval_seconds,
+        progress_mode=progress_mode,
     )
 
     records: list[dict[str, object]] = []

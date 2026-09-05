@@ -274,6 +274,7 @@ bash scripts/preprocess/preprocess_mvsec.sh \
   --python-bin python \
   --raw-root /absolute/path/to/gui-downloaded-mvsec \
   --bundle-root /datasets/evjepa/mvsec \
+  --progress tqdm \
   --plan-only
 ```
 
@@ -330,8 +331,9 @@ window-jepa-preprocess \
 
 計画が正しければ`--plan-only`と`--limit 1`を外し、`--skip-existing`と
 `--merge-manifest`を付けて変換します。val/testは出力directory、manifest、`--split`を
-それぞれ変えて実行してください。変換中は既定10秒間隔で、event進捗率、速度、ETA、
-timestamp補正統計をJSONで表示します。`--progress-interval-seconds`で間隔を変更できます。
+それぞれ変えて実行してください。進捗表示は`--progress auto`が既定で、対話terminalではevent数を
+基準にした`tqdm` bar、非TTYのbatch jobやredirectでは10秒間隔のJSONを使います。
+`--progress tqdm|json|none`で明示でき、JSON間隔は`--progress-interval-seconds`で変更できます。
 
 ```bash
 window-jepa-preprocess \

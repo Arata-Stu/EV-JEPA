@@ -85,6 +85,7 @@ class PreprocessOptions:
     skip_existing: bool = False
     resume_partial: bool = True
     progress_interval_seconds: float = 10.0
+    progress_mode: str = "json"
 
     def __post_init__(self) -> None:
         if self.spatial_downsample <= 0:
@@ -108,8 +109,41 @@ class PreprocessOptions:
             raise ValueError("timestamp_dtype must be auto, uint32, or uint64")
         if self.progress_interval_seconds < 0:
             raise ValueError("progress_interval_seconds cannot be negative")
+        if self.progress_mode not in {"json", "tqdm", "none"}:
+            raise ValueError("progress_mode must be json, tqdm, or none")
         if self.overwrite and self.skip_existing:
             raise ValueError("overwrite and skip_existing are mutually exclusive")
+
+
+def _event_chunks_with_tqdm(
+    chunks: Iterator[Mapping[str, np.ndarray]],
+    *,
+    sequence_id: str,
+    initial_events: int,
+    total_events: int,
+) -> Iterator[Mapping[str, np.ndarray]]:
+    """Wrap source chunks in an event-count progress bar without changing data."""
+
+    try:
+        from tqdm.auto import tqdm
+    except ImportError as error:
+        raise ImportError(
+            "tqdm progress was requested but tqdm is unavailable; install the "
+            "project dependencies or use --progress json"
+        ) from error
+    with tqdm(
+        total=total_events,
+        initial=initial_events,
+        desc=sequence_id,
+        unit="event",
+        unit_scale=True,
+        unit_divisor=1_000,
+        dynamic_ncols=True,
+        mininterval=0.25,
+    ) as progress:
+        for chunk in chunks:
+            yield chunk
+            progress.update(len(chunk["x"]))
 
 
 def _require_hdf5() -> tuple[Any, Any]:
@@ -946,9 +980,21 @@ def _preprocess_sequence_unlocked(
             progress_started = time.monotonic()
             last_progress = progress_started
 
-            for chunk in source.iter_event_chunks(
+            chunks = source.iter_event_chunks(
                 options.read_chunk_events, start_event=source_events_read
+            )
+            if (
+                options.progress_mode == "tqdm"
+                and options.progress_interval_seconds > 0
             ):
+                chunks = _event_chunks_with_tqdm(
+                    chunks,
+                    sequence_id=metadata.sequence_id,
+                    initial_events=source_events_read,
+                    total_events=metadata.event_count,
+                )
+
+            for chunk in chunks:
                 chunk_repair_count = 0
                 chunk_max_backward_us = 0
                 if repair_timestamps:
@@ -1101,10 +1147,14 @@ def _preprocess_sequence_unlocked(
                     source_events_read
                     == run_start_event + len(arrays["x"])
                 )
-                if options.progress_interval_seconds > 0 and (
-                    is_first_chunk_this_run
-                    or before_flush - last_progress
-                    >= options.progress_interval_seconds
+                if (
+                    options.progress_mode == "json"
+                    and options.progress_interval_seconds > 0
+                    and (
+                        is_first_chunk_this_run
+                        or before_flush - last_progress
+                        >= options.progress_interval_seconds
+                    )
                 ):
                     print(
                         json.dumps(
@@ -1148,7 +1198,8 @@ def _preprocess_sequence_unlocked(
 
                 now = time.monotonic()
                 if (
-                    options.progress_interval_seconds > 0
+                    options.progress_mode == "json"
+                    and options.progress_interval_seconds > 0
                     and (
                         now - last_progress >= options.progress_interval_seconds
                         or source_events_read == metadata.event_count
